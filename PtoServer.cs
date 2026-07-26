@@ -158,8 +158,9 @@ namespace PtoServer
 
                     switch (opcode)
                     {
-                        case Op.Login: HandleLogin(ns, payload, ref username); break;
-                        case Op.Ping:  Send(ns, new PacketWriter().Frame(Op.Ping)); break; // echo for latency
+                        case Op.Login:   HandleLogin(ns, payload, ref username); break;
+                        case Op.AddDeck: HandleDeckSave(payload, username); break; // client->server deck save
+                        case Op.Ping:    Send(ns, new PacketWriter().Frame(Op.Ping)); break; // echo for latency
                         default:
                             if (Verbose) Log("   (unhandled opcode " + opcode + ")");
                             break;
@@ -197,11 +198,95 @@ namespace PtoServer
             Send(ns, new PacketWriter().WriteU8(LoginResult.Success).WriteString(username).Frame(Op.Login));
             Log("-> login success as '" + username + "'");
 
-            // 2) (optional account data would go here: AddCard / AddDeck / Stages / Orbs)
+            // 2) account data: full collection + saved decks + stages.
+            SendAccountData(ns, username);
 
             // 3) loaded -> flips the login door open and builds the lobby menu
             Send(ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.Loaded));
             Log("-> loaded (door open -> lobby)");
+        }
+
+        // Card DB has 232 entries (116 cards x {normal, holographic}); backs 0..10; lands 0..4;
+        // stages 0..48. See docs/PROTOCOL.md. The client filters what is displayable, so granting
+        // every id is safe and simply unlocks the whole collection.
+        const int CardDbCount = 232;
+        const int BackCount   = 11;
+        const int LandCount   = 5;
+        const int StageCount  = 49;
+        const byte CardCopies = 3;
+
+        static void SendAccountData(NetworkStream ns, string username)
+        {
+            var ms = new MemoryStream();
+
+            // --- collection: every card (op 49: bool back, bool land, u16 id, u8 amount) ---
+            for (int id = 0; id < CardDbCount; id++)
+            {
+                byte[] p = new PacketWriter()
+                    .WriteBool(false).WriteBool(false).WriteU16((ushort)id).WriteU8(CardCopies)
+                    .Frame(Op.AddCard);
+                ms.Write(p, 0, p.Length);
+            }
+            // --- card backs (back=true) ---
+            for (int id = 0; id < BackCount; id++)
+            {
+                byte[] p = new PacketWriter()
+                    .WriteBool(true).WriteBool(false).WriteU16((ushort)id).WriteU8(1)
+                    .Frame(Op.AddCard);
+                ms.Write(p, 0, p.Length);
+            }
+            // --- lands (land=true) ---
+            for (int id = 0; id < LandCount; id++)
+            {
+                byte[] p = new PacketWriter()
+                    .WriteBool(false).WriteBool(true).WriteU16((ushort)id).WriteU8(1)
+                    .Frame(Op.AddCard);
+                ms.Write(p, 0, p.Length);
+            }
+
+            // --- saved decks (op 47 S->C: u8 id, str name, u16 back, u16 land, 31x u16 cards) ---
+            Deck[] decks = DeckStore.Load(username);
+            int deckCount = 0;
+            foreach (Deck d in decks)
+            {
+                if (d == null) continue;
+                var dw = new PacketWriter().WriteU8(d.Id).WriteString(d.Name)
+                                           .WriteU16(d.Back).WriteU16(d.Land);
+                for (int i = 0; i < 31; i++) dw.WriteU16(i < d.Cards.Length ? d.Cards[i] : (ushort)0);
+                byte[] dp = dw.Frame(Op.AddDeck);
+                ms.Write(dp, 0, dp.Length);
+                deckCount++;
+            }
+
+            // --- stages (op 60: StageCount x (bool completed, bool unlocked)) ---
+            var st = new PacketWriter();
+            for (int i = 0; i < StageCount; i++) st.WriteBool(false).WriteBool(true); // all unlocked
+            byte[] stagePkt = st.Frame(Op.Stages);
+            ms.Write(stagePkt, 0, stagePkt.Length);
+
+            byte[] blob = ms.ToArray();
+            Send(ns, blob);
+            Log("-> account data: " + CardDbCount + " cards + " + BackCount + " backs + " +
+                LandCount + " lands + " + deckCount + " decks + " + StageCount + " stages (" +
+                blob.Length + " bytes)");
+        }
+
+        // Client saving a deck (op 47 C->S: bool flag, str name, u8 id, u16 back, u16 land, 31x u16).
+        static void HandleDeckSave(byte[] payload, string username)
+        {
+            if (string.IsNullOrEmpty(username)) { Log("! deck save with no user -- ignored"); return; }
+            var r = new PacketReader(payload, 0);
+            var d = new Deck();
+            d.Flag = r.ReadBool();
+            d.Name = r.ReadString();
+            d.Id   = r.ReadU8();
+            d.Back = r.ReadU16();
+            d.Land = r.ReadU16();
+            d.Cards = new ushort[31];
+            int nonEmpty = 0;
+            for (int i = 0; i < 31; i++) { d.Cards[i] = r.ReadU16(); if (d.Cards[i] != 0) nonEmpty++; }
+            DeckStore.Save(username, d);
+            Log("-> saved deck #" + d.Id + " '" + d.Name + "' (" + nonEmpty + " cards) for " + username);
         }
 
         // --- helpers ---------------------------------------------------------
@@ -229,6 +314,95 @@ namespace PtoServer
             for (int i = 0; i < b.Length && i < 64; i++) sb.Append(b[i].ToString("X2")).Append(' ');
             if (b.Length > 64) sb.Append("...");
             return sb.ToString().TrimEnd();
+        }
+    }
+
+    class Deck
+    {
+        public byte Id;
+        public bool Flag;
+        public string Name = "";
+        public ushort Back, Land;
+        public ushort[] Cards = new ushort[31];
+    }
+
+    // Per-user deck persistence. Decks live in memory and are mirrored to
+    // data/<user>.decks so they survive server restarts. One line per deck:
+    //   id|flag|back|land|c0,c1,...,c30|name
+    static class DeckStore
+    {
+        const int MaxDecks = 12; // client has 12 deck slots (load_blank_decks)
+        static readonly object _lock = new object();
+        static readonly Dictionary<string, Deck[]> _mem = new Dictionary<string, Deck[]>();
+
+        static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data"); } }
+        static string FileFor(string user)
+        {
+            var safe = new StringBuilder();
+            foreach (char c in user.ToLowerInvariant())
+                safe.Append(char.IsLetterOrDigit(c) || c == '_' || c == '-' ? c : '_');
+            return Path.Combine(Dir, safe.ToString() + ".decks");
+        }
+
+        public static Deck[] Load(string user)
+        {
+            lock (_lock)
+            {
+                Deck[] cached;
+                if (_mem.TryGetValue(user, out cached)) return cached;
+                var arr = new Deck[MaxDecks];
+                try
+                {
+                    string path = FileFor(user);
+                    if (File.Exists(path))
+                    {
+                        foreach (string line in File.ReadAllLines(path))
+                        {
+                            if (line.Length == 0) continue;
+                            string[] f = line.Split('|');
+                            if (f.Length < 6) continue;
+                            var d = new Deck();
+                            d.Id   = byte.Parse(f[0]);
+                            d.Flag = f[1] == "1";
+                            d.Back = ushort.Parse(f[2]);
+                            d.Land = ushort.Parse(f[3]);
+                            string[] cs = f[4].Split(',');
+                            for (int i = 0; i < 31 && i < cs.Length; i++)
+                                ushort.TryParse(cs[i], out d.Cards[i]);
+                            d.Name = f[5];
+                            if (d.Id < MaxDecks) arr[d.Id] = d;
+                        }
+                    }
+                }
+                catch (Exception e) { Console.WriteLine("DeckStore load error: " + e.Message); }
+                _mem[user] = arr;
+                return arr;
+            }
+        }
+
+        public static void Save(string user, Deck deck)
+        {
+            lock (_lock)
+            {
+                Deck[] arr = Load(user);
+                if (deck.Id < MaxDecks) arr[deck.Id] = deck;
+                try
+                {
+                    Directory.CreateDirectory(Dir);
+                    var sb = new StringBuilder();
+                    foreach (Deck d in arr)
+                    {
+                        if (d == null) continue;
+                        var cards = new StringBuilder();
+                        for (int i = 0; i < 31; i++) { if (i > 0) cards.Append(','); cards.Append(d.Cards[i]); }
+                        sb.Append(d.Id).Append('|').Append(d.Flag ? '1' : '0').Append('|')
+                          .Append(d.Back).Append('|').Append(d.Land).Append('|')
+                          .Append(cards).Append('|').Append(d.Name).Append('\n');
+                    }
+                    File.WriteAllText(FileFor(user), sb.ToString());
+                }
+                catch (Exception e) { Console.WriteLine("DeckStore save error: " + e.Message); }
+            }
         }
     }
 }

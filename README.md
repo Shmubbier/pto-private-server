@@ -4,9 +4,10 @@ A clean-room compatibility server for the abandoned **Pixel Tactics Online: PreA
 client (`PTO_C.exe` / `data.win`). The original server (`ptotemserv.ddns.net`) is gone; this
 project reimplements the protocol so the client can connect again.
 
-**Status:** ✅ Login + lobby working. The stock client connects, authenticates, and reaches the
-main menu (Arena / Campaign / Collection). Actual gameplay (matchmaking + battle rules) is **not**
-implemented yet — see *Roadmap*.
+**Status:** ✅ Login, lobby, **collection, and deckbuilder** working. The stock client connects,
+authenticates, reaches the main menu, shows a full card collection, and can build/save decks that
+persist across sessions. Actual gameplay (matchmaking + battle rules) is **not** implemented yet —
+see *Roadmap*.
 
 ---
 
@@ -80,11 +81,13 @@ username/password — this milestone accepts everyone.
 ## Roadmap
 
 1. **[done]** Framing, login/register, lobby entry, ping keepalive.
-2. Account persistence (user database, real password checks, "already logged in").
-3. Send real collection / decks / stages / orbs after login (opcodes 47/49/60/62) so the
-   deckbuilder and collection screens populate.
-4. Matchmaking (Arena queue) — pair two clients.
-5. The hard part: the authoritative **battle engine**. The client is fully server-driven —
+2. **[done]** Post-login data load: full collection (cards/backs/lands) + stages, so the
+   Collection and Deckbuilder screens populate (opcodes 49/60).
+3. **[done]** Deck saving: parse client deck saves (op 47 C→S), persist per-user under `data/`,
+   and send saved decks back on login (op 47 S→C).
+4. Account persistence (real user database, password checks, "already logged in").
+5. Matchmaking (Arena queue) — pair two clients.
+6. The hard part: the authoritative **battle engine**. The client is fully server-driven —
    every draw/summon/attack/turn is a `container_*` message. Each must be reimplemented
    server-side per the game's rules (Pixel Tactics ruleset).
 

@@ -1,3 +1,6 @@
+# Runtime per-user state (decks, accounts)
+data/
+
 # Build artifacts
 *.exe
 *.pdb

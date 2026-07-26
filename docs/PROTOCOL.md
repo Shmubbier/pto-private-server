@@ -65,6 +65,24 @@ these are the client's receive handlers. Opcodes the client *sends* reuse the sa
 | 64 | draw_other_slot |
 | 65 | disconnect |
 
+## Post-login data payloads (implemented)
+
+Sent by the server after a successful login (op 46 status 3), before `loaded` (op 48):
+
+- **op 49 add_card_to_collection** — `bool back, bool land, u16 cardId, u8 amount`.
+  cardId is a card-DB index 0..231 (116 cards × {normal even id, holographic odd id}), or a
+  back id 0..10 when `back=1`, or a land id 0..4 when `land=1`. The client filters what is
+  displayable by card `_special`/`_collection`, so granting every id is safe.
+- **op 60 stages** — `StageCount × (bool completed, bool unlocked)`; StageCount = 49 (stages 0..48).
+
+### Deck saving (op 47 is bidirectional)
+
+- **C→S (net_save_deck):** `bool flag, str name, u8 deckId, u16 back, u16 land, 31× u16 cards`.
+  `flag` is 0 (saved from deck list) or 1 (saved from within the deck builder). cards are DB ids,
+  0 = empty slot. The server persists these under `data/<user>.decks`.
+- **S→C (container_add_deck):** `u8 deckId, str name, u16 back, u16 land, 31× u16 cards` (no flag).
+  Sent on login to restore saved decks.
+
 ## Key client scripts (reference)
 
 - `packet_header(op)` → writes `u8 op`, `u16 1374`, `u32 0` (length placeholder)
