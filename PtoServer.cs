@@ -35,6 +35,14 @@ namespace PtoServer
         public const byte Ping    = 52; // empty
         public const byte Stages  = 60; // per stage: bool completed, bool unlocked
         public const byte Orbs    = 62; // u8 amount
+
+        // matchmaking / battle
+        public const byte Queue        = 0;  // C->S: u8 deckId  (join Arena queue)
+        public const byte CancelQueue  = 1;  // C->S: u8 deckId  (leave queue)
+        public const byte BattleStart  = 2;  // S->C: u16 otherPlayer, u16 battleId
+        public const byte BattleData   = 4;  // S->C: u16 wavePlayer, u8 handSize, handSize x u16 cardIds
+        public const byte BattleReady  = 20; // C->S: empty. Sent by rm_battle on entry -> send board data now.
+        public const byte BattleDetails= 50; // S->C: bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool AI, bool unlocked
     }
 
     // Login response status bytes (first u8 of an Op.Login reply), from container_login.
@@ -104,7 +112,7 @@ namespace PtoServer
         static bool Verbose = true;
 
         static readonly object _logLock = new object();
-        static void Log(string msg)
+        internal static void Log(string msg)
         {
             lock (_logLock)
                 Console.WriteLine("[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] " + msg);
@@ -160,6 +168,9 @@ namespace PtoServer
                     {
                         case Op.Login:   HandleLogin(ns, payload, ref username); break;
                         case Op.AddDeck: HandleDeckSave(payload, username); break; // client->server deck save
+                        case Op.Queue:   Matchmaker.Join(ns, username, payload.Length > 0 ? payload[0] : (byte)0); break;
+                        case Op.CancelQueue: Matchmaker.Cancel(ns); break;
+                        case Op.BattleReady: SendBattleSetup(ns); break; // client is in rm_battle -> send board
                         case Op.Ping:    Send(ns, new PacketWriter().Frame(Op.Ping)); break; // echo for latency
                         default:
                             if (Verbose) Log("   (unhandled opcode " + opcode + ")");
@@ -170,6 +181,8 @@ namespace PtoServer
             catch (Exception ex) { Log("Client " + who + " error: " + ex.Message); }
             finally
             {
+                Matchmaker.Cancel(ns); // drop from queue if waiting
+                ForgetBattle(ns);      // drop any battle assignment
                 Log("Client disconnected: " + who + (username != null ? " (" + username + ")" : ""));
                 try { client.Close(); } catch { }
             }
@@ -289,6 +302,84 @@ namespace PtoServer
             Log("-> saved deck #" + d.Id + " '" + d.Name + "' (" + nonEmpty + " cards) for " + username);
         }
 
+        // --- matchmaking / battle bootstrap ---------------------------------
+        static readonly Random _rng = new Random(12345);
+        const int OpeningHand = 5;
+
+        // Per-connection battle assignment, keyed by stream. Set when a match is made; consumed
+        // when the client signals rm_battle entry (op 20).
+        class BattleSlot { public Waiting Me; public Waiting Opp; public bool FirstPlayer; public bool Sent; }
+        static readonly object _battleLock = new object();
+        static readonly Dictionary<NetworkStream, BattleSlot> _battles = new Dictionary<NetworkStream, BattleSlot>();
+
+        // Pair two players. `a` queued first (first player). Send battle_start (transition), then
+        // wait for each client's op 20 to deliver the board.
+        internal static void StartBattle(Waiting a, Waiting b, int battleId)
+        {
+            Log("MATCH: " + a.User + " vs " + b.User + " (battle " + battleId + ")");
+            lock (_battleLock)
+            {
+                _battles[a.Ns] = new BattleSlot { Me = a, Opp = b, FirstPlayer = true };
+                _battles[b.Ns] = new BattleSlot { Me = b, Opp = a, FirstPlayer = false };
+            }
+            // battle_start (op 2): u16 otherPlayer=1, u16 battleId -> fades client into rm_battle.
+            byte[] start = new PacketWriter().WriteU16(1).WriteU16((ushort)battleId).Frame(Op.BattleStart);
+            Send(a.Ns, start);
+            Send(b.Ns, start);
+        }
+
+        internal static void ForgetBattle(NetworkStream ns)
+        {
+            lock (_battleLock) { _battles.Remove(ns); }
+        }
+
+        // Client signalled it is in rm_battle (op 20): send both players' details + own hand,
+        // as ONE write (the client processes a whole recv in a single pass).
+        static void SendBattleSetup(NetworkStream ns)
+        {
+            BattleSlot slot;
+            lock (_battleLock) { if (!_battles.TryGetValue(ns, out slot) || slot.Sent) return; slot.Sent = true; }
+
+            Waiting me = slot.Me, opp = slot.Opp;
+            Deck md = DeckStore.Load(me.User)[me.DeckId];
+            Deck od = DeckStore.Load(opp.User)[opp.DeckId];
+            ushort myBack = md != null ? md.Back : (ushort)0, myLand = md != null ? md.Land : (ushort)0;
+            ushort opBack = od != null ? od.Back : (ushort)0, opLand = od != null ? od.Land : (ushort)0;
+
+            var ms = new MemoryStream();
+
+            // battle_details (op 50): me=1 then me=0
+            byte[] d1 = new PacketWriter().WriteBool(true).WriteU16(myBack).WriteU16(myLand)
+                .WriteString(me.User).WriteBool(false).WriteU16(0).WriteBool(false).WriteBool(true)
+                .Frame(Op.BattleDetails);
+            byte[] d2 = new PacketWriter().WriteBool(false).WriteU16(opBack).WriteU16(opLand)
+                .WriteString(opp.User).WriteBool(false).WriteU16(0).WriteBool(false).WriteBool(true)
+                .Frame(Op.BattleDetails);
+            ms.Write(d1, 0, d1.Length);
+            ms.Write(d2, 0, d2.Length);
+
+            // battle_data (op 4): u16 wavePlayer (0 = my turn), u8 handSize, handSize x u16 cardIds
+            ushort[] hand = DealHand(md);
+            var dw = new PacketWriter().WriteU16((ushort)(slot.FirstPlayer ? 0 : 1)).WriteU8((byte)hand.Length);
+            foreach (ushort c in hand) dw.WriteU16(c);
+            byte[] d3 = dw.Frame(Op.BattleData);
+            ms.Write(d3, 0, d3.Length);
+
+            Send(ns, ms.ToArray());
+            Log("-> battle setup to " + me.User + " (firstPlayer=" + slot.FirstPlayer + ", hand=[" +
+                string.Join(",", Array.ConvertAll(hand, x => x.ToString())) + "])");
+        }
+
+        // Draw the opening hand from a deck's heroes (slot 0 is the leader; slots 1..30 are heroes).
+        static ushort[] DealHand(Deck d)
+        {
+            var heroes = new List<ushort>();
+            if (d != null) for (int i = 1; i < d.Cards.Length; i++) if (d.Cards[i] != 0) heroes.Add(d.Cards[i]);
+            lock (_rng) for (int i = heroes.Count - 1; i > 0; i--) { int j = _rng.Next(i + 1); var tmp = heroes[i]; heroes[i] = heroes[j]; heroes[j] = tmp; }
+            int n = Math.Min(OpeningHand, heroes.Count);
+            return heroes.GetRange(0, n).ToArray();
+        }
+
         // --- helpers ---------------------------------------------------------
         static bool ReadExact(NetworkStream ns, byte[] buf, int off, int count)
         {
@@ -303,7 +394,7 @@ namespace PtoServer
         }
 
         static readonly object _sendLock = new object();
-        static void Send(NetworkStream ns, byte[] data)
+        internal static void Send(NetworkStream ns, byte[] data)
         {
             lock (_sendLock) { ns.Write(data, 0, data.Length); ns.Flush(); }
         }
@@ -314,6 +405,40 @@ namespace PtoServer
             for (int i = 0; i < b.Length && i < 64; i++) sb.Append(b[i].ToString("X2")).Append(' ');
             if (b.Length > 64) sb.Append("...");
             return sb.ToString().TrimEnd();
+        }
+    }
+
+    // A player waiting in the Arena queue.
+    class Waiting
+    {
+        public NetworkStream Ns;
+        public string User;
+        public byte DeckId;
+    }
+
+    // Simple 1v1 matchmaking: hold at most one waiting player; the next joiner is paired with them.
+    static class Matchmaker
+    {
+        static readonly object _lock = new object();
+        static Waiting _waiting;
+        static int _nextBattleId = 1;
+
+        public static void Join(NetworkStream ns, string user, byte deckId)
+        {
+            if (string.IsNullOrEmpty(user)) return;
+            Waiting me = new Waiting { Ns = ns, User = user, DeckId = deckId };
+            Waiting opp = null; int bid = 0;
+            lock (_lock)
+            {
+                if (_waiting == null || ReferenceEquals(_waiting.Ns, ns)) { _waiting = me; Program.Log("QUEUE: " + user + " waiting (deck " + deckId + ")"); return; }
+                opp = _waiting; _waiting = null; bid = _nextBattleId++;
+            }
+            Program.StartBattle(opp, me, bid); // opp queued first -> first player
+        }
+
+        public static void Cancel(NetworkStream ns)
+        {
+            lock (_lock) { if (_waiting != null && ReferenceEquals(_waiting.Ns, ns)) _waiting = null; }
         }
     }
 

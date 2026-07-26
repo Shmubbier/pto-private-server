@@ -83,6 +83,25 @@ Sent by the server after a successful login (op 46 status 3), before `loaded` (o
 - **S→C (container_add_deck):** `u8 deckId, str name, u16 back, u16 land, 31× u16 cards` (no flag).
   Sent on login to restore saved decks.
 
+## Matchmaking + battle bootstrap (implemented)
+
+Client → Server:
+- **op 0 queue** — `u8 deckId`. Sent by the Arena READY button (deck must have exactly 31 cards).
+- **op 1 cancel** — `u8 deckId`. Leaves the queue.
+- **op 20 battle-ready** — empty. Sent by `rm_battle`'s creation code the moment the client enters
+  the battle room. Use this as the trigger to send that client its board data.
+
+Server → Client (after pairing two queued players):
+- **op 2 battle_start** — `u16 otherPlayer (=1), u16 battleId`. Creates `obj_fade`; the client fades
+  and `room_goto(rm_battle)`. Must be processed while the client is still in the deck-select menu.
+- **op 50 battle_details** — `bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool AI,
+  bool unlocked`. Sent twice per client: `me=1` (self) and `me=0` (opponent). Requires
+  `obj_battle_control` to exist, i.e. send only after the client's op 20.
+- **op 4 battle_data** — `u16 wavePlayer (0 = this client goes first), u8 handSize, handSize x u16
+  cardIds`. Delivers the opening hand and kicks off the mulligan.
+
+Note: opcode 4 = battle_data and opcode 45 = spell_remove (do not confuse the two).
+
 ## Key client scripts (reference)
 
 - `packet_header(op)` → writes `u8 op`, `u16 1374`, `u32 0` (length placeholder)

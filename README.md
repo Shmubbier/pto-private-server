@@ -85,11 +85,22 @@ username/password — this milestone accepts everyone.
    Collection and Deckbuilder screens populate (opcodes 49/60).
 3. **[done]** Deck saving: parse client deck saves (op 47 C→S), persist per-user under `data/`,
    and send saved decks back on login (op 47 S→C).
-4. Account persistence (real user database, password checks, "already logged in").
-5. Matchmaking (Arena queue) — pair two clients.
+4. **[done]** Matchmaking (Arena queue): pair two clients (op 0 join / op 1 cancel), send the
+   `battle_start` handshake so both fade into `rm_battle`, then deliver both players' `battle_details`
+   and each player's opening hand via `battle_data` in response to the client's `op 20` ready signal.
+5. Account persistence (real user database, password checks, "already logged in").
 6. The hard part: the authoritative **battle engine**. The client is fully server-driven —
    every draw/summon/attack/turn is a `container_*` message. Each must be reimplemented
-   server-side per the game's rules (Pixel Tactics ruleset).
+   server-side per the game's rules (Pixel Tactics ruleset). First sub-steps: reveal the board
+   after `battle_data`, resolve the mulligan (`op 37`), and drive turns/waves.
+
+## Verified so far
+
+- Login/lobby/collection/deckbuilder: confirmed against the real client (screenshots).
+- Matchmaking: two clients queue → server pairs them → both receive `battle_start` and transition
+  into the battle room; each then gets both players' details and its own 5-card opening hand.
+  Verified via protocol tests (two scripted clients) and a real client entering `rm_battle`.
+  Fully rendering/playing the board is battle-engine work (item 6).
 
 ## Notes / provenance
 
