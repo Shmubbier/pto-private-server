@@ -1,0 +1,15 @@
+# Build artifacts
+*.exe
+*.pdb
+*.dll
+bin/
+obj/
+
+# Never commit the copyrighted game client or its assets
+data.win
+*.win
+PTO_C.exe
+*.ogg
+D3DX9_43.dll
+win_dev.dll
+settings.ini
