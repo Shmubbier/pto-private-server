@@ -148,11 +148,15 @@ namespace PtoHarness
             Step("B summon hand[0] at (0,0)", () => { b.Summon(0,0,0); Sleep(400); });
             Dump(a,400); Dump(b,400);
 
-            Step("B attack from (0,0) to enemy (0,0)", () => { b.Attack(false,false,0,0,0,0); Sleep(500); });
-            Dump(a,500); Dump(b,500);
-
-            Step("B end turn", () => { b.EndTurn(); Sleep(400); });
-            Dump(a,400); Dump(b,400);
+            Console.WriteLine("\n=== B attacks the enemy leader until it dies ===");
+            bool ended = false;
+            for (int i = 0; i < 30 && !ended; i++)
+            {
+                b.Attack(false,false,0,0,0,0); Sleep(200);
+                foreach (var f in a.Drain(120)) { var l=Decode.Line(f); if(l!=null) Console.WriteLine("  [A] "+l); if(f.Op==3) ended=true; }
+                foreach (var f in b.Drain(120)) { var l=Decode.Line(f); if(l!=null) Console.WriteLine("  [B] "+l); if(f.Op==3) ended=true; }
+            }
+            Console.WriteLine(ended ? "\n*** MATCH COMPLETED (battle_end received) ***" : "\n(no battle_end after 30 attacks)");
 
             a.Close(); b.Close();
             Console.WriteLine("[harness] done");

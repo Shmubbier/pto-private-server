@@ -48,6 +48,12 @@ namespace PtoServer
         public const byte Summon       = 10; // C->S: u8 player, u8 gx, u8 gy, u8 handIndex
         public const byte SummonUnit   = 5;  // S->C (actor): u16 card, u8 x, u8 y, bool isTrap
         public const byte SummonUnitGet= 6;  // S->C (opponent, mirrored): u16 card, u8 x, u8 y, bool isTrap
+        public const byte Attack       = 22; // C->S: bool isSpell, bool selectGrid, u8 ax, u8 ay, u8 tx, u8 ty
+        public const byte AttackOut    = 35; // S->C (actor): u8 ax, u8 ay, u8 vx, u8 vy, u16 dmg, u8 atype, bool activ, bool counter
+        public const byte AttackGet    = 36; // S->C (opponent, mirrored)
+        public const byte UpdateUnit   = 18; // S->C (actor): u8 x,u8 y,u8 atk,u32 life,u8 str,u8 mstr,u8 arm,bool activ,bool death,u16 maxlife
+        public const byte UpdateUnitGet= 19; // S->C (opponent, mirrored)
+        public const byte BattleEnd    = 3;  // S->C: bool won, u16 newRank
     }
 
     // Login response status bytes (first u8 of an Op.Login reply), from container_login.
@@ -182,6 +188,7 @@ namespace PtoServer
                         case Op.BattleReady: SendBattleSetup(ns); break; // client is in rm_battle -> send board
                         case Op.Mulligan:    HandleMulligan(ns); break; // mulligan choices -> start turn when both done
                         case Op.Summon:      HandleSummon(ns, payload); break; // place a hero, relay to both
+                        case Op.Attack:      HandleAttack(ns, payload); break; // attack -> damage -> maybe win
                         case Op.TurnGet:     HandleEndTurn(ns); break; // inbound op14 (empty) = end turn
                         case Op.Ping:    Send(ns, new PacketWriter().Frame(Op.Ping)); break; // echo for latency
                         default:
@@ -314,13 +321,26 @@ namespace PtoServer
             Log("-> saved deck #" + d.Id + " '" + d.Name + "' (" + nonEmpty + " cards) for " + username);
         }
 
+        // --- card stats (auto-generated from the client's card_init) ---------
+        // Index = card_create id; a deck/hand DB id maps to stats via id/2.
+        static readonly int[] CardAtk = new int[]{ 0,2,4,4,6,8,4,5,5,4,4,2,0,0,5,5,4,4,0,1,4,5,4,3,2,1,4,6,3,2,2,5,1,3,4,3,1,1,2,3,4,3,1,3,2,0,2,1,4,2,2,3,3,2,3,4,2,2,3,3,1,1,1,2,3,2,3,0,6,4,5,2,6,3,1,4,5,1,5,3,3,3,3,3,3,3,3,0,1,2,1,1,2,3,4,0,2,5,3,4,4,0,0,0,0,4,0,3,1,2,1,4,3,4,3,3 };
+        static readonly int[] CardLife = new int[]{ 0,17,19,20,17,15,23,18,18,18,19,19,19,21,21,24,17,19,19,17,23,19,18,20,20,22,9,4,7,2,5,5,5,8,6,8,5,8,5,8,7,8,8,4,6,1,6,7,6,7,4,3,5,5,6,4,3,7,6,4,5,7,4,5,7,5,8,5,4,4,20,24,19,19,16,23,16,18,18,24,8,6,6,8,7,6,6,7,4,6,5,5,6,4,4,4,5,4,6,23,22,0,0,0,4,3,6,16,16,6,6,20,7,4,4,5 };
+        static int AtkOf(ushort dbId)  { int c = dbId / 2; return (c >= 0 && c < CardAtk.Length)  ? CardAtk[c]  : 1; }
+        static int LifeOf(ushort dbId) { int c = dbId / 2; return (c >= 0 && c < CardLife.Length) ? CardLife[c] : 10; }
+
         // --- matchmaking / battle bootstrap ---------------------------------
         static readonly Random _rng = new Random(12345);
         const int OpeningHand = 5;
 
         // Per-connection battle assignment, keyed by stream. Set when a match is made; consumed
         // when the client signals rm_battle entry (op 20).
-        class BattleSlot { public Waiting Me; public Waiting Opp; public bool FirstPlayer; public bool Sent; public bool Mulliganed; public ushort[] Hand; }
+        class BattleSlot { public Waiting Me; public Waiting Opp; public bool FirstPlayer; public bool Sent; public bool Mulliganed; public ushort[] Hand; public Battle Battle; public int P; }
+
+        // Authoritative battle state shared by both slots. P[0] = first player, P[1] = second.
+        internal class Battle { public PlayerState[] P = new PlayerState[] { new PlayerState(), new PlayerState() }; public bool Over; }
+        internal class PlayerState { public System.Collections.Generic.Dictionary<int,BUnit> Units = new System.Collections.Generic.Dictionary<int,BUnit>(); public int LeaderLife = 20; public int LeaderMax = 20; public ushort LeaderCard; }
+        internal class BUnit { public ushort Card; public int Atk; public int Life; public int Max; }
+        static int Key(int x, int y) { return x * 10 + y; }
         static readonly object _battleLock = new object();
         static readonly Dictionary<NetworkStream, BattleSlot> _battles = new Dictionary<NetworkStream, BattleSlot>();
 
@@ -329,12 +349,14 @@ namespace PtoServer
         internal static void StartBattle(Waiting a, Waiting b, int battleId)
         {
             Log("MATCH: " + a.User + " vs " + b.User + " (battle " + battleId + ")");
+            var battle = new Battle();
             lock (_battleLock)
             {
                 // The later joiner takes the first turn (nicer for solo-vs-bot: the human, who
                 // queues after the waiting bot, goes first). Arbitrary for two humans.
-                _battles[a.Ns] = new BattleSlot { Me = a, Opp = b, FirstPlayer = false };
-                _battles[b.Ns] = new BattleSlot { Me = b, Opp = a, FirstPlayer = true };
+                // First player = absolute index 0.
+                _battles[a.Ns] = new BattleSlot { Me = a, Opp = b, FirstPlayer = false, Battle = battle, P = 1 };
+                _battles[b.Ns] = new BattleSlot { Me = b, Opp = a, FirstPlayer = true,  Battle = battle, P = 0 };
             }
             // battle_start (op 2): u16 otherPlayer=1, u16 battleId -> fades client into rm_battle.
             byte[] start = new PacketWriter().WriteU16(1).WriteU16((ushort)battleId).Frame(Op.BattleStart);
@@ -357,6 +379,14 @@ namespace PtoServer
             Waiting me = slot.Me, opp = slot.Opp;
             Deck md = DeckStore.Load(me.User)[me.DeckId];
             Deck od = DeckStore.Load(opp.User)[opp.DeckId];
+
+            // Seed this player's leader HP from their deck's leader card (slot 0).
+            if (slot.Battle != null && md != null)
+            {
+                ushort leader = md.Cards.Length > 0 ? md.Cards[0] : (ushort)0;
+                var ps = slot.Battle.P[slot.P];
+                ps.LeaderCard = leader; ps.LeaderMax = ps.LeaderLife = Math.Max(1, LifeOf(leader));
+            }
             ushort myBack = md != null ? md.Back : (ushort)0, myLand = md != null ? md.Land : (ushort)0;
             ushort opBack = od != null ? od.Back : (ushort)0, opLand = od != null ? od.Land : (ushort)0;
 
@@ -440,12 +470,96 @@ namespace PtoServer
             ushort card = (mine.Hand != null && handIndex < mine.Hand.Length) ? mine.Hand[handIndex] : (ushort)0;
             Log("SUMMON " + mine.Me.User + ": hand[" + handIndex + "]=card " + card + " -> (" + gx + "," + gy + ")");
 
+            // track the unit in authoritative state
+            if (mine.Battle != null)
+                mine.Battle.P[mine.P].Units[Key(gx, gy)] =
+                    new BUnit { Card = card, Atk = AtkOf(card), Life = LifeOf(card), Max = LifeOf(card) };
+
             byte[] toActor = new PacketWriter().WriteU16(card).WriteU8(gx).WriteU8(gy).WriteBool(false).Frame(Op.SummonUnit);
             Send(mine.Me.Ns, toActor);
             if (theirs != null)
             {
                 byte[] toOpp = new PacketWriter().WriteU16(card).WriteU8(gx).WriteU8(gy).WriteBool(false).Frame(Op.SummonUnitGet);
                 Send(theirs.Me.Ns, toOpp);
+            }
+        }
+
+        // Player attacks (op 22: bool isSpell, bool selectGrid, u8 ax, u8 ay, u8 tx, u8 ty).
+        // SLICE 1 (best-effort, pending real-client coordinate capture): the attacker deals its
+        // attack stat to the opposing unit at the target cell if present, else to the enemy leader.
+        // Emits attack (op 35/36) + unit update (op 18/19), and battle_end (op 3) on a leader kill.
+        static void HandleAttack(NetworkStream ns, byte[] payload)
+        {
+            BattleSlot mine, theirs = null;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out mine)) return;
+                if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
+            }
+            var r = new PacketReader(payload, 0);
+            bool isSpell = r.ReadBool();
+            bool selectGrid = r.ReadBool();
+            byte ax = r.ReadU8(), ay = r.ReadU8(), tx = r.ReadU8(), ty = r.ReadU8();
+            Log("ATTACK " + mine.Me.User + ": spell=" + isSpell + " selGrid=" + selectGrid +
+                " from(" + ax + "," + ay + ") -> (" + tx + "," + ty + ")   [raw op22 for coordinate mapping]");
+
+            Battle b = mine.Battle; if (b == null || b.Over) return;
+            PlayerState meP = b.P[mine.P];
+            PlayerState opP = b.P[1 - mine.P];
+
+            BUnit attacker; meP.Units.TryGetValue(Key(ax, ay), out attacker);
+            int dmg = Math.Max(1, attacker != null ? attacker.Atk : 1);
+
+            BUnit target; bool hitUnit = opP.Units.TryGetValue(Key(tx, ty), out target);
+            bool leaderDead = false;
+            if (hitUnit)
+            {
+                target.Life -= dmg;
+                bool dead = target.Life <= 0;
+                Log("  -> unit(" + tx + "," + ty + ") card " + target.Card + " takes " + dmg + " (life " + target.Life + (dead ? ", DEAD" : "") + ")");
+                SendAttackAndUpdate(mine, theirs, ax, ay, tx, ty, dmg, target, dead);
+                if (dead) opP.Units.Remove(Key(tx, ty));
+            }
+            else
+            {
+                opP.LeaderLife -= dmg;
+                leaderDead = opP.LeaderLife <= 0;
+                Log("  -> LEADER takes " + dmg + " (leader life " + opP.LeaderLife + (leaderDead ? ", DEAD" : "") + ")");
+                // animate the swing at the target cell even for a leader hit
+                SendAttackAndUpdate(mine, theirs, ax, ay, tx, ty, dmg, null, false);
+            }
+
+            if (leaderDead)
+            {
+                b.Over = true;
+                Log("BATTLE END: " + mine.Me.User + " wins");
+                Send(mine.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
+                if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+            }
+        }
+
+        // Send the attack animation to both clients (mirrored for the opponent) and, when a unit was
+        // hit, its updated stat block via update_unit.
+        static void SendAttackAndUpdate(BattleSlot actor, BattleSlot opp, byte ax, byte ay, byte tx, byte ty,
+                                        int dmg, BUnit target, bool dead)
+        {
+            // op 35 to actor, op 36 (mirrored) to opponent
+            Send(actor.Me.Ns, new PacketWriter().WriteU8(ax).WriteU8(ay).WriteU8(tx).WriteU8((byte)(2 - ty))
+                .WriteU16((ushort)dmg).WriteU8(0).WriteBool(true).WriteBool(false).Frame(Op.AttackOut));
+            if (opp != null)
+                Send(opp.Me.Ns, new PacketWriter().WriteU8(ax).WriteU8((byte)(2 - ay)).WriteU8(tx).WriteU8(ty)
+                    .WriteU16((ushort)dmg).WriteU8(0).WriteBool(true).WriteBool(false).Frame(Op.AttackGet));
+
+            if (target != null)
+            {
+                // update_unit: u8 x,u8 y,u8 atk,u32 life,u8 str,u8 mstr,u8 arm,bool activ,bool death,u16 maxlife
+                Send(actor.Me.Ns, new PacketWriter().WriteU8(tx).WriteU8((byte)(2 - ty)).WriteU8((byte)target.Atk)
+                    .WriteU32((uint)Math.Max(0, target.Life)).WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(false)
+                    .WriteBool(dead).WriteU16((ushort)target.Max).Frame(Op.UpdateUnit));
+                if (opp != null)
+                    Send(opp.Me.Ns, new PacketWriter().WriteU8(tx).WriteU8(ty).WriteU8((byte)target.Atk)
+                        .WriteU32((uint)Math.Max(0, target.Life)).WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(false)
+                        .WriteBool(dead).WriteU16((ushort)target.Max).Frame(Op.UpdateUnitGet));
             }
         }
 
