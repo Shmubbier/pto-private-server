@@ -43,6 +43,8 @@ namespace PtoServer
         public const byte BattleData   = 4;  // S->C: u16 wavePlayer, u8 handSize, handSize x u16 cardIds
         public const byte BattleReady  = 20; // C->S: empty. Sent by rm_battle on entry -> send board data now.
         public const byte BattleDetails= 50; // S->C: bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool AI, bool unlocked
+        public const byte Mulligan     = 37; // C->S: 4x bool (which opening-hand cards to redraw)
+        public const byte TurnGet      = 14; // S->C: u16 player (0 = this client's turn), bool showMsg
     }
 
     // Login response status bytes (first u8 of an Op.Login reply), from container_login.
@@ -171,6 +173,7 @@ namespace PtoServer
                         case Op.Queue:   Matchmaker.Join(ns, username, payload.Length > 0 ? payload[0] : (byte)0); break;
                         case Op.CancelQueue: Matchmaker.Cancel(ns); break;
                         case Op.BattleReady: SendBattleSetup(ns); break; // client is in rm_battle -> send board
+                        case Op.Mulligan:    HandleMulligan(ns); break; // mulligan choices -> start turn when both done
                         case Op.Ping:    Send(ns, new PacketWriter().Frame(Op.Ping)); break; // echo for latency
                         default:
                             if (Verbose) Log("   (unhandled opcode " + opcode + ")");
@@ -308,7 +311,7 @@ namespace PtoServer
 
         // Per-connection battle assignment, keyed by stream. Set when a match is made; consumed
         // when the client signals rm_battle entry (op 20).
-        class BattleSlot { public Waiting Me; public Waiting Opp; public bool FirstPlayer; public bool Sent; }
+        class BattleSlot { public Waiting Me; public Waiting Opp; public bool FirstPlayer; public bool Sent; public bool Mulliganed; }
         static readonly object _battleLock = new object();
         static readonly Dictionary<NetworkStream, BattleSlot> _battles = new Dictionary<NetworkStream, BattleSlot>();
 
@@ -368,6 +371,42 @@ namespace PtoServer
             Send(ns, ms.ToArray());
             Log("-> battle setup to " + me.User + " (firstPlayer=" + slot.FirstPlayer + ", hand=[" +
                 string.Join(",", Array.ConvertAll(hand, x => x.ToString())) + "])");
+        }
+
+        // Client submitted its mulligan (op 37). This first cut keeps the whole hand (no redraws);
+        // once BOTH players have mulliganed, start turn 1. Replacement-draw handling comes later.
+        static void HandleMulligan(NetworkStream ns)
+        {
+            BattleSlot mine, theirs = null;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out mine)) return;
+                mine.Mulliganed = true;
+                if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
+            }
+            Log("MULLIGAN done: " + mine.Me.User);
+            if (theirs != null && theirs.Mulliganed)
+            {
+                Log("Both mulligans in -> starting turn 1 (" +
+                    (mine.FirstPlayer ? mine.Me.User : theirs.Me.User) + " first)");
+                // First player's slot goes first. turn_get(player) is relative: 0 = "my turn".
+                BattleSlot first = mine.FirstPlayer ? mine : theirs;
+                BattleSlot second = mine.FirstPlayer ? theirs : mine;
+                StartTurn1(first, 0);   // first player: it's their turn
+                StartTurn1(second, 1);  // second player: it's the opponent's turn
+            }
+        }
+
+        // Send turn_get twice: anim_turn only runs its body on the 2nd call (the 1st just primes
+        // obj_battle_control.start=1). The 2nd ends the mulligan phase and begins the turn.
+        static void StartTurn1(BattleSlot slot, ushort player)
+        {
+            byte[] prime = new PacketWriter().WriteU16(player).WriteBool(false).Frame(Op.TurnGet);
+            byte[] go    = new PacketWriter().WriteU16(player).WriteBool(true).Frame(Op.TurnGet);
+            var ms = new MemoryStream();
+            ms.Write(prime, 0, prime.Length);
+            ms.Write(go, 0, go.Length);
+            Send(slot.Me.Ns, ms.ToArray());
         }
 
         // Draw the opening hand from a deck's heroes (slot 0 is the leader; slots 1..30 are heroes).

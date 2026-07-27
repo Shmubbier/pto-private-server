@@ -91,8 +91,15 @@ username/password — this milestone accepts everyone.
 5. Account persistence (real user database, password checks, "already logged in").
 6. The hard part: the authoritative **battle engine**. The client is fully server-driven —
    every draw/summon/attack/turn is a `container_*` message. Each must be reimplemented
-   server-side per the game's rules (Pixel Tactics ruleset). First sub-steps: reveal the board
-   after `battle_data`, resolve the mulligan (`op 37`), and drive turns/waves.
+   server-side per the game's rules (Pixel Tactics ruleset).
+   - **[done, first cut]** Board reveal: sending both `battle_details` on the client's `op 20`
+     makes `display_UI` reach 2 (the HUD/board only draw at 2), fixing the earlier black screen.
+   - **[done, first cut]** Mulligan → turn 1: on `op 37` from both players, the server keeps the
+     hand (no redraws yet) and sends `turn_get` (`op 14`) twice per client to end the mulligan and
+     begin turn 1. Verified via scripted clients; real-client visual confirmation pending.
+   - **[todo]** Mulligan redraws, then the in-turn actions: summon (`op 10`), move (`op 26`),
+     attack (`op 35`), orders/spells, wave advance, and win conditions — each relayed and
+     rule-checked server-side.
 
 ## Verified so far
 
