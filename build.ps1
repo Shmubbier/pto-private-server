@@ -1,8 +1,8 @@
-# Compiles PtoServer.cs into PtoServer.exe using the in-box .NET Framework C# compiler.
-# No .NET SDK or internet required.
+# Compiles PtoServer.cs -> PtoServer.exe and PtoHarness.cs -> PtoHarness.exe
+# using the in-box .NET Framework C# compiler. No .NET SDK or internet required.
 $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-$src = Join-Path $PSScriptRoot "PtoServer.cs"
-$out = Join-Path $PSScriptRoot "PtoServer.exe"
-Write-Host "Compiling $src ..."
-& $csc /nologo /optimize+ /out:$out $src
-if ($LASTEXITCODE -eq 0) { Write-Host "OK -> $out" } else { Write-Host "Build failed ($LASTEXITCODE)" }
+& $csc /nologo /optimize+ /out:(Join-Path $PSScriptRoot "PtoServer.exe")  (Join-Path $PSScriptRoot "PtoServer.cs")
+if ($LASTEXITCODE -ne 0) { Write-Host "server build failed"; exit 1 }
+& $csc /nologo /optimize+ /out:(Join-Path $PSScriptRoot "PtoHarness.exe") (Join-Path $PSScriptRoot "PtoHarness.cs")
+if ($LASTEXITCODE -ne 0) { Write-Host "harness build failed"; exit 1 }
+Write-Host "OK -> PtoServer.exe, PtoHarness.exe"

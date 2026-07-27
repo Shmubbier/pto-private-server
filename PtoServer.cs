@@ -112,7 +112,7 @@ namespace PtoServer
 
     class Program
     {
-        const int Port = 51338;
+        static int Port = 51338;           // override with --port N (e.g. for an isolated test server)
         const ushort ClientVersion = 72;   // client sends this; set 0 to accept anything
         static bool Verbose = true;
 
@@ -125,7 +125,11 @@ namespace PtoServer
 
         static void Main(string[] args)
         {
-            foreach (var a in args) if (a == "--quiet") Verbose = false;
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--quiet") Verbose = false;
+                else if (args[i] == "--port" && i + 1 < args.Length) int.TryParse(args[++i], out Port);
+            }
 
             var listener = new TcpListener(IPAddress.Any, Port);
             listener.Start();
