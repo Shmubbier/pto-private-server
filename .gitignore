@@ -1,6 +1,10 @@
 # Runtime per-user state (decks, accounts)
 data/
 
+# Runtime logs / pid files
+*.log
+live_pids.txt
+
 # Build artifacts
 *.exe
 *.pdb
