@@ -44,7 +44,10 @@ namespace PtoServer
         public const byte BattleReady  = 20; // C->S: empty. Sent by rm_battle on entry -> send board data now.
         public const byte BattleDetails= 50; // S->C: bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool AI, bool unlocked
         public const byte Mulligan     = 37; // C->S: 4x bool (which opening-hand cards to redraw)
-        public const byte TurnGet      = 14; // S->C: u16 player (0 = this client's turn), bool showMsg
+        public const byte TurnGet      = 14; // C->S empty = end turn.  S->C: u16 player (0=this client's turn), bool showMsg
+        public const byte Summon       = 10; // C->S: u8 player, u8 gx, u8 gy, u8 handIndex
+        public const byte SummonUnit   = 5;  // S->C (actor): u16 card, u8 x, u8 y, bool isTrap
+        public const byte SummonUnitGet= 6;  // S->C (opponent, mirrored): u16 card, u8 x, u8 y, bool isTrap
     }
 
     // Login response status bytes (first u8 of an Op.Login reply), from container_login.
@@ -174,6 +177,8 @@ namespace PtoServer
                         case Op.CancelQueue: Matchmaker.Cancel(ns); break;
                         case Op.BattleReady: SendBattleSetup(ns); break; // client is in rm_battle -> send board
                         case Op.Mulligan:    HandleMulligan(ns); break; // mulligan choices -> start turn when both done
+                        case Op.Summon:      HandleSummon(ns, payload); break; // place a hero, relay to both
+                        case Op.TurnGet:     HandleEndTurn(ns); break; // inbound op14 (empty) = end turn
                         case Op.Ping:    Send(ns, new PacketWriter().Frame(Op.Ping)); break; // echo for latency
                         default:
                             if (Verbose) Log("   (unhandled opcode " + opcode + ")");
@@ -311,7 +316,7 @@ namespace PtoServer
 
         // Per-connection battle assignment, keyed by stream. Set when a match is made; consumed
         // when the client signals rm_battle entry (op 20).
-        class BattleSlot { public Waiting Me; public Waiting Opp; public bool FirstPlayer; public bool Sent; public bool Mulliganed; }
+        class BattleSlot { public Waiting Me; public Waiting Opp; public bool FirstPlayer; public bool Sent; public bool Mulliganed; public ushort[] Hand; }
         static readonly object _battleLock = new object();
         static readonly Dictionary<NetworkStream, BattleSlot> _battles = new Dictionary<NetworkStream, BattleSlot>();
 
@@ -322,8 +327,10 @@ namespace PtoServer
             Log("MATCH: " + a.User + " vs " + b.User + " (battle " + battleId + ")");
             lock (_battleLock)
             {
-                _battles[a.Ns] = new BattleSlot { Me = a, Opp = b, FirstPlayer = true };
-                _battles[b.Ns] = new BattleSlot { Me = b, Opp = a, FirstPlayer = false };
+                // The later joiner takes the first turn (nicer for solo-vs-bot: the human, who
+                // queues after the waiting bot, goes first). Arbitrary for two humans.
+                _battles[a.Ns] = new BattleSlot { Me = a, Opp = b, FirstPlayer = false };
+                _battles[b.Ns] = new BattleSlot { Me = b, Opp = a, FirstPlayer = true };
             }
             // battle_start (op 2): u16 otherPlayer=1, u16 battleId -> fades client into rm_battle.
             byte[] start = new PacketWriter().WriteU16(1).WriteU16((ushort)battleId).Frame(Op.BattleStart);
@@ -363,6 +370,7 @@ namespace PtoServer
 
             // battle_data (op 4): u16 wavePlayer (0 = my turn), u8 handSize, handSize x u16 cardIds
             ushort[] hand = DealHand(md);
+            slot.Hand = hand; // remember for resolving summon hand-indices
             var dw = new PacketWriter().WriteU16((ushort)(slot.FirstPlayer ? 0 : 1)).WriteU8((byte)hand.Length);
             foreach (ushort c in hand) dw.WriteU16(c);
             byte[] d3 = dw.Frame(Op.BattleData);
@@ -407,6 +415,51 @@ namespace PtoServer
             ms.Write(prime, 0, prime.Length);
             ms.Write(go, 0, go.Length);
             Send(slot.Me.Ns, ms.ToArray());
+        }
+
+        // Player summons a hero (op 10: u8 player, u8 gx, u8 gy, u8 handIndex). Resolve the hand
+        // index to a card id from the tracked hand, then relay the placement to both clients:
+        // summon_unit (op 5) to the actor, summon_unit_get (op 6) to the opponent.
+        static void HandleSummon(NetworkStream ns, byte[] payload)
+        {
+            BattleSlot mine, theirs = null;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out mine)) return;
+                if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
+            }
+            var r = new PacketReader(payload, 0);
+            byte who = r.ReadU8();      // acting player (0)
+            byte gx = r.ReadU8();
+            byte gy = r.ReadU8();
+            byte handIndex = r.ReadU8();
+            ushort card = (mine.Hand != null && handIndex < mine.Hand.Length) ? mine.Hand[handIndex] : (ushort)0;
+            Log("SUMMON " + mine.Me.User + ": hand[" + handIndex + "]=card " + card + " -> (" + gx + "," + gy + ")");
+
+            byte[] toActor = new PacketWriter().WriteU16(card).WriteU8(gx).WriteU8(gy).WriteBool(false).Frame(Op.SummonUnit);
+            Send(mine.Me.Ns, toActor);
+            if (theirs != null)
+            {
+                byte[] toOpp = new PacketWriter().WriteU16(card).WriteU8(gx).WriteU8(gy).WriteBool(false).Frame(Op.SummonUnitGet);
+                Send(theirs.Me.Ns, toOpp);
+            }
+        }
+
+        // Player ends their turn (inbound op 14, empty). Flip the active player: send turn_get so
+        // the opponent's turn begins (player 0 = "my turn" for the recipient).
+        static void HandleEndTurn(NetworkStream ns)
+        {
+            BattleSlot mine, theirs = null;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out mine)) return;
+                if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
+            }
+            Log("END TURN: " + mine.Me.User + " -> passing to " + (theirs != null ? theirs.Me.User : "?"));
+            // start flag is already set from turn 1, so a single turn_get runs anim_turn's body.
+            Send(mine.Me.Ns, new PacketWriter().WriteU16(1).WriteBool(true).Frame(Op.TurnGet)); // not my turn now
+            if (theirs != null)
+                Send(theirs.Me.Ns, new PacketWriter().WriteU16(0).WriteBool(true).Frame(Op.TurnGet)); // your turn
         }
 
         // Draw the opening hand from a deck's heroes (slot 0 is the leader; slots 1..30 are heroes).

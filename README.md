@@ -97,9 +97,16 @@ username/password — this milestone accepts everyone.
    - **[done, first cut]** Mulligan → turn 1: on `op 37` from both players, the server keeps the
      hand (no redraws yet) and sends `turn_get` (`op 14`) twice per client to end the mulligan and
      begin turn 1. Verified via scripted clients; real-client visual confirmation pending.
-   - **[todo]** Mulligan redraws, then the in-turn actions: summon (`op 10`), move (`op 26`),
-     attack (`op 35`), orders/spells, wave advance, and win conditions — each relayed and
-     rule-checked server-side.
+   - **[done, first cut]** Summon (`op 10`): server resolves the hand index to a card and relays
+     the placement — `summon_unit` (`op 5`) to the actor, `summon_unit_get` (`op 6`, mirrored) to
+     the opponent. End turn (`op 14` empty): server flips the active player with `turn_get`.
+   - **[todo — the big one]** Server-authoritative **combat**: the attack request (`op 22`) gives
+     the server attacker+target coords; the server must compute the damage, deaths, and winner and
+     dictate them via `attack` (`op 35`, carries a server-computed `dmg`), `casualties` (`op 23`),
+     unit HP updates, and `battle_end` (`op 3`). This is the Pixel Tactics rules engine (waves,
+     melee/ranged, intercept, armor, counter, orders, spells, leader HP, win). It computes exact
+     values the client only animates, so it needs real-client iteration to get right — it will
+     desync if wrong. This is the remaining bulk of "a completable match".
 
 ## Verified so far
 
