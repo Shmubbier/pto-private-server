@@ -1,9 +1,16 @@
 # Runtime per-user state (decks, accounts)
 data/
 
-# Runtime logs / pid files
+# Runtime logs / pid files / captured output
 *.log
 live_pids.txt
+server_pid.txt
+cli_*.txt
+server_out.txt
+server_err.txt
+server_log.txt
+build_out.txt
+cs_check.txt
 
 # Build artifacts
 *.exe
