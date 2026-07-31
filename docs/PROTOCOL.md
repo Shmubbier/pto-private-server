@@ -94,7 +94,7 @@ Client → Server:
 Server → Client (after pairing two queued players):
 - **op 2 battle_start** — `u16 otherPlayer (=1), u16 battleId`. Creates `obj_fade`; the client fades
   and `room_goto(rm_battle)`. Must be processed while the client is still in the deck-select menu.
-- **op 50 battle_details** — `bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool AI,
+- **op 50 battle_details** — `bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool cpuOpponent,
   bool unlocked`. Sent twice per client: `me=1` (self) and `me=0` (opponent). Requires
   `obj_battle_control` to exist, i.e. send only after the client's op 20.
 - **op 4 battle_data** — `u16 wavePlayer (0 = this client goes first), u8 handSize, handSize x u16

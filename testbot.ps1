@@ -1,7 +1,7 @@
 # Persistent dummy opponent for solo testing. Connects, logs in, queues, and
 # auto-completes its side of the battle handshake (op20 ready, op37 mulligan) so a
 # human client that queues gets matched and can reach the board / turn 1.
-# It does NOT play a turn (no AI yet) — it exists to validate board render + mulligan.
+# It does NOT play a turn (no autoplay logic yet) — it exists to validate board render + mulligan.
 param([string]$Name = "TestBot", [switch]$AutoPlay)
 function New-Packet([byte]$op,[byte[]]$pl){ $t=7+$pl.Length; $ms=New-Object System.IO.MemoryStream; $bw=New-Object System.IO.BinaryWriter($ms); $bw.Write([byte]$op); $bw.Write([uint16]1374); $bw.Write([uint32]$t); if($pl.Length){$bw.Write($pl)}; $bw.Flush(); return $ms.ToArray() }
 function Str([string]$s){ return [System.Text.Encoding]::UTF8.GetBytes($s)+[byte]0 }
