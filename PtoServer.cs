@@ -247,6 +247,7 @@ namespace PtoServer
                         case Op.Summon:     HandleSummon(ns, payload); break;
                         case Op.Attack:     HandleAttack(ns, payload); break;
                         case Op.Move:       HandleMove(ns, payload); break;
+                        case Op.DrawCard:   HandleDraw(ns); break;
                         case Op.TurnGet:    HandleEndTurn(ns); break;
                         case Op.ClearCorpse:HandleClearCorpse(ns, payload); break;
                         case Op.Ping:       Send(ns, new PacketWriter().Frame(Op.Ping)); break;
@@ -559,9 +560,18 @@ namespace PtoServer
             Send(ns, turnGetPrime);
             Log("-> sent initial TurnGet (show_msg=false) to " + me.User);
 
-            // Spawn leader at (1,1) for this player on both clients
-            if (slot.Battle != null)
+            // Spawn both leaders at (1,1) — but ONLY once BOTH clients have entered the battle room
+            // (both did SendBattleSetup). SendLeaderSummon sends a SummonUnitGet (op6) to the
+            // opponent, which crashes a client whose obj_battle_control doesn't exist yet. The
+            // second client to finish setup triggers the leader summons for both.
+            BattleSlot oppSlot = null;
+            lock (_battleLock) { if (slot.Opp != null) _battles.TryGetValue(slot.Opp.Ns, out oppSlot); }
+            if (slot.Battle != null && oppSlot != null && oppSlot.Sent)
+            {
                 SendLeaderSummon(slot, slot.Battle);
+                SendLeaderSummon(oppSlot, slot.Battle);
+                Log("-> both clients in battle; spawned leaders for " + slot.Me.User + " and " + oppSlot.Me.User);
+            }
         }
 
         // Shuffle hero cards (excluding leader at slot 0), draw opening hand,
@@ -635,11 +645,56 @@ namespace PtoServer
                 b.P[b.Active].ActionsRemaining = ActionsPerWave;
                 b.Started = true;
 
+                // Turn 1 ONLY: send a "prime" turn_get first. anim_turn's body (which DESTROYS
+                // obj_mulligan) runs only on the 2nd turn_get (start is 0 on the 1st, set to 1).
+                // If obj_mulligan is never destroyed it freezes obj_unit.mouse_over, so units can
+                // never be clicked to attack/move. SendTurn below sends the real (2nd) turn_get.
+                Send(first.Me.Ns,  new PacketWriter().WriteU16(0).WriteBool(false).Frame(Op.TurnGet));
+                Send(second.Me.Ns, new PacketWriter().WriteU16(1).WriteBool(false).Frame(Op.TurnGet));
                 SendTurn(first, second, b.First);
             }
         }
 
         static void GrantAction(BattleSlot slot) { Send(slot.Me.Ns, new PacketWriter().Frame(Op.CanAction)); }
+
+        // ---- draw a card (op 8) ----------------------------------------------
+        // Client sends op 8 (empty) when the deck is clicked and sets can_do_action=0. If we don't
+        // respond, the player is frozen. Draw the top card into the hand, tell the actor (op 8) and
+        // the opponent (op 9), then consume/restore the action. Every path grants so we never stick.
+        static void HandleDraw(NetworkStream ns)
+        {
+            BattleSlot mine, theirs = null;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out mine)) return;
+                if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
+            }
+            Battle b = mine.Battle;
+            if (b == null || b.Over || !b.Started) { GrantAction(mine); return; }
+            if (mine.P != b.Active) { Log("DRAW from non-active player (ignored)"); GrantAction(mine); return; }
+            PlayerState ps = b.P[mine.P];
+            if (ps.ActionsRemaining <= 0) { Log("DRAW rejected: no actions remaining"); GrantAction(mine); return; }
+            if (ps.Deck == null || ps.Deck.Count == 0) { Log("DRAW: deck empty for " + mine.Me.User); GrantAction(mine); return; }
+
+            ushort card = ps.Deck[0];
+            ps.Deck.RemoveAt(0);
+            mine.Hand.Add(card);
+            byte deckLeft = (byte)Math.Min(255, ps.Deck.Count);
+            byte handSize = (byte)Math.Min(255, mine.Hand.Count);
+            Log("DRAW " + mine.Me.User + ": card " + card + " (deck now " + ps.Deck.Count + ", hand " + mine.Hand.Count + ")");
+
+            // op 8 to actor: bool scry, u8 deckSize, u16 card, bool phantom, u8 fromOrder, bool gridSelf, u8 x, u8 y
+            Send(mine.Me.Ns, new PacketWriter()
+                .WriteBool(false).WriteU8(deckLeft).WriteU16(card).WriteBool(false)
+                .WriteU8(0).WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCard));
+            // op 9 to opponent: bool scry, u8 deckSize, u8 handSize, u8 fromOrder, bool gridSelf, u8 x, u8 y
+            if (theirs != null)
+                Send(theirs.Me.Ns, new PacketWriter()
+                    .WriteBool(false).WriteU8(deckLeft).WriteU8(handSize).WriteU8(0)
+                    .WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCardGet));
+
+            ConsumeAction(mine, theirs, b);
+        }
 
         // ---- summon (op 10) ---------------------------------------------------
 
@@ -654,7 +709,7 @@ namespace PtoServer
 
             Battle b = mine.Battle;
             if (b == null || b.Over || !b.Started) return;
-            if (mine.P != b.Active) { Log("SUMMON from non-active player (ignored)"); return; }
+            if (mine.P != b.Active) { Log("SUMMON from non-active player (ignored)"); GrantAction(mine); return; }
             PlayerState ps = b.P[mine.P];
             if (ps.ActionsRemaining <= 0) { Log("SUMMON rejected: no actions remaining for " + mine.Me.User); GrantAction(mine); return; }
 
@@ -963,15 +1018,15 @@ namespace PtoServer
             // UpdateUnit to opponent (leader's owner) — raw Y
             if (opp != null)
                 Send(opp.Me.Ns, new PacketWriter()
-                    .WriteU8(tx).WriteU8(ty).WriteU8(leaderAtk).WriteU32(leaderLife)
+                    .WriteU8(tx).WriteU8(ty).WriteU8(leaderAtk).WriteU16((ushort)leaderLife)
                     .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true)
-                    .WriteBool(leaderDead).WriteU16(leaderMax)
+                    .WriteBool(leaderDead).WriteU8((byte)leaderMax)
                     .Frame(Op.UpdateUnit));
             // UpdateUnitGet to actor — raw Y (container_update_unit_get: yy = 2 - read)
             Send(actor.Me.Ns, new PacketWriter()
-                .WriteU8(tx).WriteU8(ty).WriteU8(leaderAtk).WriteU32(leaderLife)
+                .WriteU8(tx).WriteU8(ty).WriteU8(leaderAtk).WriteU16((ushort)leaderLife)
                 .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true)
-                .WriteBool(leaderDead).WriteU16(leaderMax)
+                .WriteBool(leaderDead).WriteU8((byte)leaderMax)
                 .Frame(Op.UpdateUnitGet));
         }
 
@@ -1007,23 +1062,25 @@ namespace PtoServer
             if (unit == null) return;
             int curLife = Math.Max(0, unit.Max - unit.Damage);
             bool dead = unit.Damage >= unit.Max;
-            bool active = (x == b.Wave) && !unit.IsCorpse;
+            // Ready = alive, hasn't acted, not summon-sick (see SyncPlayerUnits). A freshly summoned
+            // unit is RecruitedThisWave=true, so it correctly shows greyed until the next wave.
+            bool active = !unit.IsCorpse && !unit.HasAttackedThisWave && !unit.RecruitedThisWave;
             if (PacketLog)
                 Log("[SendUnitUpdateToBoth] -> (" + x + "," + y + ") active=" + (active ? 1 : 0)
                     + " wave=" + b.Wave + " ux=" + x + " isCorpse=" + unit.IsCorpse);
 
             // UpdateUnit to owner — raw Y (unit stored at slot_get_id(x, y))
             Send(ownerSlot.Me.Ns, new PacketWriter()
-                .WriteU8((byte)x).WriteU8((byte)y).WriteU8((byte)unit.Atk).WriteU32((uint)curLife)
+                .WriteU8((byte)x).WriteU8((byte)y).WriteU8((byte)unit.Atk).WriteU16((ushort)curLife)
                 .WriteU8((byte)unit.Strength).WriteU8(0).WriteU8((byte)unit.Armor)
-                .WriteBool(active).WriteBool(dead).WriteU16((ushort)unit.Max)
+                .WriteBool(active).WriteBool(dead).WriteU8((byte)unit.Max)
                 .Frame(Op.UpdateUnit));
             // UpdateUnitGet to opponent — raw Y (container_update_unit_get: yy = 2 - read)
             if (oppSlot != null)
                 Send(oppSlot.Me.Ns, new PacketWriter()
-                    .WriteU8((byte)x).WriteU8((byte)y).WriteU8((byte)unit.Atk).WriteU32((uint)curLife)
+                    .WriteU8((byte)x).WriteU8((byte)y).WriteU8((byte)unit.Atk).WriteU16((ushort)curLife)
                     .WriteU8((byte)unit.Strength).WriteU8(0).WriteU8((byte)unit.Armor)
-                    .WriteBool(active).WriteBool(dead).WriteU16((ushort)unit.Max)
+                    .WriteBool(active).WriteBool(dead).WriteU8((byte)unit.Max)
                     .Frame(Op.UpdateUnitGet));
         }
 
@@ -1172,12 +1229,7 @@ namespace PtoServer
                 b.P[b.Active].ActionsRemaining = ActionsPerWave;
                 ResetWaveFlags(b);
                 Log("  -> round complete -> ROUND " + b.Round + " (attacks " + (b.Round >= 2 ? "ENABLED" : "ceasefire") + "), first=P" + b.First);
-                if (b.Round >= 2)
-                {
-                    Send(p0.Me.Ns, new PacketWriter().Frame(Op.BattleAttackPhase));
-                    Send(p1.Me.Ns, new PacketWriter().Frame(Op.BattleAttackPhase));
-                }
-                SendWave(p0, p1, b);
+                SendWave(p0, p1, b); // op21 (attack phase) is now sent from SendTurn for round >= 2
             }
             SendTurn(p0, p1, b.Active);
         }
@@ -1292,13 +1344,24 @@ namespace PtoServer
             BattleSlot act = active == 0 ? p0 : p1;
             GrantAction(act);
             SyncUnitStates(p0, p1, act.Battle);
+
+            // End the ceasefire from Round 2 on. op 21 sets canatk=1 (never reset) and fades the
+            // "no-attack" label. Sent every turn (after the wave update) so the queued wave_update
+            // can't resurrect the label, and both clients stay unlocked. Idempotent.
+            Battle b = act.Battle;
+            if (b != null && b.Round >= 2)
+            {
+                Send(p0.Me.Ns, new PacketWriter().Frame(Op.BattleAttackPhase));
+                Send(p1.Me.Ns, new PacketWriter().Frame(Op.BattleAttackPhase));
+            }
         }
 
         static void SendWave(BattleSlot p0, BattleSlot p1, Battle b)
         {
             Send(p0.Me.Ns, new PacketWriter().WriteU8((byte)b.Wave).WriteU16((ushort)(b.First == 0 ? 0 : 1)).Frame(Op.WaveUpdate));
             Send(p1.Me.Ns, new PacketWriter().WriteU8((byte)b.Wave).WriteU16((ushort)(b.First == 1 ? 0 : 1)).Frame(Op.WaveUpdate));
-            SyncUnitStates(p0, p1, b);
+            // Note: SyncUnitStates is intentionally NOT called here — SendTurn (called right after
+            // SendWave) syncs unit states once. Calling it in both floods the client's action queue.
         }
 
         static void SendLeaderSummon(BattleSlot slot, Battle b)
@@ -1338,15 +1401,15 @@ namespace PtoServer
 
             // UpdateUnit to owner — raw Y
             Send(ownerSlot.Me.Ns, new PacketWriter()
-                .WriteU8(1).WriteU8((byte)1).WriteU8(leaderAtk).WriteU32(leaderLife)
+                .WriteU8(1).WriteU8((byte)1).WriteU8(leaderAtk).WriteU16((ushort)leaderLife)
                 .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true)
-                .WriteBool(leaderDead).WriteU16(leaderMax)
+                .WriteBool(leaderDead).WriteU8((byte)leaderMax)
                 .Frame(Op.UpdateUnit));
             // UpdateUnitGet to opponent — raw Y (container_update_unit_get: yy = 2 - read)
             Send(oppSlot.Me.Ns, new PacketWriter()
-                .WriteU8(1).WriteU8(1).WriteU8(leaderAtk).WriteU32(leaderLife)
+                .WriteU8(1).WriteU8(1).WriteU8(leaderAtk).WriteU16((ushort)leaderLife)
                 .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true)
-                .WriteBool(leaderDead).WriteU16(leaderMax)
+                .WriteBool(leaderDead).WriteU8((byte)leaderMax)
                 .Frame(Op.UpdateUnitGet));
 
             // 2. Recruited units on grid
@@ -1357,7 +1420,12 @@ namespace PtoServer
 
                 int ux = kvp.Key / 10;
                 int uy = kvp.Key % 10;
-                bool unitActive = (ux == b.Wave) && !u.IsCorpse;
+                // "active" (client: not greyed / can be ordered) means simply READY: alive, hasn't
+                // acted this wave, and isn't summon-sick. It must NOT be tied to the current wave
+                // column — the client already restricts attacks to the active wave via
+                // (global.__wave == grid_x) in the unit action menu. Greying by wave here overrides
+                // anim_wave_update's activate=1 refresh and paints the whole board exhausted.
+                bool unitActive = !u.IsCorpse && !u.HasAttackedThisWave && !u.RecruitedThisWave;
                 int curLife = Math.Max(0, u.Max - u.Damage);
                 if (PacketLog)
                     Log("  unit (" + ux + "," + uy + ") active=" + (unitActive ? 1 : 0)
@@ -1365,15 +1433,15 @@ namespace PtoServer
 
                     // UpdateUnit to owner — raw Y
                 Send(ownerSlot.Me.Ns, new PacketWriter()
-                    .WriteU8((byte)ux).WriteU8((byte)uy).WriteU8((byte)u.Atk).WriteU32((uint)curLife)
+                    .WriteU8((byte)ux).WriteU8((byte)uy).WriteU8((byte)u.Atk).WriteU16((ushort)curLife)
                     .WriteU8((byte)u.Strength).WriteU8(0).WriteU8((byte)u.Armor)
-                    .WriteBool(unitActive).WriteBool(u.Damage >= u.Max).WriteU16((ushort)u.Max)
+                    .WriteBool(unitActive).WriteBool(u.Damage >= u.Max).WriteU8((byte)u.Max)
                     .Frame(Op.UpdateUnit));
                 // UpdateUnitGet to opponent — raw Y
                 Send(oppSlot.Me.Ns, new PacketWriter()
-                    .WriteU8((byte)ux).WriteU8((byte)uy).WriteU8((byte)u.Atk).WriteU32((uint)curLife)
+                    .WriteU8((byte)ux).WriteU8((byte)uy).WriteU8((byte)u.Atk).WriteU16((ushort)curLife)
                     .WriteU8((byte)u.Strength).WriteU8(0).WriteU8((byte)u.Armor)
-                    .WriteBool(unitActive).WriteBool(u.Damage >= u.Max).WriteU16((ushort)u.Max)
+                    .WriteBool(unitActive).WriteBool(u.Damage >= u.Max).WriteU8((byte)u.Max)
                     .Frame(Op.UpdateUnitGet));
             }
         }
@@ -1403,7 +1471,9 @@ namespace PtoServer
                     if (opcode == Op.UpdateUnit || opcode == Op.UpdateUnitGet)
                     {
                         string ann = "";
-                        if (data.Length >= 18) ann = " activate=" + data[17];
+                        // payload layout: x,y,atk,life(u16),str,mstr,arm,activ,dead,max(u8).
+                        // 7-byte frame header + activ at payload index 8 => data[15].
+                        if (data.Length >= 16) ann = " activate=" + data[15];
                         Log("-> " + (opcode == Op.UpdateUnit ? "UpdateUnit" : "UpdateUnitGet")
                             + " (" + data.Length + "B)" + ann + " " + Hex(data, 0));
                     }
