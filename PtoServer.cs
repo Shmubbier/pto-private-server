@@ -42,7 +42,8 @@ namespace PtoServer
         public const byte Loaded  = 48;
         public const byte Ping    = 52;
         public const byte Stages  = 60;
-        public const byte Orbs    = 62;
+        public const byte Orbs    = 62;  // battle: set your own orb count (container_orbs, u8)
+        public const byte OrbsGet = 63;  // battle: opponent's orb count (cosmetic)
 
         // matchmaking / battle
         public const byte Queue        = 0;
@@ -73,6 +74,7 @@ namespace PtoServer
         public const byte ClearCorpseGet = 25;
         public const byte Move         = 26;
         public const byte MoveGet      = 27;
+        public const byte Order        = 28;  // client->server: cast an order / targeted spell
         public const byte DeckUpdate   = 54;
         public const byte CardHover    = 7;   // client->server: card hover (cosmetic)
         public const byte ArrowPos     = 34;  // client->server: arrow position (cosmetic)
@@ -155,6 +157,7 @@ namespace PtoServer
         static bool PacketLog = true;
         const int ActionsPerWave = 2;
         const int OpeningHand = 5;
+        const byte OrbPool = 20;  // orbs granted to each player at the start of every turn (for orders)
 
         static readonly object _logLock = new object();
         static StreamWriter _logFile;
@@ -247,6 +250,7 @@ namespace PtoServer
                         case Op.Summon:     HandleSummon(ns, payload); break;
                         case Op.Attack:     HandleAttack(ns, payload); break;
                         case Op.Move:       HandleMove(ns, payload); break;
+                        case Op.Order:      HandleOrder(ns, payload); break;
                         case Op.DrawCard:   HandleDraw(ns); break;
                         case Op.TurnGet:    HandleEndTurn(ns); break;
                         case Op.ClearCorpse:HandleClearCorpse(ns, payload); break;
@@ -542,7 +546,12 @@ namespace PtoServer
 
             // Deal opening hand and initialize deck
             ushort[] hand = InitializeDeckAndDrawHand(md, slot);
+            // The client draws the opening hand by front-inserting each card (container_battle_data ->
+            // anim_draw_card_self: ds_list_insert(hand, 0, ...)), so its displayed hand is the REVERSE
+            // of the order we send. Store the reverse here so the hand index the client sends on summon
+            // maps to the same card. (Draws below likewise Insert(0) to match.)
             slot.Hand = new List<ushort>(hand);
+            slot.Hand.Reverse();
             var dw = new PacketWriter().WriteU16((ushort)(slot.FirstPlayer ? 0 : 1)).WriteU8((byte)hand.Length);
             foreach (ushort c in hand) dw.WriteU16(c);
             byte[] d3 = dw.Frame(Op.BattleData);
@@ -610,26 +619,16 @@ namespace PtoServer
             bool[] redraw = new bool[4];
             for (int i = 0; i < 4 && i < payload.Length; i++) redraw[i] = r.ReadBool();
 
-            PlayerState ps = mine.Battle.P[mine.P];
-            int redrawCount = 0;
-            for (int i = 3; i >= 0; i--) // reverse order to avoid index shift
-            {
-                if (redraw[i] && i < mine.Hand.Count && ps.Deck.Count > 0)
-                {
-                    ushort old = mine.Hand[i];
-                    mine.Hand.RemoveAt(i);
-                    // Return to bottom of deck (optional: could shuffle back)
-                    ps.Deck.Add(old);
-                    // Draw replacement
-                    ushort drawn = ps.Deck[0];
-                    ps.Deck.RemoveAt(0);
-                    mine.Hand.Insert(i, drawn);
-                    redrawCount++;
-                }
-            }
-            if (redrawCount > 0)
-                Log("MULLIGAN " + mine.Me.User + ": redraw " + redrawCount + " cards -> hand=[" +
-                    string.Join(",", mine.Hand.ConvertAll(x => x.ToString()).ToArray()) + "]");
+            // NOTE: mulligan redraw is intentionally DISABLED (keep all cards). Redrawing requires
+            // the server to tell the client to delete the mulliganed card (anim_mull_back) and draw
+            // its replacement; without that response the client keeps showing the OLD card while the
+            // server holds the NEW one, so the hand index the client sends on summon maps to the wrong
+            // card. Until that response protocol is implemented, we leave the hand untouched so the
+            // server's hand and the client's displayed hand stay identical.
+            int marked = 0;
+            for (int i = 0; i < 4; i++) if (redraw[i]) marked++;
+            if (marked > 0)
+                Log("MULLIGAN " + mine.Me.User + ": " + marked + " card(s) marked but redraw is disabled (kept in sync)");
 
             mine.Mulliganed = true;
             Log("MULLIGAN done: " + mine.Me.User);
@@ -678,7 +677,7 @@ namespace PtoServer
 
             ushort card = ps.Deck[0];
             ps.Deck.RemoveAt(0);
-            mine.Hand.Add(card);
+            mine.Hand.Insert(0, card); // client draws to the front of its hand (anim_draw_card_self); mirror it
             byte deckLeft = (byte)Math.Min(255, ps.Deck.Count);
             byte handSize = (byte)Math.Min(255, mine.Hand.Count);
             Log("DRAW " + mine.Me.User + ": card " + card + " (deck now " + ps.Deck.Count + ", hand " + mine.Hand.Count + ")");
@@ -694,6 +693,189 @@ namespace PtoServer
                     .WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCardGet));
 
             ConsumeAction(mine, theirs, b);
+        }
+
+        // ---- order / targeted spell (op 28) -----------------------------------
+        // Client sends: u8 card, bool grid, u8 x, u8 y, u16 cardId (see battle_order_attack).
+        // cardId == 0 is a cancel (player clicked empty). Effects are server-authoritative: we
+        // mutate the data model, then SyncUnitStates pushes the new life/state to both clients
+        // (no dedicated cast animation yet — the life bars just update). Orders/spells we haven't
+        // implemented fall through to a graceful no-op (action refunded) so nothing freezes.
+        enum OrderKind { None, DamageSingle, DamageRow, DamageColumn, DamageBlast, DamageAll, HealSingle, HealAll, HealLeader }
+
+        struct OrderEffect { public OrderKind Kind; public int Amount; }
+
+        // Effects for the tester Arena deck (card id = REAL*2). Damage orders hit the enemy grid,
+        // heals hit the caster's grid. Unimplemented cards return None (graceful no-op).
+        static OrderEffect OrderOf(ushort cardId)
+        {
+            switch (cardId / 2)
+            {
+                case 26: return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 5 }; // Fighter: Thunder 5
+                case 28: return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 8 }; // Berserker: Bombard 8
+                case 30: return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 3 }; // Alchemist: Poison 3 (simplified)
+                case 31: return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 5 }; // Gunner: Bombard Row 5
+                case 32: return new OrderEffect { Kind = OrderKind.HealAll,      Amount = 4 }; // Healer: Cure All 4
+                case 35: return new OrderEffect { Kind = OrderKind.DamageBlast,  Amount = 4 }; // Knight: Blast 4
+                case 41: return new OrderEffect { Kind = OrderKind.DamageColumn, Amount = 5 }; // Planestalker: Bombard Column 5
+                case 43: return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 5 }; // Pyromancer: Fire 5
+                case 52: return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 4 }; // Fire Elemental: Fire 4
+                case 53: return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 5 }; // Water Elemental: Cure 5
+                case 56: return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 4 }; // Lightning Elemental: Thunder 4
+                default: return new OrderEffect { Kind = OrderKind.None };
+            }
+        }
+
+        static void HandleOrder(NetworkStream ns, byte[] payload)
+        {
+            BattleSlot mine, theirs = null;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out mine)) return;
+                if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
+            }
+
+            Battle b = mine.Battle;
+            if (b == null || b.Over || !b.Started) { GrantAction(mine); return; }
+
+            var r = new PacketReader(payload, 0);
+            byte card = r.ReadU8();
+            bool grid = r.ReadBool();
+            byte x = r.ReadU8(), y = r.ReadU8();
+            ushort cardId = r.ReadU16();
+
+            // cardId 0 = the player cancelled (clicked empty). Restore the action, do nothing.
+            if (cardId == 0) { Log("ORDER cancelled by " + mine.Me.User); GrantAction(mine); return; }
+            if (mine.P != b.Active) { Log("ORDER from non-active player (ignored)"); GrantAction(mine); return; }
+
+            PlayerState ps = b.P[mine.P];
+            if (ps.ActionsRemaining <= 0) { Log("ORDER rejected: no actions remaining"); GrantAction(mine); return; }
+
+            OrderEffect eff = OrderOf(cardId);
+            Log("ORDER " + mine.Me.User + ": card " + cardId + " kind=" + eff.Kind + " amt=" + eff.Amount +
+                " grid=" + grid + " target(" + x + "," + y + ")");
+            if (eff.Kind == OrderKind.None)
+            {
+                Log("  -> order effect not implemented yet; no-op (action refunded)");
+                GrantAction(mine);
+                return;
+            }
+
+            ResolveEffect(eff, mine, theirs, b, x, y);
+        }
+
+        // Apply an order/spell effect and push results to both clients. (x,y) are the raw client
+        // target coords: damage effects hit the enemy grid (gy mirrored 2-y), heals hit the caster's
+        // grid (gy = y). Shared by HandleOrder (op28) and the isSpell path of HandleAttack (op22).
+        static void ResolveEffect(OrderEffect eff, BattleSlot mine, BattleSlot theirs, Battle b, byte x, byte y)
+        {
+            PlayerState ps = b.P[mine.P];
+            PlayerState opPs = b.P[1 - mine.P];
+            int gx = x;
+            int enemyGy = 2 - y;   // the enemy board is Y-mirrored on the caster's screen
+            int selfGy = y;
+
+            switch (eff.Kind)
+            {
+                case OrderKind.DamageSingle:
+                    DamageEnemyAt(opPs, gx, enemyGy, eff.Amount);
+                    break;
+                case OrderKind.DamageRow:      // "in a row" = fixed gy, all gx (see order_fire_4)
+                    for (int cx = 0; cx <= 2; cx++) DamageEnemyAt(opPs, cx, enemyGy, eff.Amount);
+                    break;
+                case OrderKind.DamageColumn:   // fixed gx, all gy
+                    for (int cy = 0; cy <= 2; cy++) DamageEnemyAt(opPs, gx, cy, eff.Amount);
+                    break;
+                case OrderKind.DamageBlast:    // target + its column-neighbours
+                    DamageEnemyAt(opPs, gx, enemyGy, eff.Amount);
+                    DamageEnemyAt(opPs, gx, enemyGy - 1, eff.Amount);
+                    DamageEnemyAt(opPs, gx, enemyGy + 1, eff.Amount);
+                    break;
+                case OrderKind.DamageAll:
+                    foreach (var kv in opPs.Units) { BUnit u = kv.Value; if (u != null && !u.IsCorpse) u.Damage += Math.Max(1, eff.Amount - u.Armor); }
+                    break;
+                case OrderKind.HealSingle:
+                    HealOwnAt(ps, gx, selfGy, eff.Amount);
+                    break;
+                case OrderKind.HealAll:
+                    foreach (var kv in ps.Units) { BUnit u = kv.Value; if (u != null && !u.IsCorpse) u.Damage = Math.Max(0, u.Damage - eff.Amount); }
+                    ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + eff.Amount);
+                    break;
+                case OrderKind.HealLeader:
+                    ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + eff.Amount);
+                    break;
+            }
+
+            // A single-target damage can hit the enemy leader at (1,1) — check for a win.
+            if (opPs.LeaderLife <= 0)
+            {
+                b.Over = true;
+                Log("BATTLE END: " + mine.Me.User + " wins (order/spell lethal)");
+                Send(mine.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
+                if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                return;
+            }
+
+            // Push updated life/state to both clients, then spend the action.
+            BattleSlot p0slot = mine.P == 0 ? mine : theirs;
+            BattleSlot p1slot = mine.P == 0 ? theirs : mine;
+            if (p0slot != null && p1slot != null) SyncUnitStates(p0slot, p1slot, b);
+            ConsumeAction(mine, theirs, b);
+        }
+
+        // Wave-position spells (v/f/r) for the deck. wave: 2=Vanguard,1=Flank,0=Rear (=caster grid_x).
+        static OrderEffect SpellOf(ushort cardId, int wave)
+        {
+            switch (cardId / 2)
+            {
+                case 28: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 5 }; break; // Berserker R: Bombard 5
+                case 29: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 4 };        // Assassin V: Backstab 4
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 2 }; break; // Assassin R: Backstab 2
+                case 30: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 1 }; break; // Alchemist R: Poison 1
+                case 32: if (wave == 1) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Healer F: Cure 4
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.HealAll,      Amount = 2 }; break; // Healer R: Cure All 2
+                case 36: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 }; break; // Mascot V: Cure 4
+                case 37: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 }; break; // Mystic V: Cure 4
+                case 42: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Priestess V: Cure 4
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.HealLeader,   Amount = 2 }; break; // Priestess F: Cure Leader 2
+                case 43: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageBlast,  Amount = 3 };        // Pyromancer V: Blast 3
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 3 }; break; // Pyromancer R: Fire 3
+                case 52: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 2 }; break; // Fire Elem R: Fire 2
+                case 53: if (wave == 0) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 3 }; break; // Water Elem R: Cure 3
+                case 56: if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 2 }; break; // Lightning Elem F: Thunder 2
+            }
+            return new OrderEffect { Kind = OrderKind.None };
+        }
+
+        // Apply order damage to an enemy unit (or the enemy leader at 1,1). Unit death is resolved
+        // at wave end by ProcessCasualties, exactly like attack damage.
+        static void DamageEnemyAt(PlayerState opPs, int gx, int gy, int dmg)
+        {
+            if (gx < 0 || gx > 2 || gy < 0 || gy > 2) return;
+            if (gx == 1 && gy == 1) { opPs.LeaderLife -= dmg; Log("    damage -> enemy LEADER -" + dmg + " (life " + opPs.LeaderLife + ")"); return; }
+            BUnit u;
+            if (opPs.Units.TryGetValue(Key(gx, gy), out u) && u != null && !u.IsCorpse)
+            {
+                int actual = Math.Max(1, dmg - u.Armor);
+                u.Damage += actual;
+                Log("    damage -> enemy (" + gx + "," + gy + ") card " + u.Card + " -" + actual + " (now " + Math.Max(0, u.Max - u.Damage) + "/" + u.Max + ")");
+            }
+            else Log("    damage -> no enemy unit at (" + gx + "," + gy + ")");
+        }
+
+        static void HealOwnAt(PlayerState ps, int gx, int gy, int amount)
+        {
+            if (gx < 0 || gx > 2 || gy < 0 || gy > 2) return;
+            if (gx == 1 && gy == 1) { ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + amount); Log("    heal -> own LEADER +" + amount + " (life " + ps.LeaderLife + ")"); return; }
+            BUnit u;
+            if (ps.Units.TryGetValue(Key(gx, gy), out u) && u != null && !u.IsCorpse)
+            {
+                int before = Math.Max(0, u.Max - u.Damage);
+                u.Damage = Math.Max(0, u.Damage - amount);
+                int after = Math.Max(0, u.Max - u.Damage);
+                Log("    heal -> own (" + gx + "," + gy + ") card " + u.Card + " " + before + "->" + after + "/" + u.Max + (before == u.Max ? " (was already full — nothing to heal)" : ""));
+            }
+            else Log("    heal -> no own unit at (" + gx + "," + gy + ")");
         }
 
         // ---- summon (op 10) ---------------------------------------------------
@@ -803,6 +985,31 @@ namespace PtoServer
 
             Log("ATTACK " + mine.Me.User + ": spell=" + isSpell + " from(" + ax + "," + ay + ") -> (" + tx + "," + serverTy + ")");
 
+            // Spells (instant self-cast OR targeted) reuse op 22 with the spell flag set. The packet
+            // carries the caster's coords (ax,ay) and a target (tx,ty). We identify the caster's card
+            // + wave (wave = ax = the caster's grid_x column), resolve its wave-spell (SpellOf), and
+            // apply it to the target. MUST NOT fall through to attack logic (that would make the
+            // caster melee the mirrored slot and get counter-killed). Unimplemented spells no-op.
+            if (isSpell)
+            {
+                ushort casterCard = 0;
+                if (ax == 1 && ay == 1) casterCard = ps.LeaderCard;
+                else { BUnit cu; if (ps.Units.TryGetValue(Key(ax, ay), out cu) && cu != null && !cu.IsCorpse) casterCard = cu.Card; }
+
+                OrderEffect seff = (casterCard != 0) ? SpellOf(casterCard, ax) : new OrderEffect { Kind = OrderKind.None };
+                Log("SPELL " + mine.Me.User + ": card " + casterCard + " wave " + ax + " kind=" + seff.Kind + " target(" + tx + "," + ty + ")");
+                if (seff.Kind == OrderKind.None)
+                {
+                    Log("  -> spell not implemented yet; no-op (action refunded)");
+                    GrantAction(mine);
+                    BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
+                    if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b);
+                    return;
+                }
+                ResolveEffect(seff, mine, theirs, b, tx, ty);
+                return;
+            }
+
             // Find attacker
             BUnit attacker;
             bool attackerIsLeader = (ax == 1 && ay == 1);
@@ -854,11 +1061,13 @@ namespace PtoServer
                 BUnit targetUnit;
                 if (!opPs.Units.TryGetValue(targetKey, out targetUnit) || targetUnit.IsCorpse)
                 {
-                    // No alive unit at target - check if we can hit the leader
-                    // (melee can hit leader if no alive unit in front of it in same column)
-                    if (!CanMeleeTargetLeader(ay, opPs, b))
+                    // No alive unit at the target cell. The only thing that can be hit through an
+                    // empty cell is the leader, and the leader sits behind the CENTER lane (gy=1).
+                    // So this is only valid when the TARGET lane is the center and its Vanguard is
+                    // clear. (Bug fix: this used the attacker's lane 'ay' instead of the target
+                    // lane 'serverTy', which let empty side tiles wrongly hit or wrongly reject.)
+                    if (!CanMeleeTargetLeader(serverTy, opPs, b))
                     { Log("ATTACK rejected: no valid melee target at (" + tx + "," + serverTy + ")"); GrantAction(mine); return; }
-                    // If we got here, the target IS the leader (tx=1, ty=1)
                     targetIsLeader = true;
                 }
                 else
@@ -895,7 +1104,11 @@ namespace PtoServer
                 opPs.LeaderLife -= rawDmg;
                 leaderDied = opPs.LeaderLife <= 0;
                 Log("  -> LEADER takes " + rawDmg + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
-                SendAttackAndLeaderUpdate(mine, theirs, ax, ay, tx, serverTy, rawDmg, attackerIsLeader, opPs, isRanged, false, b);
+                // Target the leader's real slot (1,1), NOT the empty front slot the client aimed at.
+                // The client's attack animation looks up a unit at the target coords; sending the
+                // empty slot makes that lookup undefined and crashes (and mis-addresses the leader's
+                // HP update). The leader is always stored at (1,1) on both grids.
+                SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, rawDmg, attackerIsLeader, opPs, isRanged, false, b);
             }
             else
             {
@@ -929,7 +1142,8 @@ namespace PtoServer
                     opPs.LeaderLife -= rawDmg;
                     leaderDied = opPs.LeaderLife <= 0;
                     Log("  -> LEADER (no unit at target) takes " + rawDmg + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
-                    SendAttackAndLeaderUpdate(mine, theirs, ax, ay, tx, serverTy, rawDmg, attackerIsLeader, opPs, isRanged, false, b);
+                    // Target the leader's real slot (1,1) — see note above; empty-slot coords crash the client.
+                    SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, rawDmg, attackerIsLeader, opPs, isRanged, false, b);
                 }
             }
 
@@ -953,15 +1167,14 @@ namespace PtoServer
         // Melee: can the attacker target the leader at (1,1)?
         // col = attacker's column (grid_y). Leader is at wave=1, col=1.
         // Only if no alive unit is in front of the leader (wave > 1) in the same column.
-        static bool CanMeleeTargetLeader(int col, PlayerState opPs, Battle b)
+        // The leader sits at the center (1,1), behind the center-lane Vanguard (2,1). It can be
+        // melee'd only by attacking the CENTER lane (targetCol == 1) once that Vanguard is gone.
+        static bool CanMeleeTargetLeader(int targetCol, PlayerState opPs, Battle b)
         {
-            for (int wave = 2; wave > 1; wave--)
-            {
-                int k = Key(wave, col);
-                BUnit u;
-                if (opPs.Units.TryGetValue(k, out u) && !u.IsCorpse) return false;
-            }
-            return true; // no blockers, can hit leader
+            if (targetCol != 1) return false; // only the center lane leads to the leader
+            BUnit u;
+            if (opPs.Units.TryGetValue(Key(2, 1), out u) && u != null && !u.IsCorpse) return false; // center Vanguard blocks
+            return true;
         }
 
         // Is the unit at (x, y) the frontmost alive unit in its column?
@@ -1344,6 +1557,15 @@ namespace PtoServer
             BattleSlot act = active == 0 ? p0 : p1;
             GrantAction(act);
             SyncUnitStates(p0, p1, act.Battle);
+
+            // Grant a generous orb pool each turn so orders (which cost orbs) are always affordable.
+            // op62 sets the recipient's OWN orb count; op63 shows the opponent's count (cosmetic).
+            // Orbs start at 0 (container_battle_start) and only change via these packets, so without
+            // this the player can never afford any order.
+            Send(p0.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.Orbs));
+            Send(p1.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.Orbs));
+            Send(p0.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.OrbsGet));
+            Send(p1.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.OrbsGet));
 
             // End the ceasefire from Round 2 on. op 21 sets canatk=1 (never reset) and fades the
             // "no-attack" label. Sent every turn (after the wave update) so the queued wave_update

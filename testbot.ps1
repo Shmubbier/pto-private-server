@@ -11,7 +11,9 @@ $c=New-Object System.Net.Sockets.TcpClient; $c.Connect("127.0.0.1",51338); $ns=$
 $ns.Write((New-Packet 46 (@([byte]0)+(Str $Name)+(Str "pw")+(U16 72))),0,999) 2>$null
 $p=New-Packet 46 (@([byte]0)+(Str $Name)+(Str "pw")+(U16 72)); $ns.Write($p,0,$p.Length); $ns.Flush()
 Start-Sleep -Milliseconds 500; $b=New-Object byte[] 16384; [void]$ns.Read($b,0,$b.Length)
-$cards=@(2)+(26..55); $dp=@([byte]0)+(Str "Deck")+@([byte]0)+(U16 1)+(U16 2); foreach($cc in $cards){$dp+=(U16 $cc)}
+# Use the finished unit pool (cards 52,54,..,110 = REAL 26-55), same legal deck as the human.
+# The old 26..55 range was leader cards (REAL 13-27) whose inflated stats one-shot units.
+$cards=@(2)+(0..29 | ForEach-Object {52 + $_ * 2}); $dp=@([byte]0)+(Str "Deck")+@([byte]0)+(U16 1)+(U16 2); foreach($cc in $cards){$dp+=(U16 $cc)}
 $p=New-Packet 47 $dp; $ns.Write($p,0,$p.Length); $ns.Flush(); Start-Sleep -Milliseconds 300
 $p=New-Packet 0 @([byte]0); $ns.Write($p,0,$p.Length); $ns.Flush()
 Write-Host "$Name queued, waiting for a human to match..."
