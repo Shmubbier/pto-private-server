@@ -64,6 +64,8 @@ namespace PtoServer
         public const byte AttackGet    = 36;
         public const byte UpdateUnit   = 18;
         public const byte UpdateUnitGet= 19;
+        public const byte UpdateBuff   = 38;  // battle: per-unit buff/state (atktype, incorp, adpx, ...) 20 bytes
+        public const byte UpdateBuffGet= 39;  // battle: same, opponent view (yy mirrored client-side)
         public const byte BattleEnd    = 3;
         public const byte CanAction    = 40;
         public const byte Action       = 15;  // battle: set your remaining action count (u8); orders need >=1
@@ -406,6 +408,65 @@ namespace PtoServer
                 if (atk >= 3 && life >= 16 && life <= 20) return UnitAbility.RangedAttack;
             }
             return UnitAbility.None;
+        }
+
+        // Ranged-attack per wave, indexed by REAL card id (card/2). Bit W set => ranged at wave W
+        // (wave: 2=Vanguard, 1=Flank, 0=Rear). Derived from the client card_init descriptions
+        // ("R.Attack" at a wave). Used for BOTH the client atktype (update_buff) and the server's
+        // no-counter/ranged-targeting, so the two always agree.
+        static readonly byte[] RangedWaves = BuildRangedWaves();
+        static byte[] BuildRangedWaves()
+        {
+            var a = new byte[128];
+            a[27] = 0x1; // Dragon Mage  - Rear R.Attack
+            a[31] = 0x7; // Gunner       - all waves R.Attack
+            a[41] = 0x7; // Planestalker - all waves R.Attack
+            a[43] = 0x2; // Pyromancer   - Flank R.Attack
+            a[52] = 0x2; // Fire Elem    - Flank R.Attack
+            a[54] = 0x2; // Air Elem     - Flank R.Attack
+            a[55] = 0x2; // Dark Elem    - Flank R.Attack
+            return a;
+        }
+        static bool IsRangedAtWave(ushort card, int wave)
+        {
+            int c = card / 2;
+            if (c < 0 || c >= RangedWaves.Length || wave < 0 || wave > 2) return false;
+            return (RangedWaves[c] & (1 << wave)) != 0;
+        }
+
+        // Build a 20-byte update_buff payload for a unit at (x, y). All fields are 1 byte. s8 fields
+        // default to -1 (sent as 255). We only vary atktype (ranged), inter(cept), and adpx (= grid_x,
+        // which drives the client's wave-spell selection); everything else is the no-buff default.
+        static PacketWriter BuildBuff(int x, int y, byte atktype, bool intercept)
+        {
+            return new PacketWriter()
+                .WriteU8((byte)x).WriteU8((byte)y).WriteU8(atktype)
+                .WriteBool(intercept)     // inter
+                .WriteU8(255)             // ongo (s8 -1)
+                .WriteBool(false)         // covered
+                .WriteU8(255).WriteU8(255)// coveredx, coveredy (s8 -1)
+                .WriteBool(false)         // incorp (0 -> no crash on return_noone_infront)
+                .WriteBool(false)         // shield
+                .WriteBool(false)         // silence
+                .WriteBool(false)         // rev
+                .WriteBool(false)         // cnter
+                .WriteBool(false)         // immort
+                .WriteBool(false)         // deathpro
+                .WriteU8((byte)x)         // adpx = grid_x (wave) -> spellid follows the unit on move
+                .WriteBool(true)          // can_attack
+                .WriteU8(99)              // m_actions
+                .WriteU8(0)               // actions
+                .WriteBool(false);        // dec
+        }
+
+        // Send a unit's buff/state to both clients (op38 to owner raw-Y, op39 to opponent Y-mirrored).
+        static void SendUnitBuff(BattleSlot ownerSlot, BattleSlot oppSlot, int x, int y, BUnit unit)
+        {
+            if (unit == null || unit.IsCorpse) return;
+            byte atktype = (byte)(IsRangedAtWave(unit.Card, x) ? 1 : 0);
+            bool intercept = (unit.Abilities & UnitAbility.Intercept) != 0;
+            Send(ownerSlot.Me.Ns, BuildBuff(x, y, atktype, intercept).Frame(Op.UpdateBuff));
+            if (oppSlot != null) Send(oppSlot.Me.Ns, BuildBuff(x, y, atktype, intercept).Frame(Op.UpdateBuffGet));
         }
 
         static int GetUnitArmor(ushort card, int wave)
@@ -1070,7 +1131,9 @@ namespace PtoServer
             { Log("ATTACK rejected: attacker was recruited this wave"); GrantAction(mine); return; }
 
             // Determine attack type: ranged if unit has RangedAttack ability
-            bool isRanged = (attacker.Abilities & UnitAbility.RangedAttack) != 0;
+            // Ranged is decided by the same table the client's atktype (update_buff) uses, so the
+            // two never disagree. Leaders melee. ax is the attacker's wave (grid_x).
+            bool isRanged = !attackerIsLeader && IsRangedAtWave(attacker.Card, ax);
 
             // Find target (using server Y coordinate)
             PlayerState opPs = b.P[1 - mine.P];
@@ -1321,6 +1384,9 @@ namespace PtoServer
                     .WriteU8((byte)unit.Strength).WriteU8(0).WriteU8((byte)unit.Armor)
                     .WriteBool(active).WriteBool(dead).WriteU8((byte)unit.Max)
                     .Frame(Op.UpdateUnitGet));
+
+            // Buff/state (atktype for ranged, incorp=0, adpx=wave). x is the unit's wave (grid_x).
+            SendUnitBuff(ownerSlot, oppSlot, x, y, unit);
         }
 
         // ---- move (op 26) -----------------------------------------------------
@@ -1694,6 +1760,9 @@ namespace PtoServer
                     .WriteU8((byte)u.Strength).WriteU8(0).WriteU8((byte)u.Armor)
                     .WriteBool(unitActive).WriteBool(unitDead).WriteU8((byte)u.Max)
                     .Frame(Op.UpdateUnitGet));
+
+                // Buff/state (atktype for ranged, incorp=0, adpx=wave). ux is the unit's wave (grid_x).
+                SendUnitBuff(ownerSlot, oppSlot, ux, uy, u);
             }
         }
 
