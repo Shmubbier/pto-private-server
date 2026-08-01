@@ -66,6 +66,8 @@ namespace PtoServer
         public const byte UpdateUnitGet= 19;
         public const byte BattleEnd    = 3;
         public const byte CanAction    = 40;
+        public const byte Action       = 15;  // battle: set your remaining action count (u8); orders need >=1
+        public const byte ActionGet    = 16;  // battle: opponent's remaining action count (cosmetic)
         public const byte HandCardRemove = 12;
         public const byte WaveUpdate   = 17;
         public const byte BattleAttackPhase = 21;
@@ -654,7 +656,14 @@ namespace PtoServer
             }
         }
 
-        static void GrantAction(BattleSlot slot) { Send(slot.Me.Ns, new PacketWriter().Frame(Op.CanAction)); }
+        static void GrantAction(BattleSlot slot)
+        {
+            Send(slot.Me.Ns, new PacketWriter().Frame(Op.CanAction));
+            // Also push the remaining action count (global.__player_actions). The order slot is only
+            // valid when this is >= 1 (summon_ui_script), so without it orders can never be played.
+            int actions = (slot.Battle != null) ? slot.Battle.P[slot.P].ActionsRemaining : 0;
+            Send(slot.Me.Ns, new PacketWriter().WriteU8((byte)Math.Max(0, Math.Min(255, actions))).Frame(Op.Action));
+        }
 
         // ---- draw a card (op 8) ----------------------------------------------
         // Client sends op 8 (empty) when the deck is clicked and sets can_do_action=0. If we don't
@@ -761,6 +770,16 @@ namespace PtoServer
                 return;
             }
 
+            // Playing a hand card as an order discards it. `card` is the hand index the client sent;
+            // remove it (and tell the client) only if that slot really holds this card, so board-unit
+            // orders (where the card isn't in hand) are left alone.
+            if (card < mine.Hand.Count && mine.Hand[card] == cardId)
+            {
+                mine.Hand.RemoveAt(card);
+                Send(mine.Me.Ns, new PacketWriter().WriteU8(card).WriteU16(cardId).WriteBool(true).Frame(Op.HandCardRemove));
+                Log("  -> discarded order card " + cardId + " from hand[" + card + "]");
+            }
+
             ResolveEffect(eff, mine, theirs, b, x, y);
         }
 
@@ -772,7 +791,7 @@ namespace PtoServer
             PlayerState ps = b.P[mine.P];
             PlayerState opPs = b.P[1 - mine.P];
             int gx = x;
-            int enemyGy = 2 - y;   // the enemy board is Y-mirrored on the caster's screen
+            int enemyGy = y;       // opponent slot grid_y already equals the server lane (no mirror)
             int selfGy = y;
 
             switch (eff.Kind)
@@ -981,7 +1000,12 @@ namespace PtoServer
             bool isSpell = r.ReadBool();
             bool selectGrid = r.ReadBool();
             byte ax = r.ReadU8(), ay = r.ReadU8(), tx = r.ReadU8(), ty = r.ReadU8();
-            byte serverTy = (byte)(2 - ty); // Convert from opponent-slot Y to server Y
+            // The client's opponent slots are registered under key slot_get_id(x, loopYY) but their
+            // grid_y is set to (2 - loopYY) (obj_battle_control Create), so a relayed enemy unit sits
+            // on a slot whose grid_y ALREADY equals its server lane. The click therefore sends the
+            // real server lane in ty — do NOT mirror it again. (The attack-response container_attack
+            // does its own 2-y to recover the slot key, so echoing ty back is also correct.)
+            byte serverTy = ty;
 
             Log("ATTACK " + mine.Me.User + ": spell=" + isSpell + " from(" + ax + "," + ay + ") -> (" + tx + "," + serverTy + ")");
 
@@ -1273,8 +1297,10 @@ namespace PtoServer
         static void SendUnitUpdateToBoth(BattleSlot ownerSlot, BattleSlot oppSlot, int x, int y, BUnit unit, Battle b)
         {
             if (unit == null) return;
-            int curLife = Math.Max(0, unit.Max - unit.Damage);
-            bool dead = unit.Damage >= unit.Max;
+            // A corpse must always render dead with 0 HP. ProcessCasualties resets Damage=0 on
+            // corpses, so we can't infer death from Damage alone — check IsCorpse.
+            bool dead = unit.IsCorpse || unit.Damage >= unit.Max;
+            int curLife = dead ? 0 : Math.Max(0, unit.Max - unit.Damage);
             // Ready = alive, hasn't acted, not summon-sick (see SyncPlayerUnits). A freshly summoned
             // unit is RecruitedThisWave=true, so it correctly shows greyed until the next wave.
             bool active = !unit.IsCorpse && !unit.HasAttackedThisWave && !unit.RecruitedThisWave;
@@ -1648,7 +1674,10 @@ namespace PtoServer
                 // (global.__wave == grid_x) in the unit action menu. Greying by wave here overrides
                 // anim_wave_update's activate=1 refresh and paints the whole board exhausted.
                 bool unitActive = !u.IsCorpse && !u.HasAttackedThisWave && !u.RecruitedThisWave;
-                int curLife = Math.Max(0, u.Max - u.Damage);
+                // Corpses always render dead with 0 HP (ProcessCasualties zeroes their Damage, so we
+                // must key off IsCorpse, not Damage, or the HP bar shows full life on a dead sprite).
+                bool unitDead = u.IsCorpse || u.Damage >= u.Max;
+                int curLife = unitDead ? 0 : Math.Max(0, u.Max - u.Damage);
                 if (PacketLog)
                     Log("  unit (" + ux + "," + uy + ") active=" + (unitActive ? 1 : 0)
                         + " wave=" + b.Wave + " ux=" + ux + " isCorpse=" + u.IsCorpse);
@@ -1657,13 +1686,13 @@ namespace PtoServer
                 Send(ownerSlot.Me.Ns, new PacketWriter()
                     .WriteU8((byte)ux).WriteU8((byte)uy).WriteU8((byte)u.Atk).WriteU16((ushort)curLife)
                     .WriteU8((byte)u.Strength).WriteU8(0).WriteU8((byte)u.Armor)
-                    .WriteBool(unitActive).WriteBool(u.Damage >= u.Max).WriteU8((byte)u.Max)
+                    .WriteBool(unitActive).WriteBool(unitDead).WriteU8((byte)u.Max)
                     .Frame(Op.UpdateUnit));
                 // UpdateUnitGet to opponent — raw Y
                 Send(oppSlot.Me.Ns, new PacketWriter()
                     .WriteU8((byte)ux).WriteU8((byte)uy).WriteU8((byte)u.Atk).WriteU16((ushort)curLife)
                     .WriteU8((byte)u.Strength).WriteU8(0).WriteU8((byte)u.Armor)
-                    .WriteBool(unitActive).WriteBool(u.Damage >= u.Max).WriteU8((byte)u.Max)
+                    .WriteBool(unitActive).WriteBool(unitDead).WriteU8((byte)u.Max)
                     .Frame(Op.UpdateUnitGet));
             }
         }
