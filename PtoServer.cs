@@ -506,6 +506,7 @@ namespace PtoServer
             public PlayerState[] P = new PlayerState[] { new PlayerState(), new PlayerState() };
             public bool Over;
             public bool Started;
+            public bool LeadersSpawned; // guard so both leaders are summoned exactly once
             public int Wave = 2;   // 2=Vanguard, 1=Flank, 0=Rear
             public int Round = 1;  // ceasefire during round 1
             public int First = 0;  // absolute player index holding first-player token
@@ -636,9 +637,21 @@ namespace PtoServer
             // (both did SendBattleSetup). SendLeaderSummon sends a SummonUnitGet (op6) to the
             // opponent, which crashes a client whose obj_battle_control doesn't exist yet. The
             // second client to finish setup triggers the leader summons for both.
+            // Spawn leaders exactly ONCE per battle. Both clients' SendBattleSetup can see the other's
+            // Sent flag true at the same time (race), and each call spawns BOTH leaders — that's what
+            // duplicated the leaders. Guard with Battle.LeadersSpawned, checked+set under the lock.
             BattleSlot oppSlot = null;
-            lock (_battleLock) { if (slot.Opp != null) _battles.TryGetValue(slot.Opp.Ns, out oppSlot); }
-            if (slot.Battle != null && oppSlot != null && oppSlot.Sent)
+            bool doSpawn = false;
+            lock (_battleLock)
+            {
+                if (slot.Opp != null) _battles.TryGetValue(slot.Opp.Ns, out oppSlot);
+                if (slot.Battle != null && oppSlot != null && oppSlot.Sent && !slot.Battle.LeadersSpawned)
+                {
+                    slot.Battle.LeadersSpawned = true;
+                    doSpawn = true;
+                }
+            }
+            if (doSpawn)
             {
                 SendLeaderSummon(slot, slot.Battle);
                 SendLeaderSummon(oppSlot, slot.Battle);
@@ -1303,10 +1316,13 @@ namespace PtoServer
                 .WriteU8(ax).WriteU8(ay).WriteU8(tx).WriteU8(ty)
                 .WriteU16((ushort)dmg).WriteU8(atype).WriteBool(true).WriteBool(counter)
                 .Frame(Op.AttackOut));
-            // AttackGet to opponent — mirror attacker's Y (container_attack_get: yy = 2 - read)
+            // AttackGet to opponent — send RAW attacker Y. container_attack_get ALREADY mirrors it
+            // (yy = 2 - read), so pre-mirroring here double-mirrors and, for a non-center attacker,
+            // makes the opponent look up the attacker at the wrong slot -> no attack animation, and
+            // for ranged the projectile that releases the queue never fires (turn freezes).
             if (opp != null)
                 Send(opp.Me.Ns, new PacketWriter()
-                    .WriteU8(ax).WriteU8((byte)(2 - ay)).WriteU8(tx).WriteU8(ty)
+                    .WriteU8(ax).WriteU8(ay).WriteU8(tx).WriteU8(ty)
                     .WriteU16((ushort)dmg).WriteU8(atype).WriteBool(true).WriteBool(counter)
                     .Frame(Op.AttackGet));
 
@@ -1342,10 +1358,11 @@ namespace PtoServer
                 .WriteU8(ax).WriteU8(ay).WriteU8(tx).WriteU8(ty)
                 .WriteU16((ushort)dmg).WriteU8(atype).WriteBool(true).WriteBool(counter)
                 .Frame(Op.AttackOut));
-            // AttackGet to opponent — mirror attacker Y
+            // AttackGet to opponent — RAW attacker Y (container_attack_get already does yy = 2 - read;
+            // pre-mirroring double-mirrors and freezes the opponent on non-center-row attacks).
             if (opp != null)
                 Send(opp.Me.Ns, new PacketWriter()
-                    .WriteU8(ax).WriteU8((byte)(2 - ay)).WriteU8(tx).WriteU8(ty)
+                    .WriteU8(ax).WriteU8(ay).WriteU8(tx).WriteU8(ty)
                     .WriteU16((ushort)dmg).WriteU8(atype).WriteBool(true).WriteBool(counter)
                     .Frame(Op.AttackGet));
 
@@ -1360,8 +1377,11 @@ namespace PtoServer
         static void SendUnitUpdateToBoth(BattleSlot ownerSlot, BattleSlot oppSlot, int x, int y, BUnit unit, Battle b)
         {
             if (unit == null) return;
-            // A corpse must always render dead with 0 HP. ProcessCasualties resets Damage=0 on
-            // corpses, so we can't infer death from Damage alone — check IsCorpse.
+            // Render dead as soon as a unit has lethal damage (or is a corpse). The client's death
+            // animation holds the action queue (deathdontunque) until it finishes, so we want it to
+            // play during the attacker's turn — NOT batched into the wave-advance burst, where it
+            // would block the incoming turn_get and freeze both clients. (Corpses keep Damage=0 after
+            // ProcessCasualties, hence the IsCorpse check for 0 HP.)
             bool dead = unit.IsCorpse || unit.Damage >= unit.Max;
             int curLife = dead ? 0 : Math.Max(0, unit.Max - unit.Damage);
             // Ready = alive, hasn't acted, not summon-sick (see SyncPlayerUnits). A freshly summoned
@@ -1465,11 +1485,13 @@ namespace PtoServer
             ps.Units.Remove(key);
             Log("CLEAR_CORPSE " + mine.Me.User + ": removed corpse at (" + cx + "," + cy + ")");
 
-            // Notify both clients
-            Send(mine.Me.Ns, new PacketWriter().WriteU8(cx).WriteU8(cy).Frame(Op.ClearCorpse));
+            // Notify both clients. Payload is x, y, AND a `goup` bool (container_clear_corpse reads
+            // all three) — omitting it made the client read past the buffer end and abort the clear,
+            // desyncing the boards. goup=false = the corpse fades in place (normal clear).
+            Send(mine.Me.Ns, new PacketWriter().WriteU8(cx).WriteU8(cy).WriteBool(false).Frame(Op.ClearCorpse));
             if (theirs != null)
                 // container_clear_corpse_get mirrors Y: yy = 2 - buffer_read
-                Send(theirs.Me.Ns, new PacketWriter().WriteU8(cx).WriteU8(cy).Frame(Op.ClearCorpseGet));
+                Send(theirs.Me.Ns, new PacketWriter().WriteU8(cx).WriteU8(cy).WriteBool(false).Frame(Op.ClearCorpseGet));
 
             ConsumeAction(mine, theirs, b);
         }
@@ -1740,8 +1762,8 @@ namespace PtoServer
                 // (global.__wave == grid_x) in the unit action menu. Greying by wave here overrides
                 // anim_wave_update's activate=1 refresh and paints the whole board exhausted.
                 bool unitActive = !u.IsCorpse && !u.HasAttackedThisWave && !u.RecruitedThisWave;
-                // Corpses always render dead with 0 HP (ProcessCasualties zeroes their Damage, so we
-                // must key off IsCorpse, not Damage, or the HP bar shows full life on a dead sprite).
+                // Render dead on lethal damage (or corpse) so the death animation plays during the
+                // turn, not in the wave-advance burst (see SendUnitUpdateToBoth). Corpses keep 0 HP.
                 bool unitDead = u.IsCorpse || u.Damage >= u.Max;
                 int curLife = unitDead ? 0 : Math.Max(0, u.Max - u.Damage);
                 if (PacketLog)
