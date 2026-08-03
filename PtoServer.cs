@@ -161,7 +161,9 @@ namespace PtoServer
         static bool PacketLog = true;
         const int ActionsPerWave = 2;
         const int OpeningHand = 5;
-        const byte OrbPool = 20;  // orbs granted to each player at the start of every turn (for orders)
+        const int OrbGainPerRound = 1;  // order resource gained at the start of each round
+        const int OrbMax = 3;           // ...capped at this
+        const int TurnSeconds = 60;     // a turn auto-advances after this many seconds of inactivity
 
         static readonly object _logLock = new object();
         static StreamWriter _logFile;
@@ -194,11 +196,55 @@ namespace PtoServer
             Log("Point the client at this machine via settings.ini  ->  [NETWORK] IP=<server ip>");
             Log("Waiting for connections... (Ctrl+C to stop)");
 
+            // Turn-timeout watchdog: force-advance a turn when the active player exceeds TurnSeconds.
+            new Thread(TurnTimeoutLoop) { IsBackground = true }.Start();
+
             while (true)
             {
                 TcpClient c = listener.AcceptTcpClient();
                 var t = new Thread(() => HandleClient(c)) { IsBackground = true };
                 t.Start();
+            }
+        }
+
+        // Periodically scan live battles and auto-advance any turn past its deadline. Runs under
+        // _battleLock so it can't race the client threads' turn handling.
+        static void TurnTimeoutLoop()
+        {
+            while (true)
+            {
+                Thread.Sleep(2000);
+                try
+                {
+                    var expired = new List<BattleSlot>();
+                    lock (_battleLock)
+                    {
+                        // Select each battle's ACTIVE player's slot if its deadline has passed. Only one
+                        // slot per battle has P == b.Active, so this is inherently one-per-battle — do NOT
+                        // dedup by Battle first, or the inactive slot (iterated first) would mask the
+                        // active one and the turn would never advance.
+                        foreach (var kv in _battles)
+                        {
+                            BattleSlot slot = kv.Value;
+                            Battle b = slot.Battle;
+                            if (b == null || !b.Started || b.Over) continue;
+                            if (slot.P == b.Active && b.TurnDeadline != default(DateTime)
+                                && DateTime.UtcNow > b.TurnDeadline)
+                                expired.Add(slot);
+                        }
+                        // Advance inside the same lock so state stays consistent with client threads.
+                        foreach (var active in expired)
+                        {
+                            BattleSlot opp = null;
+                            if (active.Opp != null) _battles.TryGetValue(active.Opp.Ns, out opp);
+                            Battle b = active.Battle;
+                            if (opp == null || b == null || b.Over || active.P != b.Active) continue;
+                            Log("TURN TIMEOUT: auto-advancing " + active.Me.User + " (" + TurnSeconds + "s)");
+                            try { AdvanceTurn(active, opp, b); } catch (Exception ex) { Log("timeout advance error: " + ex.Message); }
+                        }
+                    }
+                }
+                catch (Exception ex) { Log("TurnTimeoutLoop error: " + ex.Message); }
             }
         }
 
@@ -495,6 +541,7 @@ namespace PtoServer
             public Waiting Opp;
             public bool FirstPlayer;
             public bool Sent;
+            public bool DataSent; // battle_data (opening hand) has been sent to this client
             public bool Mulliganed;
             public List<ushort> Hand = new List<ushort>();
             public Battle Battle;
@@ -507,6 +554,7 @@ namespace PtoServer
             public bool Over;
             public bool Started;
             public bool LeadersSpawned; // guard so both leaders are summoned exactly once
+            public DateTime TurnDeadline; // wall-clock time the active player's turn auto-advances
             public int Wave = 2;   // 2=Vanguard, 1=Flank, 0=Rear
             public int Round = 1;  // ceasefire during round 1
             public int First = 0;  // absolute player index holding first-player token
@@ -521,6 +569,7 @@ namespace PtoServer
             public ushort LeaderCard;
             public List<ushort> Deck = new List<ushort>(); // draw pile (hero cards remaining)
             public int ActionsRemaining;
+            public int Orbs;  // order resource: +1 each round, capped at OrbMax; spent on orders
         }
 
         internal class BUnit
@@ -625,27 +674,26 @@ namespace PtoServer
             Log("-> battle setup to " + me.User + " (firstPlayer=" + slot.FirstPlayer + ", hand=[" +
                 string.Join(",", Array.ConvertAll(hand, x => x.ToString())) + "])");
 
-            // Send initial TurnGet (show_msg=false) to trigger black screen lighten and start action queue
-            // This allows the mulligan UI to appear
-            // Client needs this to set next_que=1 and process the draw card actions
-            // Based on SendTurn(), the first player receives player=0, second player receives player=1
-            byte[] turnGetPrime = new PacketWriter().WriteU16((ushort)(slot.FirstPlayer ? 0 : 1)).WriteBool(false).Frame(Op.TurnGet);
-            Send(ns, turnGetPrime);
-            Log("-> sent initial TurnGet (show_msg=false) to " + me.User);
+            // Both the prime turn_get AND the leader summons are sent together from the single thread
+            // that sees BOTH clients' battle_data delivered (below). This is deliberate: the prime
+            // turn_get MUST be queued on each client BEFORE that client's leader summon. The leader
+            // summon's landing animation does not release the action queue during the mulligan phase,
+            // so anything queued after it (like the prime turn_get) never runs. If the prime runs late,
+            // anim_turn never sets global.__turn and BOTH players see "You are going second!". Sending
+            // both from one thread, prime-first, guarantees the order on each socket (and avoids the
+            // cross-thread write race that previously interleaved the leader packets with the prime).
+            lock (_battleLock) { slot.DataSent = true; }
 
-            // Spawn both leaders at (1,1) — but ONLY once BOTH clients have entered the battle room
-            // (both did SendBattleSetup). SendLeaderSummon sends a SummonUnitGet (op6) to the
-            // opponent, which crashes a client whose obj_battle_control doesn't exist yet. The
-            // second client to finish setup triggers the leader summons for both.
-            // Spawn leaders exactly ONCE per battle. Both clients' SendBattleSetup can see the other's
-            // Sent flag true at the same time (race), and each call spawns BOTH leaders — that's what
-            // duplicated the leaders. Guard with Battle.LeadersSpawned, checked+set under the lock.
+            // Spawn leaders exactly ONCE per battle, only after BOTH clients have their battle_data.
+            // SendLeaderSummon sends a SummonUnitGet (op6) to the opponent, which crashes a client whose
+            // obj_battle_control doesn't exist yet. Guard with Battle.LeadersSpawned under the lock so
+            // both threads can't each spawn (that duplicated the leaders).
             BattleSlot oppSlot = null;
             bool doSpawn = false;
             lock (_battleLock)
             {
                 if (slot.Opp != null) _battles.TryGetValue(slot.Opp.Ns, out oppSlot);
-                if (slot.Battle != null && oppSlot != null && oppSlot.Sent && !slot.Battle.LeadersSpawned)
+                if (slot.Battle != null && oppSlot != null && oppSlot.DataSent && !slot.Battle.LeadersSpawned)
                 {
                     slot.Battle.LeadersSpawned = true;
                     doSpawn = true;
@@ -653,10 +701,23 @@ namespace PtoServer
             }
             if (doSpawn)
             {
+                // Prime turn_get first (sets global.__turn for the first/second indicator), then leaders.
+                // first player receives player=0, second player receives player=1 (matches SendTurn()).
+                SendPrimeTurn(slot);
+                SendPrimeTurn(oppSlot);
                 SendLeaderSummon(slot, slot.Battle);
                 SendLeaderSummon(oppSlot, slot.Battle);
-                Log("-> both clients in battle; spawned leaders for " + slot.Me.User + " and " + oppSlot.Me.User);
+                Log("-> both clients in battle; primed turn + spawned leaders for " + slot.Me.User + " and " + oppSlot.Me.User);
             }
+        }
+
+        // Prime turn_get (show_msg=false): sets global.__turn on the client (via anim_turn) so the
+        // mulligan "You are going first/second!" indicator is correct. player=0 to the first player,
+        // player=1 to the second. Must be sent before that client's leader summon (see SendBattleSetup).
+        static void SendPrimeTurn(BattleSlot s)
+        {
+            Send(s.Me.Ns, new PacketWriter().WriteU16((ushort)(s.FirstPlayer ? 0 : 1)).WriteBool(false).Frame(Op.TurnGet));
+            Log("-> primed turn_get (player=" + (s.FirstPlayer ? 0 : 1) + ", show=false) to " + s.Me.User);
         }
 
         // Shuffle hero cards (excluding leader at slot 0), draw opening hand,
@@ -690,21 +751,66 @@ namespace PtoServer
                 if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
             }
 
-            // Process redraws
+            // Read which of the first 4 displayed hand cards the player wants to shuffle back and redraw.
+            // _cancel[i] (a bool) toggles displayed hand position i. Because we deal the opening hand
+            // REVERSED (client front-inserts each), slot.Hand[i] == the client's displayed card at i, so
+            // position i maps directly to slot.Hand[i].
             var r = new PacketReader(payload, 0);
             bool[] redraw = new bool[4];
             for (int i = 0; i < 4 && i < payload.Length; i++) redraw[i] = r.ReadBool();
 
-            // NOTE: mulligan redraw is intentionally DISABLED (keep all cards). Redrawing requires
-            // the server to tell the client to delete the mulliganed card (anim_mull_back) and draw
-            // its replacement; without that response the client keeps showing the OLD card while the
-            // server holds the NEW one, so the hand index the client sends on summon maps to the wrong
-            // card. Until that response protocol is implemented, we leave the hand untouched so the
-            // server's hand and the client's displayed hand stay identical.
-            int marked = 0;
-            for (int i = 0; i < 4; i++) if (redraw[i]) marked++;
-            if (marked > 0)
-                Log("MULLIGAN " + mine.Me.User + ": " + marked + " card(s) marked but redraw is disabled (kept in sync)");
+            var positions = new List<int>();
+            for (int i = 0; i < 4; i++) if (redraw[i] && i < mine.Hand.Count) positions.Add(i);
+
+            if (positions.Count > 0)
+            {
+                PlayerState ps = mine.Battle.P[mine.P];
+
+                // Remove the marked cards from the hand in DESCENDING position order so an earlier
+                // removal doesn't shift the index of a later one. The client mirrors this exact order
+                // (anim_mull_back does ds_list_delete(hand, pos)), so both stay identical.
+                positions.Sort(); positions.Reverse();
+                var returned = new List<ushort>();
+                foreach (int pos in positions) { returned.Add(mine.Hand[pos]); mine.Hand.RemoveAt(pos); }
+
+                // Shuffle the returned cards back into the deck so replacements aren't the same cards.
+                ps.Deck.AddRange(returned);
+                lock (_rng) for (int i = ps.Deck.Count - 1; i > 0; i--)
+                {
+                    int j = _rng.Next(i + 1);
+                    var t = ps.Deck[i]; ps.Deck[i] = ps.Deck[j]; ps.Deck[j] = t;
+                }
+
+                // Tell the client to remove each marked card (op37 back): bool scry, bool mul_self,
+                // u8 pos, bool deckback. Descending pos to match our removals above.
+                foreach (int pos in positions)
+                    Send(mine.Me.Ns, new PacketWriter()
+                        .WriteBool(false).WriteBool(true).WriteU8((byte)pos).WriteBool(true).Frame(Op.Mulligan));
+
+                // Draw the replacements. Each is front-inserted on the client (anim_draw_card_self does
+                // ds_list_insert(hand, 0, ...)), so mirror with Insert(0, ...). op8: bool scry, u8 deck,
+                // u16 card, bool phantom, u8 fromOrder, bool gridSelf, u8 x, u8 y.
+                int toDraw = positions.Count;
+                for (int k = 0; k < toDraw && ps.Deck.Count > 0; k++)
+                {
+                    ushort nc = ps.Deck[0]; ps.Deck.RemoveAt(0);
+                    mine.Hand.Insert(0, nc);
+                    byte deckLeft = (byte)Math.Min(255, ps.Deck.Count);
+                    Send(mine.Me.Ns, new PacketWriter()
+                        .WriteBool(false).WriteU8(deckLeft).WriteU16(nc).WriteBool(false)
+                        .WriteU8(0).WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCard));
+                }
+                // NOTE: we intentionally do NOT send the opponent a view of this redraw. A mulligan
+                // removes N and draws N, so the opponent's face-down hand count is unchanged anyway;
+                // and sending the opponent an anim_mull_back would set THEIR obj_hand.startmull=0 and
+                // corrupt their own in-progress mulligan.
+                Log("MULLIGAN " + mine.Me.User + ": redrew " + positions.Count + " card(s); hand now [" +
+                    string.Join(",", mine.Hand) + "]");
+            }
+            else
+            {
+                Log("MULLIGAN " + mine.Me.User + ": kept all cards");
+            }
 
             mine.Mulliganed = true;
             Log("MULLIGAN done: " + mine.Me.User);
@@ -719,6 +825,7 @@ namespace PtoServer
                 b.Wave = 2; b.Round = 1; b.First = first.P; b.Active = first.P;
                 b.P[b.Active].ActionsRemaining = ActionsPerWave;
                 b.Started = true;
+                GrantRoundOrbs(b); // round 1 order resource
 
                 // Turn 1 ONLY: send a "prime" turn_get first. anim_turn's body (which DESTROYS
                 // obj_mulligan) runs only on the 2nd turn_get (start is 0 on the 1st, set to 1).
@@ -737,6 +844,34 @@ namespace PtoServer
             // valid when this is >= 1 (summon_ui_script), so without it orders can never be played.
             int actions = (slot.Battle != null) ? slot.Battle.P[slot.P].ActionsRemaining : 0;
             Send(slot.Me.Ns, new PacketWriter().WriteU8((byte)Math.Max(0, Math.Min(255, actions))).Frame(Op.Action));
+        }
+
+        // Order resource. Each player gains OrbGainPerRound at the start of every round (capped at
+        // OrbMax) and spends OrbCostOf(card) when an order is played.
+        static void GrantRoundOrbs(Battle b)
+        {
+            for (int pi = 0; pi < 2; pi++)
+                b.P[pi].Orbs = Math.Min(OrbMax, b.P[pi].Orbs + OrbGainPerRound);
+        }
+
+        // op62 = recipient's OWN orb count; op63 = the opponent's count (cosmetic display).
+        static void SendOrbs(BattleSlot p0, BattleSlot p1, Battle b)
+        {
+            int o0 = Math.Max(0, b.P[0].Orbs), o1 = Math.Max(0, b.P[1].Orbs);
+            Send(p0.Me.Ns, new PacketWriter().WriteU8((byte)o0).Frame(Op.Orbs));
+            Send(p0.Me.Ns, new PacketWriter().WriteU8((byte)o1).Frame(Op.OrbsGet));
+            Send(p1.Me.Ns, new PacketWriter().WriteU8((byte)o1).Frame(Op.Orbs));
+            Send(p1.Me.Ns, new PacketWriter().WriteU8((byte)o0).Frame(Op.OrbsGet));
+        }
+
+        // Orb cost of a card's order (card_init orb_cost; most are 1, a few are 2).
+        static int OrbCostOf(ushort cardId)
+        {
+            switch (cardId / 2)
+            {
+                case 29: case 39: case 47: case 49: case 50: return 2; // Assassin, Overlord, Templar, Vampire, Witch
+                default: return 1;
+            }
         }
 
         // ---- draw a card (op 8) ----------------------------------------------
@@ -842,6 +977,21 @@ namespace PtoServer
                 Log("  -> order effect not implemented yet; no-op (action refunded)");
                 GrantAction(mine);
                 return;
+            }
+
+            // Order resource: must be able to afford it, then spend (client already gates on this,
+            // but the server is authoritative). Push the new orb counts so both clients stay synced.
+            int orbCost = OrbCostOf(cardId);
+            if (ps.Orbs < orbCost)
+            {
+                Log("  -> ORDER rejected: not enough orbs (" + ps.Orbs + "/" + orbCost + ")");
+                GrantAction(mine);
+                return;
+            }
+            ps.Orbs -= orbCost;
+            {
+                BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
+                if (q0 != null && q1 != null) SendOrbs(q0, q1, b);
             }
 
             // Playing a hand card as an order discards it. `card` is the hand index the client sent;
@@ -1519,7 +1669,13 @@ namespace PtoServer
             Battle b = mine.Battle;
             if (b == null || b.Over || theirs == null || !b.Started) return;
             if (mine.P != b.Active) { Log("END TURN from non-active player (ignored)"); return; }
+            AdvanceTurn(mine, theirs, b);
+        }
 
+        // Advance to the next turn / wave / round. Called by HandleEndTurn (op14) and by the turn-
+        // timeout thread when the active player exceeds TurnSeconds. Assumes mine.P == b.Active.
+        static void AdvanceTurn(BattleSlot mine, BattleSlot theirs, Battle b)
+        {
             BattleSlot p0 = mine.P == 0 ? mine : theirs;
             BattleSlot p1 = mine.P == 1 ? mine : theirs;
 
@@ -1553,6 +1709,7 @@ namespace PtoServer
                 b.First = 1 - b.First;
                 b.Wave = 2;
                 b.Active = b.First;
+                GrantRoundOrbs(b); // +1 orb each round (capped)
                 b.P[b.Active].ActionsRemaining = ActionsPerWave;
                 ResetWaveFlags(b);
                 Log("  -> round complete -> ROUND " + b.Round + " (attacks " + (b.Round >= 2 ? "ENABLED" : "ceasefire") + "), first=P" + b.First);
@@ -1672,14 +1829,12 @@ namespace PtoServer
             GrantAction(act);
             SyncUnitStates(p0, p1, act.Battle);
 
-            // Grant a generous orb pool each turn so orders (which cost orbs) are always affordable.
-            // op62 sets the recipient's OWN orb count; op63 shows the opponent's count (cosmetic).
-            // Orbs start at 0 (container_battle_start) and only change via these packets, so without
-            // this the player can never afford any order.
-            Send(p0.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.Orbs));
-            Send(p1.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.Orbs));
-            Send(p0.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.OrbsGet));
-            Send(p1.Me.Ns, new PacketWriter().WriteU8(OrbPool).Frame(Op.OrbsGet));
+            // Start the turn clock for the auto-advance timeout.
+            if (act.Battle != null) act.Battle.TurnDeadline = DateTime.UtcNow.AddSeconds(TurnSeconds);
+
+            // Re-send the current orb counts each turn to keep both clients in sync (idempotent).
+            // Orbs are gained per round (GrantRoundOrbs) and spent on orders (HandleOrder).
+            if (act.Battle != null) SendOrbs(p0, p1, act.Battle);
 
             // End the ceasefire from Round 2 on. op 21 sets canatk=1 (never reset) and fades the
             // "no-attack" label. Sent every turn (after the wave update) so the queued wave_update
