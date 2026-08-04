@@ -151,6 +151,11 @@ namespace PtoServer
         None        = 0,
         Intercept   = 1,  // blocks enemy ranged attacks in this column
         RangedAttack= 2,  // can target any enemy regardless of column
+        Counter     = 4,  // deals its attack back when hit by a melee attack
+        HeroKiller  = 8,  // deals double damage to enemy heroes
+        Vamp        = 16, // when it deals damage, heal your leader by that amount
+        Deathproof  = 32, // not defeated when lethal damage would defeat it
+        Ephemeral   = 64, // defeated automatically at end of wave
     }
 
     class Program
@@ -159,7 +164,7 @@ namespace PtoServer
         const ushort ClientVersion = 72;
         static bool Verbose = true;
         static bool PacketLog = true;
-        const int ActionsPerWave = 2;
+        const int ActionsPerWave = 3;  // actions granted at the start of each wave (Haste/effects add on top)
         const int OpeningHand = 5;
         const int OrbGainPerRound = 1;  // order resource gained at the start of each round
         const int OrbMax = 3;           // ...capped at this
@@ -437,23 +442,173 @@ namespace PtoServer
         // TODO: populate from data.win reverse-engineering for full accuracy.
         static UnitAbility GetUnitAbilities(ushort card, int wave)
         {
-            int id = card / 2;
-            // Heuristic based on common PT1 archetypes.
-            // Vanguard: defensive cards tend to get intercept
-            if (wave == 2)
+            SelfPassive p = PassiveOf(card, wave);
+            UnitAbility a = UnitAbility.None;
+            if (p.Intercept)  a |= UnitAbility.Intercept;
+            if (p.Counter)    a |= UnitAbility.Counter;
+            if (p.HeroKiller) a |= UnitAbility.HeroKiller;
+            if (p.Vamp)       a |= UnitAbility.Vamp;
+            if (p.Deathproof) a |= UnitAbility.Deathproof;
+            if (p.Ephemeral)  a |= UnitAbility.Ephemeral;
+            if (IsRangedAtWave(card, wave)) a |= UnitAbility.RangedAttack;
+            return a;
+        }
+
+        // ---- data-driven self passives (parsed from client card_init.gml power text) -----------
+        // "Self" passives apply to the hero that has them (no Forerunner:/Supporter:/Unit:/Leader:/
+        // Vanguard: prefix — those are auras, a later tier). Strength here folds in "Melee Strength"
+        // (nearly all our melee units), so it's added to the unit's attack stat. Armor is flat damage
+        // reduction. Intercept/Counter are combat flags. wave index: 2=Vanguard, 1=Flank, 0=Rear.
+        struct SelfPassive { public bool Intercept; public bool Counter; public bool HeroKiller; public bool Vamp; public bool Deathproof; public bool Ephemeral; public CoverType Cover; public int Strength; public int Armor; }
+        static readonly SelfPassive[,] _passive = BuildPassives();
+        static SelfPassive[,] BuildPassives()
+        {
+            var p = new SelfPassive[128, 3];
+            // -- Intercept (plain; NOT "Intercept Killer") --
+            int[] iceptV = { 26,30,32,33,35,36,37,39,40,41,48,53,57,61,66,67,80,82,83,90,91,92,98,109,115 };
+            foreach (int r in iceptV) p[r, 2].Intercept = true;
+            p[45, 2].Intercept = p[45, 1].Intercept = p[45, 0].Intercept = true; // Force Cube: all waves
+
+            // -- Counter (retaliates against melee) --
+            p[28, 1].Counter = true; // Berserker  (Flank)
+            p[35, 2].Counter = true; // Knight      (Vanguard)
+            p[61, 2].Counter = true; // Curse Knight (Vanguard)
+            p[84, 2].Counter = true; // Fencer      (Vanguard)
+
+            // -- Hero Killer (double damage to enemy heroes) --
+            p[29, 1].HeroKiller = true; // Assassin      (Flank)
+            p[52, 2].HeroKiller = true; // Fire Elemental (Vanguard)
+
+            // -- Vamp (heal your leader by damage dealt) --
+            p[49, 2].Vamp = true; // Vampire    (Vanguard)
+            p[97, 2].Vamp = true; // Dark Knight (Vanguard)
+
+            // -- Deathproof (survive lethal at wave end) -- (plain self only; auras are a later tier)
+            p[109, 2].Deathproof = true; // Druid (Vanguard)
+
+            // -- Ephemeral (defeated at end of wave) --
+            p[51, 2].Ephemeral = p[51, 1].Ephemeral = p[51, 0].Ephemeral = true; // Zombie (all waves)
+            p[54, 2].Ephemeral = true;                                           // Air Elemental (Vanguard)
+            p[59, 2].Ephemeral = p[59, 1].Ephemeral = p[59, 0].Ephemeral = true; // Ghost (all waves)
+
+            // -- Cover:X (takes damage aimed at the covered position) -- (self "Cover:", NOT aura "X: Cover")
+            p[35, 0].Cover = CoverType.Forerunner; // Knight  Rear:  Cover: Forerunner
+            p[49, 1].Cover = CoverType.Forerunner; // Vampire Flank: Cover: Forerunner
+            p[47, 0].Cover = CoverType.Vanguard;   // Templar Rear:  Cover: Vanguard
+            p[96, 1].Cover = CoverType.Leader;     // Squire  Flank: Cover: Leader
+            p[96, 0].Cover = CoverType.Forerunner; // Squire  Rear:  Cover: Forerunner
+            p[98, 1].Cover = CoverType.Forerunner; // White Knight Flank: Cover: Forerunner
+
+            // -- Strength (folds in Melee Strength) --
+            p[26, 1].Strength = 2; p[26, 0].Strength = 3;                 // Fighter
+            p[28, 2].Strength = 2;                                        // Berserker  (Melee Strength 2)
+            p[33, 2].Strength = 2;                                        // Homunculus (Melee Strength 2)
+            p[56, 2].Strength = 2;                                        // Lightning Elemental
+            p[66, 0].Strength = 5;                                        // Relic Hunter (Melee Strength 5)
+            p[80, 2].Strength = 2; p[80, 0].Strength = 3;                 // Warrior
+            p[84, 1].Strength = 2;                                        // Fencer
+            p[88, 2].Strength = 3;                                        // Biomancer
+            p[89, 2].Strength = 2;                                        // Legionnaire
+            p[92, 2].Strength = 1; p[92, 1].Strength = 3; p[92, 0].Strength = 3; // Treasure Hunter
+            p[96, 2].Strength = 1;                                        // Squire
+
+            // -- Armor (flat damage reduction) --
+            p[28, 2].Armor = 1; // Berserker
+            p[30, 2].Armor = 2; // Alchemist
+            p[32, 2].Armor = 2; // Healer
+            return p;
+        }
+        static SelfPassive PassiveOf(ushort card, int wave)
+        {
+            int r = card / 2;
+            if (r < 0 || r >= 128 || wave < 0 || wave > 2) return default(SelfPassive);
+            return _passive[r, wave];
+        }
+
+        // ---- auras: passives that grant stats/abilities to OTHER units ("X: Y" in the card text) -----
+        // A source at (sx,sy) projects each aura onto a set of recipient cells:
+        //   Forerunner -> (sx+1,sy)   Supporter -> (sx-1,sy)   Vanguard -> all (2,*)   Rear -> all (0,*)
+        //   Unit -> all your heroes + leader   Leader -> the leader (1,1)
+        enum AuraTarget : byte { Forerunner, Supporter, Vanguard, Rear, Unit, Leader }
+        struct Aura { public AuraTarget Target; public int Strength; public int Armor; public UnitAbility Grant; }
+
+        // Aura sources by card+wave. R.Immunity / Cover-grant auras are omitted (no underlying ability yet).
+        static List<Aura> AurasOf(ushort card, int wave)
+        {
+            var list = new List<Aura>();
+            switch (card / 2)
             {
-                // Cards with high life relative to attack tend to be interceptors
-                int atk = AtkOf(card); int life = LifeOf(card);
-                if (life >= 20 && atk <= 3) return UnitAbility.Intercept;
+                case 27: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Supporter, Strength = 3 }); break; // Dragon Mage F
+                case 30: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Leader, Armor = 2 }); break;        // Alchemist F
+                case 31: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Supporter, Grant = UnitAbility.RangedAttack }); break; // Gunner F
+                case 33: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Leader, Armor = 2 }); break;        // Homunculus F
+                case 37: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2, Armor = 1 }); break; // Mystic F
+                case 41: if (wave == 1) { list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.RangedAttack });
+                                          list.Add(new Aura { Target = AuraTarget.Supporter, Grant = UnitAbility.RangedAttack }); } break; // Planestalker F
+                case 48: if (wave == 1) { list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.Intercept });
+                                          list.Add(new Aura { Target = AuraTarget.Supporter, Grant = UnitAbility.RangedAttack }); } break; // Trapper F
+                case 57: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Armor = 2 });
+                         if (wave == 0) list.Add(new Aura { Target = AuraTarget.Leader, Armor = 1 }); break;        // Earth Elemental F / R
+                case 58: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2 });
+                         if (wave == 0) list.Add(new Aura { Target = AuraTarget.Leader, Strength = 2 }); break;     // Adventure Ranger F / R
+                case 60: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Leader, Armor = 2 }); break;        // Chronicler F
+                case 61: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.Counter });
+                         if (wave == 0) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Counter }); break; // Curse Knight F / R
+                case 66: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Unit, Strength = 1 });
+                         if (wave == 2) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Deathproof }); break; // Relic Hunter F / V
+                case 80: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2 }); break; // Warrior F
+                case 83: if (wave == 0) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Intercept }); break; // Defender R
+                case 94: if (wave == 0) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2 }); break; // Magus R
             }
-            // Rear: support/ranged cards
-            if (wave == 0)
+            return list;
+        }
+
+        // Recompute every unit's effective stats = its own base passives + all ally auras. Also fills the
+        // leader stat bonuses. Call after any board change (summon/move/casualty) and before combat.
+        static void RecomputeAuras(PlayerState ps)
+        {
+            ps.LeaderArmorBonus = 0; ps.LeaderStrBonus = 0;
+            // 1. Reset each unit to its OWN base passives for its current wave.
+            foreach (var kv in ps.Units)
             {
-                // Cards with moderate stats and low life tend to have ranged attack
-                int atk = AtkOf(card); int life = LifeOf(card);
-                if (atk >= 3 && life >= 16 && life <= 20) return UnitAbility.RangedAttack;
+                BUnit u = kv.Value; if (u == null) continue;
+                int wave = kv.Key / 10;
+                u.Strength = GetUnitStrength(u.Card, wave);
+                u.Atk = AtkOf(u.Card) + u.Strength;
+                u.Armor = GetUnitArmor(u.Card, wave);
+                u.Abilities = GetUnitAbilities(u.Card, wave);
+                u.Cover = PassiveOf(u.Card, wave).Cover;
             }
-            return UnitAbility.None;
+            // 2. Apply each source's auras onto its recipients.
+            foreach (var kv in ps.Units)
+            {
+                BUnit src = kv.Value; if (src == null || src.IsCorpse) continue;
+                int sx = kv.Key / 10, sy = kv.Key % 10;
+                foreach (Aura a in AurasOf(src.Card, sx))
+                    foreach (int rk in AuraRecipients(a.Target, sx, sy, ps))
+                    {
+                        if (rk < 0) { ps.LeaderArmorBonus += a.Armor; ps.LeaderStrBonus += a.Strength; continue; }
+                        BUnit r; if (!ps.Units.TryGetValue(rk, out r) || r == null || r.IsCorpse) continue;
+                        r.Strength += a.Strength; r.Atk += a.Strength; r.Armor += a.Armor; r.Abilities |= a.Grant;
+                    }
+            }
+        }
+
+        // Recipient keys for an aura target relative to a source at (sx,sy). -1 means "the leader".
+        static IEnumerable<int> AuraRecipients(AuraTarget t, int sx, int sy, PlayerState ps)
+        {
+            switch (t)
+            {
+                case AuraTarget.Forerunner: if (sx < 2) yield return Key(sx + 1, sy); break;
+                case AuraTarget.Supporter:  if (sx > 0) yield return Key(sx - 1, sy); break;
+                case AuraTarget.Vanguard:   for (int y = 0; y < 3; y++) yield return Key(2, y); break;
+                case AuraTarget.Rear:       for (int y = 0; y < 3; y++) yield return Key(0, y); break;
+                case AuraTarget.Leader:     yield return -1; break;
+                case AuraTarget.Unit:
+                    foreach (var kv in ps.Units) yield return kv.Key;
+                    yield return -1; // the leader is part of the unit
+                    break;
+            }
         }
 
         // Ranged-attack per wave, indexed by REAL card id (card/2). Bit W set => ranged at wave W
@@ -483,7 +638,7 @@ namespace PtoServer
         // Build a 20-byte update_buff payload for a unit at (x, y). All fields are 1 byte. s8 fields
         // default to -1 (sent as 255). We only vary atktype (ranged), inter(cept), and adpx (= grid_x,
         // which drives the client's wave-spell selection); everything else is the no-buff default.
-        static PacketWriter BuildBuff(int x, int y, byte atktype, bool intercept)
+        static PacketWriter BuildBuff(int x, int y, byte atktype, bool intercept, bool counter)
         {
             return new PacketWriter()
                 .WriteU8((byte)x).WriteU8((byte)y).WriteU8(atktype)
@@ -495,7 +650,7 @@ namespace PtoServer
                 .WriteBool(false)         // shield
                 .WriteBool(false)         // silence
                 .WriteBool(false)         // rev
-                .WriteBool(false)         // cnter
+                .WriteBool(counter)       // cnter
                 .WriteBool(false)         // immort
                 .WriteBool(false)         // deathpro
                 .WriteU8((byte)x)         // adpx = grid_x (wave) -> spellid follows the unit on move
@@ -509,27 +664,17 @@ namespace PtoServer
         static void SendUnitBuff(BattleSlot ownerSlot, BattleSlot oppSlot, int x, int y, BUnit unit)
         {
             if (unit == null || unit.IsCorpse) return;
-            byte atktype = (byte)(IsRangedAtWave(unit.Card, x) ? 1 : 0);
+            // Use the EFFECTIVE ranged ability (own R.Attack OR an aura-granted one), not just the card's
+            // own wave table — otherwise a "Supporter: R.Attack" grantee never shows/uses ranged.
+            byte atktype = (byte)(((unit.Abilities & UnitAbility.RangedAttack) != 0) ? 1 : 0);
             bool intercept = (unit.Abilities & UnitAbility.Intercept) != 0;
-            Send(ownerSlot.Me.Ns, BuildBuff(x, y, atktype, intercept).Frame(Op.UpdateBuff));
-            if (oppSlot != null) Send(oppSlot.Me.Ns, BuildBuff(x, y, atktype, intercept).Frame(Op.UpdateBuffGet));
+            bool counter = (unit.Abilities & UnitAbility.Counter) != 0;
+            Send(ownerSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter).Frame(Op.UpdateBuff));
+            if (oppSlot != null) Send(oppSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter).Frame(Op.UpdateBuffGet));
         }
 
-        static int GetUnitArmor(ushort card, int wave)
-        {
-            int id = card / 2;
-            if (wave == 2)
-            {
-                int life = LifeOf(card);
-                if (life >= 22) return 1; // heavy vanguard units get 1 armor
-            }
-            return 0;
-        }
-
-        static int GetUnitStrength(ushort card, int wave)
-        {
-            return 0; // base implementation: no strength bonuses
-        }
+        static int GetUnitArmor(ushort card, int wave)    { return PassiveOf(card, wave).Armor; }
+        static int GetUnitStrength(ushort card, int wave) { return PassiveOf(card, wave).Strength; }
 
         // ---- matchmaking / battle bootstrap -----------------------------------
 
@@ -570,6 +715,8 @@ namespace PtoServer
             public List<ushort> Deck = new List<ushort>(); // draw pile (hero cards remaining)
             public int ActionsRemaining;
             public int Orbs;  // order resource: +1 each round, capped at OrbMax; spent on orders
+            public int LeaderArmorBonus; // from "Leader: Armor N" auras (recomputed each RecomputeAuras)
+            public int LeaderStrBonus;   // from "Leader: Strength N" auras
         }
 
         internal class BUnit
@@ -581,10 +728,14 @@ namespace PtoServer
             public int Armor;         // flat damage reduction
             public int Strength;      // bonus attack damage
             public UnitAbility Abilities;
+            public CoverType Cover;   // what this unit covers (redirects damage aimed there to itself)
             public bool IsCorpse;     // dead unit occupying space
             public bool RecruitedThisWave;  // cannot attack on the turn recruited
             public bool HasAttackedThisWave; // can only attack once per wave
         }
+
+        // What a Cover:X unit protects. It takes damage that would land on the covered position.
+        internal enum CoverType : byte { None = 0, Forerunner = 1, Leader = 2, Vanguard = 3 }
 
         static int Key(int x, int y) { return x * 10 + y; }
         static readonly object _battleLock = new object();
@@ -728,11 +879,15 @@ namespace PtoServer
         {
             var heroes = new List<ushort>();
             if (d != null) for (int i = 1; i < d.Cards.Length; i++) if (d.Cards[i] != 0) heroes.Add(d.Cards[i]);
-            lock (_rng) for (int i = heroes.Count - 1; i > 0; i--)
-            {
-                int j = _rng.Next(i + 1);
-                var tmp = heroes[i]; heroes[i] = heroes[j]; heroes[j] = tmp;
-            }
+            // Testing aid: PTO_NOSHUFFLE=1 keeps the deck in .decks order so the opening hand is
+            // deterministic (front-load the cards you want to test). Production shuffles as normal.
+            if (Environment.GetEnvironmentVariable("PTO_NOSHUFFLE") != "1")
+                lock (_rng) for (int i = heroes.Count - 1; i > 0; i--)
+                {
+                    int j = _rng.Next(i + 1);
+                    var tmp = heroes[i]; heroes[i] = heroes[j]; heroes[j] = tmp;
+                }
+            else Log("PTO_NOSHUFFLE=1: deck kept in fixed order for deterministic testing");
             int n = Math.Min(OpeningHand, heroes.Count);
             ushort[] hand = heroes.GetRange(0, n).ToArray();
             // Remaining cards go to the draw pile
@@ -865,13 +1020,25 @@ namespace PtoServer
         }
 
         // Orb cost of a card's order (card_init orb_cost; most are 1, a few are 2).
+        // Order orb costs, indexed by REAL (cardId/2). Data-driven from the game DB (PTOdbDump.txt /
+        // card_init.gml OrderOrbCost). Default is 1; only the non-1 costs are listed.
+        static readonly int[] _orbCost = BuildOrbCosts();
+        static int[] BuildOrbCosts()
+        {
+            var a = new int[128];
+            for (int i = 0; i < a.Length; i++) a[i] = 1;
+            int[] free = { 51, 92, 115 };                                   // Zombie, Treasure Hunter, Plague Doctor
+            int[] two  = { 29,39,47,49,50,64,83,85,90,94,95,98,109 };       // 2-orb orders
+            int[] three= { 61,63,97 };                                      // Curse Knight, Divinity, Dark Knight
+            foreach (int r in free)  a[r] = 0;
+            foreach (int r in two)   a[r] = 2;
+            foreach (int r in three) a[r] = 3;
+            return a;
+        }
         static int OrbCostOf(ushort cardId)
         {
-            switch (cardId / 2)
-            {
-                case 29: case 39: case 47: case 49: case 50: return 2; // Assassin, Overlord, Templar, Vampire, Witch
-                default: return 1;
-            }
+            int r = cardId / 2;
+            return (r >= 0 && r < _orbCost.Length) ? _orbCost[r] : 1;
         }
 
         // ---- draw a card (op 8) ----------------------------------------------
@@ -919,7 +1086,7 @@ namespace PtoServer
         // mutate the data model, then SyncUnitStates pushes the new life/state to both clients
         // (no dedicated cast animation yet — the life bars just update). Orders/spells we haven't
         // implemented fall through to a graceful no-op (action refunded) so nothing freezes.
-        enum OrderKind { None, DamageSingle, DamageRow, DamageColumn, DamageBlast, DamageAll, HealSingle, HealAll, HealLeader }
+        enum OrderKind { None, DamageSingle, DamageRow, DamageColumn, DamageBlast, DamageAll, HealSingle, HealAll, HealLeader, DrawCards, KillHero, GainActions, Inspire }
 
         struct OrderEffect { public OrderKind Kind; public int Amount; }
 
@@ -934,7 +1101,10 @@ namespace PtoServer
                 case 30: return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 3 }; // Alchemist: Poison 3 (simplified)
                 case 31: return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 5 }; // Gunner: Bombard Row 5
                 case 32: return new OrderEffect { Kind = OrderKind.HealAll,      Amount = 4 }; // Healer: Cure All 4
+                case 29: return new OrderEffect { Kind = OrderKind.KillHero };                  // Assassin: Assassinate
                 case 35: return new OrderEffect { Kind = OrderKind.DamageBlast,  Amount = 4 }; // Knight: Blast 4
+                case 36: return new OrderEffect { Kind = OrderKind.DrawCards,    Amount = 2 }; // Mascot: Inspire, Draw 2 (Draw part)
+                case 44: return new OrderEffect { Kind = OrderKind.GainActions,  Amount = 2 }; // Scientist: Haste 2
                 case 41: return new OrderEffect { Kind = OrderKind.DamageColumn, Amount = 5 }; // Planestalker: Bombard Column 5
                 case 43: return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 5 }; // Pyromancer: Fire 5
                 case 52: return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 4 }; // Fire Elemental: Fire 4
@@ -942,6 +1112,13 @@ namespace PtoServer
                 case 56: return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 4 }; // Lightning Elemental: Thunder 4
                 default: return new OrderEffect { Kind = OrderKind.None };
             }
+        }
+
+        // Effects that resolve against the ENEMY board (so the order must be aimed at the enemy).
+        static bool IsEnemyTargeting(OrderKind k)
+        {
+            return k == OrderKind.DamageSingle || k == OrderKind.DamageRow || k == OrderKind.DamageColumn
+                || k == OrderKind.DamageBlast || k == OrderKind.KillHero;
         }
 
         static void HandleOrder(NetworkStream ns, byte[] payload)
@@ -975,6 +1152,24 @@ namespace PtoServer
             if (eff.Kind == OrderKind.None)
             {
                 Log("  -> order effect not implemented yet; no-op (action refunded)");
+                GrantAction(mine);
+                return;
+            }
+
+            // The client's positional targeting (o_type 0) lets you click EITHER board, but the effect
+            // must land on the correct one. `grid` (isgrid) is 1 when the player clicked their OWN board,
+            // 0 for the enemy. Damage/kill orders MUST target an enemy hero; a single-target heal must
+            // target your own hero. Reject a wrong-board click (and refund) instead of resolving it
+            // against the mirrored cell (which let Assassinate kill an enemy by clicking your own unit).
+            if (IsEnemyTargeting(eff.Kind) && grid)
+            {
+                Log("  -> ORDER rejected: " + eff.Kind + " must target an ENEMY hero (own board clicked)");
+                GrantAction(mine);
+                return;
+            }
+            if (eff.Kind == OrderKind.HealSingle && !grid)
+            {
+                Log("  -> ORDER rejected: heal must target your OWN hero (enemy board clicked)");
                 GrantAction(mine);
                 return;
             }
@@ -1014,6 +1209,7 @@ namespace PtoServer
         {
             PlayerState ps = b.P[mine.P];
             PlayerState opPs = b.P[1 - mine.P];
+            RecomputeAuras(ps); RecomputeAuras(opPs); // fresh leader-armor / unit stats for the effect
             int gx = x;
             int enemyGy = y;       // opponent slot grid_y already equals the server lane (no mirror)
             int selfGy = y;
@@ -1047,6 +1243,33 @@ namespace PtoServer
                 case OrderKind.HealLeader:
                     ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + eff.Amount);
                     break;
+                case OrderKind.DrawCards:
+                    DrawCardsFor(mine, theirs, b, eff.Amount);
+                    break;
+                case OrderKind.KillHero:
+                    KillEnemyAt(opPs, gx, enemyGy);
+                    break;
+                case OrderKind.GainActions:
+                    // Haste N: +N actions this turn. ConsumeAction below spends 1 for playing the order,
+                    // and GrantAction pushes the new count (op15) to the client.
+                    ps.ActionsRemaining += eff.Amount;
+                    Log("  gain actions +" + eff.Amount + " (now " + ps.ActionsRemaining + " before order cost)");
+                    break;
+                case OrderKind.Inspire:
+                    // Refresh a friendly hero: clear both summoning-sickness and the attacked flag so it
+                    // can act/attack again this wave. SyncUnitStates below re-marks it active (ungreyed).
+                    {
+                        if (gx == 1 && selfGy == 1) { Log("  inspire: leader ignored"); break; }
+                        BUnit iu;
+                        if (ps.Units.TryGetValue(Key(gx, selfGy), out iu) && iu != null && !iu.IsCorpse)
+                        {
+                            iu.RecruitedThisWave = false;
+                            iu.HasAttackedThisWave = false;
+                            Log("  inspire -> refreshed own (" + gx + "," + selfGy + ") card " + iu.Card);
+                        }
+                        else Log("  inspire -> no own unit at (" + gx + "," + selfGy + ")");
+                    }
+                    break;
             }
 
             // A single-target damage can hit the enemy leader at (1,1) — check for a win.
@@ -1077,12 +1300,16 @@ namespace PtoServer
                 case 30: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 1 }; break; // Alchemist R: Poison 1
                 case 32: if (wave == 1) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Healer F: Cure 4
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.HealAll,      Amount = 2 }; break; // Healer R: Cure All 2
-                case 36: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 }; break; // Mascot V: Cure 4
+                case 36: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Mascot V: Cure 4
+                         return new OrderEffect { Kind = OrderKind.Inspire };                                       // Mascot F/R: Inspire
                 case 37: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 }; break; // Mystic V: Cure 4
+                case 39: if (wave == 1 || wave == 0) return new OrderEffect { Kind = OrderKind.Inspire }; break;     // Overlord F/R: Inspire
                 case 42: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Priestess V: Cure 4
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.HealLeader,   Amount = 2 }; break; // Priestess F: Cure Leader 2
                 case 43: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageBlast,  Amount = 3 };        // Pyromancer V: Blast 3
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 3 }; break; // Pyromancer R: Fire 3
+                case 44: if (wave == 1) return new OrderEffect { Kind = OrderKind.DrawCards,    Amount = 2 };        // Scientist F: Draw 2
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.Inspire };                 break; // Scientist R: Inspire
                 case 52: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 2 }; break; // Fire Elem R: Fire 2
                 case 53: if (wave == 0) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 3 }; break; // Water Elem R: Cure 3
                 case 56: if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 2 }; break; // Lightning Elem F: Thunder 2
@@ -1090,12 +1317,57 @@ namespace PtoServer
             return new OrderEffect { Kind = OrderKind.None };
         }
 
+        // Defeat an enemy hero outright (Assassinate / Hero Killer effects). Applies lethal damage so
+        // the unit renders dead during the turn and is finalized as a corpse at wave end by
+        // ProcessCasualties. Leaders are not heroes and cannot be targeted.
+        static void KillEnemyAt(PlayerState opPs, int gx, int gy)
+        {
+            if (gx < 0 || gx > 2 || gy < 0 || gy > 2) return;
+            if (gx == 1 && gy == 1) { Log("    kill -> leader is not a hero, ignored"); return; }
+            BUnit u;
+            if (opPs.Units.TryGetValue(Key(gx, gy), out u) && u != null && !u.IsCorpse)
+            {
+                u.Damage = u.Max;
+                Log("    kill -> enemy (" + gx + "," + gy + ") card " + u.Card + " DEFEATED");
+            }
+            else Log("    kill -> no enemy unit at (" + gx + "," + gy + ")");
+        }
+
+        // Draw n cards for `mine` as an effect (ignores the draw-action hand limit). Mirrors the client
+        // front-insert (Hand.Insert(0,...)) and notifies the opponent (op9) like HandleDraw does.
+        static void DrawCardsFor(BattleSlot mine, BattleSlot theirs, Battle b, int n)
+        {
+            PlayerState ps = b.P[mine.P];
+            for (int i = 0; i < n; i++)
+            {
+                if (ps.Deck == null || ps.Deck.Count == 0) { Log("  draw (effect): deck empty for " + mine.Me.User); break; }
+                ushort card = ps.Deck[0]; ps.Deck.RemoveAt(0);
+                mine.Hand.Insert(0, card);
+                byte deckLeft = (byte)Math.Min(255, ps.Deck.Count);
+                Send(mine.Me.Ns, new PacketWriter()
+                    .WriteBool(false).WriteU8(deckLeft).WriteU16(card).WriteBool(false)
+                    .WriteU8(0).WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCard));
+                if (theirs != null)
+                    Send(theirs.Me.Ns, new PacketWriter()
+                        .WriteBool(false).WriteU8(deckLeft).WriteU8((byte)Math.Min(255, mine.Hand.Count)).WriteU8(0)
+                        .WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCardGet));
+                Log("  draw (effect): " + mine.Me.User + " drew card " + card + " (deck now " + ps.Deck.Count + ")");
+            }
+        }
+
         // Apply order damage to an enemy unit (or the enemy leader at 1,1). Unit death is resolved
         // at wave end by ProcessCasualties, exactly like attack damage.
         static void DamageEnemyAt(PlayerState opPs, int gx, int gy, int dmg)
         {
             if (gx < 0 || gx > 2 || gy < 0 || gy > 2) return;
-            if (gx == 1 && gy == 1) { opPs.LeaderLife -= dmg; Log("    damage -> enemy LEADER -" + dmg + " (life " + opPs.LeaderLife + ")"); return; }
+            // Cover: redirect this damage to a living coverer of the position (order/spell damage, too).
+            bool isLeader = (gx == 1 && gy == 1);
+            {
+                int cvx, cvy;
+                if (TryCover(opPs, gx, gy, isLeader, out cvx, out cvy))
+                { Log("    COVER: order damage on (" + gx + "," + gy + ") redirected to (" + cvx + "," + cvy + ")"); gx = cvx; gy = cvy; isLeader = false; }
+            }
+            if (isLeader) { int ld = Math.Max(1, dmg - opPs.LeaderArmorBonus); opPs.LeaderLife -= ld; Log("    damage -> enemy LEADER -" + ld + " (life " + opPs.LeaderLife + ")"); return; }
             BUnit u;
             if (opPs.Units.TryGetValue(Key(gx, gy), out u) && u != null && !u.IsCorpse)
             {
@@ -1164,17 +1436,19 @@ namespace PtoServer
             var unit = new BUnit
             {
                 Card = card,
-                Atk = AtkOf(card) + GetUnitStrength(card, gy),
+                Atk = AtkOf(card) + GetUnitStrength(card, gx),
                 Max = LifeOf(card),
                 Damage = 0,
-                Armor = GetUnitArmor(card, gy),
-                Strength = GetUnitStrength(card, gy),
-                Abilities = GetUnitAbilities(card, gy),
+                Armor = GetUnitArmor(card, gx),
+                Strength = GetUnitStrength(card, gx),
+                Abilities = GetUnitAbilities(card, gx),
+                Cover = PassiveOf(card, gx).Cover,
                 IsCorpse = false,
                 RecruitedThisWave = true,
                 HasAttackedThisWave = false,
             };
             ps.Units[key] = unit;
+            RecomputeAuras(ps); // the new unit may grant/receive auras -> refresh effective stats
 
             // Remove card from hand
             mine.Hand.RemoveAt(handIndex);
@@ -1195,6 +1469,9 @@ namespace PtoServer
                 // Client mirrors Y in container_summon_unit_get: yy = 2 - buffer_read
                 byte[] toOpp = new PacketWriter().WriteU16(card).WriteU8(gx).WriteU8(gy).WriteBool(false).Frame(Op.SummonUnitGet);
                 Send(theirs.Me.Ns, toOpp);
+
+                // Refresh all of the owner's units so aura recipients (neighbors/leader) update on screen.
+                SyncUnitStates(mine.P == 0 ? mine : theirs, mine.P == 0 ? theirs : mine, b);
             }
 
             // Consume action
@@ -1219,6 +1496,9 @@ namespace PtoServer
 
             PlayerState ps = b.P[mine.P];
             if (ps.ActionsRemaining <= 0) { Log("ATTACK rejected: no actions remaining"); GrantAction(mine); return; }
+
+            // Fold ally auras into effective stats for BOTH sides before resolving combat.
+            RecomputeAuras(b.P[mine.P]); RecomputeAuras(b.P[1 - mine.P]);
 
             var r = new PacketReader(payload, 0);
             bool isSpell = r.ReadBool();
@@ -1267,7 +1547,7 @@ namespace PtoServer
                 attacker = new BUnit
                 {
                     Card = ps.LeaderCard,
-                    Atk = AtkOf(ps.LeaderCard),
+                    Atk = AtkOf(ps.LeaderCard) + ps.LeaderStrBonus, // + "Leader: Strength N" auras
                     Max = ps.LeaderMax,
                     Damage = ps.LeaderMax - ps.LeaderLife,
                     Armor = 0,
@@ -1296,7 +1576,9 @@ namespace PtoServer
             // Determine attack type: ranged if unit has RangedAttack ability
             // Ranged is decided by the same table the client's atktype (update_buff) uses, so the
             // two never disagree. Leaders melee. ax is the attacker's wave (grid_x).
-            bool isRanged = !attackerIsLeader && IsRangedAtWave(attacker.Card, ax);
+            // Ranged if the attacker has the RangedAttack ability (own OR aura-granted; auras were
+            // recomputed above), not just the card's own wave table.
+            bool isRanged = !attackerIsLeader && (attacker.Abilities & UnitAbility.RangedAttack) != 0;
 
             // Find target (using server Y coordinate)
             PlayerState opPs = b.P[1 - mine.P];
@@ -1331,13 +1613,38 @@ namespace PtoServer
             // --- Ranged + Intercept validation ---
             if (isRanged && !targetIsLeader)
             {
-                // Check if an intercepting unit blocks this attack
+                // Check if an intercepting unit blocks this attack. It only blocks when it stands IN
+                // FRONT of the target in the same column (higher wave = closer to the enemy); a ranged
+                // shot passes over allies/enemies but cannot pass over an interceptor. An interceptor
+                // behind (or at) the target does not block.
                 int interceptWave = FindInterceptInColumn(serverTy, opPs, b.Wave);
-                if (interceptWave >= 0 && interceptWave != tx)
+                if (interceptWave > tx)
                 {
                     // Intercept redirects attack to the interceptor
                     Log("  -> INTERCEPT: ranged attack redirected to (" + interceptWave + "," + serverTy + ")");
                     tx = (byte)interceptWave;
+                    targetKey = Key(tx, serverTy);
+                    targetIsLeader = false;
+                }
+            }
+
+            // The unit ORIGINALLY targeted (before any cover redirect) is the one that reacts with
+            // Counter: a covered hero still counters even though the coverer absorbs the damage, because
+            // Counter reacts to being ATTACKED, not to taking damage. Capture it now, pre-redirect.
+            byte origTx = tx, origTy = serverTy;
+            BUnit counterUnit = null;
+            if (!targetIsLeader) opPs.Units.TryGetValue(Key(origTx, origTy), out counterUnit);
+
+            // --- Cover: a living coverer takes damage aimed at a covered position (its forerunner, the
+            // leader, or vanguard). Applies to melee AND ranged; redirect the hit to the coverer. (No
+            // jump-in animation yet — the damage just lands on the coverer; animation is a later pass.)
+            {
+                int cvx, cvy;
+                if (TryCover(opPs, targetIsLeader ? 1 : tx, targetIsLeader ? 1 : serverTy, targetIsLeader, out cvx, out cvy))
+                {
+                    Log("  -> COVER: hit on " + (targetIsLeader ? "leader" : ("(" + tx + "," + serverTy + ")")) +
+                        " redirected to coverer (" + cvx + "," + cvy + ")");
+                    tx = (byte)cvx; serverTy = (byte)cvy;
                     targetKey = Key(tx, serverTy);
                     targetIsLeader = false;
                 }
@@ -1350,51 +1657,65 @@ namespace PtoServer
 
             if (targetIsLeader)
             {
-                // Damage goes to opponent's leader
-                opPs.LeaderLife -= rawDmg;
+                // Damage goes to opponent's leader (reduced by "Leader: Armor N" auras).
+                int ldmg = Math.Max(1, rawDmg - opPs.LeaderArmorBonus);
+                opPs.LeaderLife -= ldmg;
                 leaderDied = opPs.LeaderLife <= 0;
-                Log("  -> LEADER takes " + rawDmg + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
+                Log("  -> LEADER takes " + ldmg + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
                 // Target the leader's real slot (1,1), NOT the empty front slot the client aimed at.
                 // The client's attack animation looks up a unit at the target coords; sending the
                 // empty slot makes that lookup undefined and crashes (and mis-addresses the leader's
                 // HP update). The leader is always stored at (1,1) on both grids.
-                SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, rawDmg, attackerIsLeader, opPs, isRanged, false, b);
+                SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, ldmg, attackerIsLeader, opPs, isRanged, false, b);
+                ApplyVamp(mine, theirs, b, attacker, attackerIsLeader, ldmg);
             }
             else
             {
                 BUnit target;
                 if (opPs.Units.TryGetValue(targetKey, out target) && !target.IsCorpse)
                 {
-                    int actualDmg = Math.Max(1, rawDmg - target.Armor);
+                    // Hero Killer: this attacker deals DOUBLE damage to enemy heroes (every unit is a
+                    // hero; leaders are handled in the targetIsLeader branch and are unaffected).
+                    int baseDmg = rawDmg;
+                    if (!attackerIsLeader && (attacker.Abilities & UnitAbility.HeroKiller) != 0)
+                    {
+                        baseDmg = rawDmg * 2;
+                        Log("  -> HERO KILLER: double damage vs hero (" + rawDmg + " -> " + baseDmg + ")");
+                    }
+                    int actualDmg = Math.Max(1, baseDmg - target.Armor);
                     target.Damage += actualDmg;
                     targetDied = target.Damage >= target.Max;
                     Log("  -> unit(" + tx + "," + serverTy + ") card " + target.Card + " takes " + actualDmg +
                         " (damage " + target.Damage + "/" + target.Max + (targetDied ? ", WILL DIE AT WAVE END" : "") + ")");
                     SendAttackAndUpdate(mine, theirs, ax, ay, tx, serverTy, actualDmg, attackerIsLeader, target, isRanged, false, b);
-
-                    // --- Counter-attack (melee only) ---
-                    if (!isRanged && !targetDied && target.Atk > 0 && !target.RecruitedThisWave)
-                    {
-                        // Target counter-attacks if it's alive, melee, in the current wave, and was not recruited this wave
-                        int counterKey = Key(tx, serverTy);
-                        int counterDmg = Math.Max(1, target.Atk - attacker.Armor);
-                        attacker.Damage += counterDmg;
-                        bool attackerDied = attacker.Damage >= attacker.Max;
-                        Log("  -> COUNTER-ATTACK: unit(" + tx + "," + serverTy + ") hits back for " + counterDmg +
-                            " (attacker damage " + attacker.Damage + "/" + attacker.Max + (attackerDied ? ", WILL DIE" : "") + ")");
-                        SendAttackAndUpdate(theirs, mine, tx, serverTy, ax, ay, counterDmg, false, attacker, false, true, b);
-                        // Note: counter-attack from attacker's perspective uses theirs/mine swapped
-                    }
+                    ApplyVamp(mine, theirs, b, attacker, attackerIsLeader, actualDmg);
                 }
                 else
                 {
-                    // No unit at target, damage goes to leader
-                    opPs.LeaderLife -= rawDmg;
+                    // No unit at target, damage goes to leader (reduced by "Leader: Armor N" auras).
+                    int ldmg2 = Math.Max(1, rawDmg - opPs.LeaderArmorBonus);
+                    opPs.LeaderLife -= ldmg2;
                     leaderDied = opPs.LeaderLife <= 0;
-                    Log("  -> LEADER (no unit at target) takes " + rawDmg + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
+                    Log("  -> LEADER (no unit at target) takes " + ldmg2 + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
                     // Target the leader's real slot (1,1) — see note above; empty-slot coords crash the client.
-                    SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, rawDmg, attackerIsLeader, opPs, isRanged, false, b);
+                    SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, ldmg2, attackerIsLeader, opPs, isRanged, false, b);
+                    ApplyVamp(mine, theirs, b, attacker, attackerIsLeader, ldmg2);
                 }
+            }
+
+            // --- Counter-attack (melee only). The ORIGINALLY-targeted unit counters if it has Counter,
+            // is alive (a covered unit is undamaged and still counters), was not recruited this wave, and
+            // has attack power. Counter comes from that unit's own cell (origTx, origTy). ---
+            if (!isRanged && counterUnit != null && !counterUnit.IsCorpse && counterUnit.Damage < counterUnit.Max
+                && counterUnit.Atk > 0 && !counterUnit.RecruitedThisWave
+                && (counterUnit.Abilities & UnitAbility.Counter) != 0 && attacker != null && !attackerIsLeader)
+            {
+                int counterDmg = Math.Max(1, counterUnit.Atk - attacker.Armor);
+                attacker.Damage += counterDmg;
+                bool attackerDied = attacker.Damage >= attacker.Max;
+                Log("  -> COUNTER-ATTACK: unit(" + origTx + "," + origTy + ") hits back for " + counterDmg +
+                    " (attacker damage " + attacker.Damage + "/" + attacker.Max + (attackerDied ? ", WILL DIE" : "") + ")");
+                SendAttackAndUpdate(theirs, mine, origTx, origTy, ax, ay, counterDmg, false, attacker, false, true, b);
             }
 
             // Mark attacker as having attacked
@@ -1439,6 +1760,29 @@ namespace PtoServer
                 if (opPs.Units.TryGetValue(k, out u) && !u.IsCorpse) return false;
             }
             return true;
+        }
+
+        // Cover: if a living unit on ps's board covers the position (gx,gy) (or the leader), return true
+        // and output the coverer's cell. The coverer takes the damage aimed at the covered position.
+        //   Forerunner -> the unit directly BEHIND the target covers it (leader's "behind" is 0,1)
+        //   Leader     -> any Cover:Leader unit protects the leader
+        //   Vanguard   -> any Cover:Vanguard unit protects any vanguard hero
+        static bool TryCover(PlayerState ps, int gx, int gy, bool isLeader, out int cx, out int cy)
+        {
+            cx = gx; cy = gy;
+            int tx = isLeader ? 1 : gx;
+            int ty = isLeader ? 1 : gy;
+            BUnit c;
+            if (tx - 1 >= 0 && ps.Units.TryGetValue(Key(tx - 1, ty), out c) && c != null && !c.IsCorpse
+                && c.Cover == CoverType.Forerunner)
+            { cx = tx - 1; cy = ty; return true; }
+            if (isLeader)
+                foreach (var kv in ps.Units)
+                { BUnit u = kv.Value; if (u != null && !u.IsCorpse && u.Cover == CoverType.Leader) { cx = kv.Key / 10; cy = kv.Key % 10; return true; } }
+            if (!isLeader && gx == 2)
+                foreach (var kv in ps.Units)
+                { BUnit u = kv.Value; if (u != null && !u.IsCorpse && u.Cover == CoverType.Vanguard) { cx = kv.Key / 10; cy = kv.Key % 10; return true; } }
+            return false;
         }
 
         // Find the frontmost intercept unit in a column.
@@ -1599,11 +1943,29 @@ namespace PtoServer
             ps.Units.Remove(srcKey);
             ps.Units[dstKey] = unit;
 
+            // Passives depend on the wave (grid_x), so recompute them for the destination wave x2.
+            unit.Atk = AtkOf(unit.Card) + GetUnitStrength(unit.Card, x2);
+            unit.Strength = GetUnitStrength(unit.Card, x2);
+            unit.Armor = GetUnitArmor(unit.Card, x2);
+            unit.Abilities = GetUnitAbilities(unit.Card, x2);
+            unit.Cover = PassiveOf(unit.Card, x2).Cover;
+
+            // Moving is one of the once-per-wave actions (move / attack / cast) — a hero that moves
+            // cannot attack again this wave. Mark it exhausted so it greys out and can't attack until
+            // the next wave (or an Inspire refreshes it).
+            unit.HasAttackedThisWave = true;
+
             // Relay to both clients
             Send(mine.Me.Ns, new PacketWriter().WriteU8(x1).WriteU8(y1).WriteU8(x2).WriteU8(y2).Frame(Op.Move));
             if (theirs != null)
                 // container_move_unit_get mirrors Y: y1 = 2 - read, y2 = 2 - read
                 Send(theirs.Me.Ns, new PacketWriter().WriteU8(x1).WriteU8(y1).WriteU8(x2).WriteU8(y2).Frame(Op.MoveGet));
+
+            // Push the recomputed stats/buff (attack, armor, intercept/counter/ranged icons) for the
+            // unit's new wave so the client display matches the server after the move.
+            SendUnitUpdateToBoth(mine, theirs, x2, y2, unit, b);
+            // Moving changes aura relationships (this unit as source and as recipient), so refresh all.
+            SyncUnitStates(mine.P == 0 ? mine : theirs, mine.P == 0 ? theirs : mine, b);
 
             ConsumeAction(mine, theirs, b);
         }
@@ -1654,6 +2016,40 @@ namespace PtoServer
             ps.ActionsRemaining--;
             Log("  actions remaining for " + mine.Me.User + ": " + ps.ActionsRemaining);
             GrantAction(mine);
+        }
+
+        // Push an owner's leader HP (slot 1,1) to both clients. Used when the leader's life changes
+        // outside the normal attack path (e.g. Vamp healing your own leader mid-attack).
+        static void SendLeaderHp(BattleSlot ownerSlot, BattleSlot oppSlot, PlayerState ps)
+        {
+            byte atk = (byte)AtkOf(ps.LeaderCard);
+            ushort life = (ushort)Math.Max(0, ps.LeaderLife);
+            ushort max = (ushort)ps.LeaderMax;
+            bool dead = ps.LeaderLife <= 0;
+            Send(ownerSlot.Me.Ns, new PacketWriter()
+                .WriteU8(1).WriteU8(1).WriteU8(atk).WriteU16(life)
+                .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true).WriteBool(dead).WriteU8((byte)max)
+                .Frame(Op.UpdateUnit));
+            if (oppSlot != null)
+                Send(oppSlot.Me.Ns, new PacketWriter()
+                    .WriteU8(1).WriteU8(1).WriteU8(atk).WriteU16(life)
+                    .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true).WriteBool(dead).WriteU8((byte)max)
+                    .Frame(Op.UpdateUnitGet));
+        }
+
+        // Vamp: when a hero deals damage, heal its owner's leader by that much (capped at leader max).
+        static void ApplyVamp(BattleSlot mine, BattleSlot theirs, Battle b, BUnit attacker, bool attackerIsLeader, int dealt)
+        {
+            if (attackerIsLeader || attacker == null || dealt <= 0) return;
+            if ((attacker.Abilities & UnitAbility.Vamp) == 0) return;
+            PlayerState ps = b.P[mine.P];
+            int before = ps.LeaderLife;
+            ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + dealt);
+            if (ps.LeaderLife != before)
+            {
+                Log("  -> VAMP: heal own leader +" + (ps.LeaderLife - before) + " (life " + ps.LeaderLife + ")");
+                SendLeaderHp(mine, theirs, ps);
+            }
         }
 
         // ---- end turn (op 14 empty = end turn) --------------------------------
@@ -1735,8 +2131,22 @@ namespace PtoServer
                 {
                     BUnit u = kvp.Value;
                     if (u == null || u.IsCorpse) continue;
+                    bool ephemeral = (u.Abilities & UnitAbility.Ephemeral) != 0;
+                    // Ephemeral heroes are defeated at wave end regardless of damage.
+                    if (ephemeral)
+                    {
+                        Log("  EPHEMERAL: player " + pi + " unit(" + (kvp.Key / 10) + "," + (kvp.Key % 10) + ") card " + u.Card + " expires");
+                        deadKeys.Add(kvp.Key); anyCasualties = true;
+                        continue;
+                    }
                     if (u.Damage >= u.Max)
                     {
+                        // Deathproof heroes survive lethal (keep their damage, are NOT defeated).
+                        if ((u.Abilities & UnitAbility.Deathproof) != 0)
+                        {
+                            Log("  DEATHPROOF: player " + pi + " unit(" + (kvp.Key / 10) + "," + (kvp.Key % 10) + ") card " + u.Card + " survives lethal");
+                            continue;
+                        }
                         deadKeys.Add(kvp.Key);
                         anyCasualties = true;
                     }
@@ -1882,10 +2292,12 @@ namespace PtoServer
         static void SyncPlayerUnits(BattleSlot ownerSlot, BattleSlot oppSlot, Battle b, int ownerP)
         {
             var ps = b.P[ownerP];
+            RecomputeAuras(ps); // fold ally auras into each unit's effective stats before sending them
             if (PacketLog) Log("[SyncPlayerUnits] player=" + ownerP + " wave=" + b.Wave);
 
             // 1. Leader at (1,1) — active in all waves
-            byte leaderAtk = (byte)AtkOf(ps.LeaderCard);
+            byte leaderAtk = (byte)(AtkOf(ps.LeaderCard) + ps.LeaderStrBonus); // + "Leader: Strength N" auras
+            byte leaderArmor = (byte)ps.LeaderArmorBonus;                      // from "Leader: Armor N" auras
             uint leaderLife = (uint)Math.Max(0, ps.LeaderLife);
             bool leaderDead = ps.LeaderLife <= 0;
             ushort leaderMax = (ushort)ps.LeaderMax;
@@ -1893,13 +2305,13 @@ namespace PtoServer
             // UpdateUnit to owner — raw Y
             Send(ownerSlot.Me.Ns, new PacketWriter()
                 .WriteU8(1).WriteU8((byte)1).WriteU8(leaderAtk).WriteU16((ushort)leaderLife)
-                .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true)
+                .WriteU8(0).WriteU8(0).WriteU8(leaderArmor).WriteBool(true)
                 .WriteBool(leaderDead).WriteU8((byte)leaderMax)
                 .Frame(Op.UpdateUnit));
             // UpdateUnitGet to opponent — raw Y (container_update_unit_get: yy = 2 - read)
             Send(oppSlot.Me.Ns, new PacketWriter()
                 .WriteU8(1).WriteU8(1).WriteU8(leaderAtk).WriteU16((ushort)leaderLife)
-                .WriteU8(0).WriteU8(0).WriteU8(0).WriteBool(true)
+                .WriteU8(0).WriteU8(0).WriteU8(leaderArmor).WriteBool(true)
                 .WriteBool(leaderDead).WriteU8((byte)leaderMax)
                 .Frame(Op.UpdateUnitGet));
 

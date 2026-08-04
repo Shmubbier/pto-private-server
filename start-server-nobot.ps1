@@ -15,14 +15,50 @@ if (-not (Test-Path ".\PtoServer.exe")) {
     & "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /optimize+ /out:PtoServer.exe PtoServer.cs | Out-Null
 }
 
-# Make sure the 'tester' account has a ready 31-card deck to select in Arena
+# Build the test deck: leader + 30 hero cards (the client requires 30 to start a match). To keep the
+# deck to ONLY finished cards, the 17 finished heroes are repeated (duplicates) to fill 30 slots.
+# Card id = REAL * 2. If the Arena deck-select screen rejects duplicates, fall back to filling with
+# other heroes instead. Excluded (unfinished): Fighter, Dragon Mage, Mystic, Oracle, Homunculus,
+# Paladin, Planestalker, Force Cube, Zombie, Fire/Water/Air/Dark Elemental.
 New-Item -ItemType Directory -Force -Path ".\data" | Out-Null
-$cards = @(2) + (0..29 | ForEach-Object { 52 + $_ * 2 })
-Set-Content ".\data\tester.decks" -Value ("0|0|1|2|" + ($cards -join ',') + "|Arena Deck") -Encoding utf8
-# and the same for 'fester' (second human) so both have a legal deck
-Set-Content ".\data\fester.decks" -Value ("0|0|1|2|" + ($cards -join ',') + "|Arena Deck") -Encoding utf8
+# Ordered so the cards under test come FIRST. With PTO_NOSHUFFLE=1 (set below) the deck stays in this
+# order, so the opening hand is the first 5 heroes here. Reorder to test different cards.
+$finished = @(
+    60,   # 30 Alchemist   <- aura: Leader: Armor 2 (Flank)
+    62,   # 31 Gunner      <- aura: Supporter: R.Attack (Flank)
+    96,   # 48 Trapper     <- aura: Forerunner: Intercept, Supporter: R.Attack (Flank)
+    98,   # 49 Vampire     <- Vamp / Cover: Forerunner
+    70,   # 35 Knight      <- Counter / Cover: Forerunner (Rear)
+    88,   # 44 Scientist   <- Haste (order) / Draw (flank spell)
+    58,   # 29 Assassin    <- Hero Killer / Assassinate
+    72,   # 36 Mascot      <- Draw (order) / Inspire
+    64,   # 32 Healer      <- Armor / Intercept
+    56,   # 28 Berserker
+    60,   # 30 Alchemist
+    62,   # 31 Gunner
+    68,   # 34 Illusionist
+    78,   # 39 Overlord
+    84,   # 42 Priestess
+    86,   # 43 Pyromancer
+    92,   # 46 Summoner
+    94,   # 47 Templar
+    96,   # 48 Trapper
+    100   # 50 Witch
+)
+# Repeat the finished list until we have 30 hero cards.
+$heroes = @()
+while ($heroes.Count -lt 30) { $heroes += $finished }
+$heroes = $heroes[0..29]
+$cards = @(2) + $heroes
+$deck = "0|0|1|2|" + ($cards -join ',') + "|Arena Deck"
+# Give every account we might log in as the same finished deck.
+Set-Content ".\data\tester.decks" -Value $deck -Encoding utf8
+Set-Content ".\data\fester.decks" -Value $deck -Encoding utf8
+Set-Content ".\data\jester.decks" -Value $deck -Encoding utf8
 
 # Start the server only (logs to server_live.log). No bot.
+# PTO_NOSHUFFLE keeps the deck in the fixed order above so the opening hand is deterministic for testing.
+$env:PTO_NOSHUFFLE = "1"
 Remove-Item ".\server_live.log" -ErrorAction SilentlyContinue
 $srv = Start-Process ".\PtoServer.exe" -RedirectStandardOutput ".\server_live.log" -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 1
