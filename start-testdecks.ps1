@@ -17,12 +17,12 @@ $decks = @(
     @{ name = "4 Replicate";      front = @(130,128) }                     # Puppeteer(order, Quick) / Doppelganger(F spell): copy a FRIENDLY hero's card to hand
     @{ name = "5 Infusion";       front = @(120,212) }                     # Chronicler(V spell: leader +N, self -N; order Infuse Leader 4) / Statistician(V Infuse Leader 3, R Meteor Storm 7)
     @{ name = "6 Execute";        front = @(54,136) }                      # Dragon Mage(V spell) / Sniper(F spell): instantly defeat an enemy hero
-    @{ name = "7 Meteor Storm";   front = @(138,212) }                     # Warmage(order: 10 to all rivals) / Statistician(R spell: 7 to all rivals)
+    @{ name = "7 Meteor Storm";   front = @(138,212) }                     # Warmage(order: 10 to all rivals) / Statistician(R spell: 7 to all rivals). (Immortality/Restructure have their own launcher: start-ongoingtest.ps1)
     @{ name = "8 Shield/Str/Sil"; front = @(210,192,54,170) }             # Scholar/Squire(Shield) / Dragon Mage(Str Buff 5 order) / Wizard(Str/Silence)
     @{ name = "9 Decoy/Swap/Take";front = @(220,108,194) }                 # Occultist(Decoy) / Air Elemental(R Swap) / Dark Knight(R Takedown)
-    @{ name = "10 Fin/Ice/Bk/Orb";front = @(172,164,174,224) }             # Lancer(Finisher) / Ranger(Ice) / Reflector(Backlash) / Mastermind(Orbs)
+    @{ name = "10 Fin/Ice/Bk/Orb";front = @(172,164,174,224) }             # Lancer(Finisher) / Ranger(Ice) / Reflector(Backlash) / Mastermind(Orbs). (Traps have their own launcher: start-traptest.ps1)
     @{ name = "11 Ban/Uns/Ret/Wl";front = @(96,92,68,110) }                # Trapper(Banish) / Summoner(Unsummon) / Illusionist(Retreat/Wild) / Dark Elemental(Unsummon)
-    @{ name = "12 Meteor/Back";   front = @(210,208,138) }                 # Scholar(Meteor 6 order) / Magic Student(Quick Meteor 2) / Warmage(Meteor 7)
+    @{ name = "12 Revenge";       front = @(94,116) }                      # Templar(Revenge: Strength 4 @V) / Adventure Ranger(Revenge: Melee Strength 3 @V): leader +N attack when they die at Vanguard
 )
 $filler = @(56,58,60,62,64,68,70,72,78,84,86,88,92,94,96,98,100)   # finished heroes to fill 30
 

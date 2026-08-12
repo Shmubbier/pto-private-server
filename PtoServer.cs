@@ -159,14 +159,14 @@ namespace PtoServer
         RangedAttack    = 2,     // can target any enemy regardless of column
         Counter         = 4,     // deals its attack back when hit by a melee attack
         HeroKiller      = 8,     // deals double damage to enemy heroes
-        Vamp            = 16,    // when it deals damage, heal your leader by that amount
-        Deathproof      = 32,    // not defeated when lethal damage would defeat it
-        Ephemeral       = 64,    // defeated automatically at end of wave
+        Vamp            = 16,    // when it deals attack damage, heals ITSELF by that much (removes its own damage)
+        Deathproof      = 32,    // immune to INSTANT-KILL effects only (Assassinate/Execute/Takedown/Finisher Kill); ordinary damage still kills
+        Ephemeral       = 64,    // on defeat its corpse clears INSTANTLY (leaves no corpse); does not change death timing
         RImmunity       = 128,   // cannot be targeted by ranged attacks
-        InterceptKiller = 256,   // its ranged attacks ignore enemy Intercept
-        Swift           = 512,   // can attack the turn it is recruited (no summon-sickness)
+        InterceptKiller = 256,   // deals DOUBLE damage to targets that HAVE Intercept
+        Swift           = 512,   // can act the turn it is recruited (no summon-sickness); the attack still costs an action
         Incorporeal     = 1024,  // does not block melee (unit behind can attack / be targeted through it)
-        Mercy           = 2048,  // when it deals attack damage, it heals itself by that much
+        Mercy           = 2048,  // when it deals attack damage, heals a RANDOM damaged friendly hero by that much
         DoubleAttack    = 4096,  // makes its melee attack twice
         Reflect         = 8192,  // reflects attack damage it takes back to the attacker
     }
@@ -492,7 +492,7 @@ namespace PtoServer
         // Vanguard: prefix — those are auras, a later tier). Strength here folds in "Melee Strength"
         // (nearly all our melee units), so it's added to the unit's attack stat. Armor is flat damage
         // reduction. Intercept/Counter are combat flags. wave index: 2=Vanguard, 1=Flank, 0=Rear.
-        struct SelfPassive { public bool Intercept; public bool Counter; public bool HeroKiller; public bool Vamp; public bool Deathproof; public bool Ephemeral; public bool RImmunity; public bool InterceptKiller; public bool Swift; public bool Incorporeal; public bool Mercy; public bool DoubleAttack; public bool Reflect; public CoverType Cover; public int Strength; public int Armor; public int Regen; public int Finisher; }
+        struct SelfPassive { public bool Intercept; public bool Counter; public bool HeroKiller; public bool Vamp; public bool Deathproof; public bool Ephemeral; public bool RImmunity; public bool InterceptKiller; public bool Swift; public bool Incorporeal; public bool Mercy; public bool DoubleAttack; public bool Reflect; public CoverType Cover; public int Strength; public int Armor; public int Regen; public int Finisher; public int RevengeStrength; }
         static readonly SelfPassive[,] _passive = BuildPassives();
         static SelfPassive[,] BuildPassives()
         {
@@ -512,14 +512,14 @@ namespace PtoServer
             p[29, 1].HeroKiller = true; // Assassin      (Flank)
             p[52, 2].HeroKiller = true; // Fire Elemental (Vanguard)
 
-            // -- Vamp (heal your leader by damage dealt) --
+            // -- Vamp (heal ITSELF by attack damage dealt) --
             p[49, 2].Vamp = true; // Vampire    (Vanguard)
             p[97, 2].Vamp = true; // Dark Knight (Vanguard)
 
-            // -- Deathproof (survive lethal at wave end) -- (plain self only; auras are a later tier)
+            // -- Deathproof (immune to non-attack damage; still dies to attacks) -- (plain self only; auras are a later tier)
             p[109, 2].Deathproof = true; // Druid (Vanguard)
 
-            // -- Ephemeral (defeated at end of wave) --
+            // -- Ephemeral (on defeat, corpse clears instantly — leaves no corpse) --
             p[51, 2].Ephemeral = p[51, 1].Ephemeral = p[51, 0].Ephemeral = true; // Zombie (all waves)
             p[54, 2].Ephemeral = true;                                           // Air Elemental (Vanguard)
             p[59, 2].Ephemeral = p[59, 1].Ephemeral = p[59, 0].Ephemeral = true; // Ghost (all waves)
@@ -534,7 +534,7 @@ namespace PtoServer
 
             // -- R.Immunity (cannot be targeted by ranged) --
             p[48, 2].RImmunity = true; // Trapper Vanguard: "Intercept, R.Immunity"
-            // -- Intercept Killer (ranged ignores enemy Intercept) --
+            // -- Intercept Killer (double damage vs targets that HAVE Intercept) --
             p[31, 2].InterceptKiller = true; // Gunner Vanguard: "R.Attack, Intercept Killer"
             p[68, 2].InterceptKiller = true; // Sniper Vanguard
             p[82, 0].InterceptKiller = true; // Ranger Rear
@@ -553,6 +553,9 @@ namespace PtoServer
             p[67, 2].Regen = 2; // Sage Vanguard: "Intercept, Regen 2"
             // -- Finisher N (this hero's attack deals +N to an ALREADY-damaged hero) --
             p[86, 2].Finisher = 3; // Lancer Vanguard: "Finisher 3"
+            // -- Revenge: Strength N (while THIS hero is itself damaged (Damage>0), it attacks for +N) --
+            p[47, 2].RevengeStrength = 4; // Templar Vanguard: "Revenge: Strength 4"
+            p[58, 2].RevengeStrength = 3; // Adventure Ranger Vanguard: "Revenge: Melee Strength 3"
 
             // -- Strength (folds in Melee Strength) --
             p[26, 1].Strength = 2; p[26, 0].Strength = 3;                 // Fighter
@@ -616,6 +619,8 @@ namespace PtoServer
                 case 80: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2 }); break; // Warrior F
                 case 83: if (wave == 0) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Intercept }); break; // Defender R
                 case 94: if (wave == 0) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2 }); break; // Magus R
+                case 87: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.Reflect }); break; // Reflector F: Forerunner: Reflect Damage
+                case 106:if (wave == 1) list.Add(new Aura { Target = AuraTarget.Leader, Grant = UnitAbility.Reflect }); break;     // Statistician F: Leader: Reflect Damage
             }
             return list;
         }
@@ -631,9 +636,10 @@ namespace PtoServer
                 BUnit u = kv.Value; if (u == null) continue;
                 int wave = kv.Key / 10;
                 u.Strength = GetUnitStrength(u.Card, wave);
-                u.Atk = AtkOf(u.Card) + u.Strength + u.TempStrength; // TempStrength = Strength Buff (until end of turn)
+                u.Atk = Math.Max(0, AtkOf(u.Card) + u.Strength + u.TempStrength - u.Enervate); // + Strength Buff, - Enervate
                 u.Armor = GetUnitArmor(u.Card, wave);
                 u.Finisher = GetUnitFinisher(u.Card, wave);
+                u.Revenge = GetUnitRevenge(u.Card, wave);
                 u.Abilities = GetUnitAbilities(u.Card, wave);
                 u.Cover = PassiveOf(u.Card, wave).Cover;
             }
@@ -650,15 +656,179 @@ namespace PtoServer
                         r.Strength += a.Strength; r.Atk += a.Strength; r.Armor += a.Armor; r.Abilities |= a.Grant;
                     }
             }
+            // 2.5 Leader passive grants that apply to ALL your heroes (a leader-wide aura).
+            ApplyLeaderUnitGrants(ps);
             // 3. Silence: a silenced hero loses ALL innate abilities + applied status (auras, Str buff,
             // Shield) — only its base attack remains. Applied last so nothing above leaks through.
             foreach (var kv in ps.Units)
             {
                 BUnit u = kv.Value; if (u == null || !u.Silenced) continue;
                 u.Abilities = UnitAbility.None; u.Cover = CoverType.None;
-                u.Strength = 0; u.Armor = 0; u.Finisher = 0; u.TempStrength = 0; u.Shield = false;
+                u.Strength = 0; u.Armor = 0; u.Finisher = 0; u.Revenge = 0; u.TempStrength = 0; u.Shield = false; u.Enervate = 0;
                 u.Atk = AtkOf(u.Card);
             }
+        }
+
+        // Leader passives that behave like a "Unit: X" aura — they grant an ability/stat to ALL of your
+        // heroes (and sometimes the leader). Applied every RecomputeAuras (after ally auras, before
+        // Silence). Silenced heroes are skipped. Indexed by leader REAL (LeaderCard/2).
+        static void ApplyLeaderUnitGrants(PlayerState ps)
+        {
+            int lr = ps.LeaderCard / 2;
+            foreach (var kv in ps.Units)
+            {
+                BUnit u = kv.Value;
+                if (u == null || u.IsCorpse || u.Silenced) continue;
+                switch (lr)
+                {
+                    case 3:  u.Armor += 1; break;                                 // Cadenza: your heroes have Armor 1
+                    case 4:  if (ps.IsFirstPlayer) { u.Strength += 3; u.Atk += 3; } else u.Armor += 1; break; // Kallistar: First Player -> Strength 3, else Armor 1
+                    case 6:  u.Strength += 2; u.Atk += 2; break;                  // Hikaru: Melee Attack Strength 2
+                    case 12: u.Abilities |= UnitAbility.Swift; break;             // Borneo: all your heroes have Swift
+                    case 17: u.Abilities |= UnitAbility.RangedAttack; break;      // Zaamassal Kett: gain Ranged Attack
+                    case 20: if (u.Revenge < 5) u.Revenge = 5; break;            // Eligor Larington: Revenge: Strength 5
+                    case 22: u.Abilities |= UnitAbility.Vamp; break;              // Demitras: gain Vamp
+                }
+                // Magdelina: persistent +Strength to all your heroes each round.
+                if (ps.RoundStrBonus > 0) { u.Strength += ps.RoundStrBonus; u.Atk += ps.RoundStrBonus; }
+                // Rexan / Hepzibah: your Zombies (card 102 = REAL 51) have +1 Melee Strength.
+                if ((lr == 16 || lr == 23) && u.Card / 2 == 51) { u.Strength += 1; u.Atk += 1; }
+            }
+            if (lr == 6) ps.LeaderStrBonus += 2; // Hikaru: the Leader also has Melee Attack Strength 2
+            // Star Knight Iri (per-defeat) + Magdelina (per-round) also boost the LEADER's attack.
+            ps.LeaderStrBonus += ps.LeaderPermStr + ps.RoundStrBonus;
+        }
+
+        // Leader passive that fires at the END OF the leader-owner's turn (heal / draw). ps = ending player.
+        static void ApplyLeaderEndOfTurn(BattleSlot mine, BattleSlot theirs, Battle b)
+        {
+            PlayerState ps = b.P[mine.P];
+            int lr = ps.LeaderCard / 2;
+            if (lr == 8) // Kavri: heal 2 from each hero + leader in the CURRENT wave
+            {
+                int n = 0;
+                foreach (var kv in ps.Units) { BUnit u = kv.Value; if (u != null && !u.IsCorpse && kv.Key / 10 == b.Wave && u.Damage > 0) { u.Damage = Math.Max(0, u.Damage - 2); n++; } }
+                ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + 2);
+                Log("  LEADER (Kavri): healed 2 from wave " + b.Wave + " (" + n + " heroes + leader)");
+            }
+            else if (lr == 24 && mine.Hand.Count < 5) // Marmelee Greyheart: draw 1 if fewer than 5 cards
+            {
+                DrawCardsFor(mine, theirs, b, 1);
+                Log("  LEADER (Marmelee): drew 1 (hand < 5)");
+            }
+        }
+
+        // Fired at every own-hero death site. `ownerSlot` owns the dying hero `deadUnit`; `oppSlot` is the
+        // enemy. Handles Star Knight Iri (own leader), Shekhtur (own leader), and Rexan (the ENEMY leader).
+        static void OnHeroDefeated(BattleSlot ownerSlot, BattleSlot oppSlot, Battle b, BUnit deadUnit)
+        {
+            if (ownerSlot == null || b == null) return;
+            PlayerState ps = b.P[ownerSlot.P];
+            PlayerState opPs = oppSlot != null ? b.P[oppSlot.P] : null;
+            int lr = ps.LeaderCard / 2;
+
+            // Star Knight Iri: your leader gains +1 Strength (persistent) and heals 3.
+            if (lr == 25)
+            {
+                ps.LeaderPermStr += 1;
+                ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + 3);
+                Log("  LEADER (Star Knight Iri): +1 Strength & heal 3 (leader life " + ps.LeaderLife + ")");
+            }
+            // Shekhtur: the defeated hero makes a free melee attack at a random enemy hero (parting shot).
+            if (lr == 2 && opPs != null && oppSlot != null && deadUnit != null)
+            {
+                var alive = new List<int>();
+                foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) alive.Add(kv.Key);
+                if (alive.Count > 0)
+                {
+                    int k; lock (_rng) k = alive[_rng.Next(alive.Count)];
+                    BUnit t = opPs.Units[k];
+                    int actual = Math.Max(1, Math.Max(1, deadUnit.Atk) - t.Armor);
+                    t.Damage += actual;
+                    Log("  LEADER (Shekhtur): defeated hero's parting shot -> " + actual + " to enemy (" + (k / 10) + "," + (k % 10) + ")");
+                    SendUnitUpdateToBoth(oppSlot, ownerSlot, k / 10, k % 10, t, b);
+                }
+            }
+            // Rexan (the ENEMY's leader): when this hero dies, the enemy summons a Zombie in a random
+            // empty Vanguard slot on their board.
+            if (opPs != null && oppSlot != null && opPs.LeaderCard / 2 == 16)
+            {
+                var empties = new List<int>();
+                for (int lane = 0; lane < 3; lane++) if (!opPs.Units.ContainsKey(Key(2, lane))) empties.Add(Key(2, lane));
+                if (empties.Count > 0)
+                {
+                    int ek; lock (_rng) ek = empties[_rng.Next(empties.Count)];
+                    PlaceUnit(oppSlot, ownerSlot, b, 102, ek / 10, ek % 10, 0, true);
+                    Log("  LEADER (Rexan): enemy hero died -> summoned a Zombie at (" + (ek / 10) + "," + (ek % 10) + ")");
+                }
+            }
+        }
+
+        // Leader passives that fire at the END OF EACH ROUND (both players). Lixis can kill, so the
+        // caller must re-check for a rout afterward.
+        static void ApplyLeaderEndOfRound(Battle b, BattleSlot p0, BattleSlot p1)
+        {
+            for (int pi = 0; pi < 2; pi++)
+            {
+                PlayerState ps = b.P[pi], opPs = b.P[1 - pi];
+                BattleSlot own = pi == 0 ? p0 : p1, opp = pi == 0 ? p1 : p0;
+                int lr = ps.LeaderCard / 2;
+                if (lr == 1) // Lixis: 3 to all rival heroes + 1 to rival leader
+                {
+                    var keys = new List<int>(); foreach (var kv in opPs.Units) keys.Add(kv.Key);
+                    foreach (int k in keys) DamageEnemyAt(opPs, k / 10, k % 10, 3);
+                    opPs.LeaderLife -= 1;
+                    Log("  LEADER (Lixis): 3 to all rival heroes + 1 to rival leader (rival leader life " + opPs.LeaderLife + ")");
+                    ProcessImmediateDeaths(opPs, opp, own, b);
+                }
+                else if (lr == 18) // Magdelina: each hero + leader in your unit gains Strength 1 (persistent)
+                {
+                    ps.RoundStrBonus += 1;
+                    Log("  LEADER (Magdelina): +1 Strength to all your heroes + leader (now +" + ps.RoundStrBonus + ")");
+                }
+                else if (lr == 14) // Sagas: cast Replicate free (copy a random own hero's card to hand)
+                {
+                    var heroes = new List<int>(); foreach (var kv in ps.Units) if (kv.Value != null && !kv.Value.IsCorpse) heroes.Add(kv.Key);
+                    if (heroes.Count > 0) { int hk; lock (_rng) hk = heroes[_rng.Next(heroes.Count)]; AddCardToHand(own, opp, b, pi, ps.Units[hk].Card); Log("  LEADER (Sagas): Replicate -> copied card " + ps.Units[hk].Card + " to hand"); }
+                }
+                else if (lr == 10) // Mikhail: cast Resurrect (revive one own corpse at full HP)
+                {
+                    int ck = -1; foreach (var kv in ps.Units) if (kv.Value != null && kv.Value.IsCorpse) { ck = kv.Key; break; }
+                    if (ck >= 0)
+                    {
+                        ushort rc = ps.Units[ck].Card; int cx = ck / 10, cy = ck % 10;
+                        ps.Units.Remove(ck); SendClearCorpse(own, opp, cx, cy); PlaceUnit(own, opp, b, rc, cx, cy, 0, true);
+                        Log("  LEADER (Mikhail): resurrected a corpse at (" + cx + "," + cy + ")");
+                    }
+                }
+            }
+        }
+
+        // Leader passive that fires whenever the owner PLAYS AN ORDER (Rukyuk / Tatsumi). Called from
+        // HandleOrder after the order resolves. Can damage the rival (Rukyuk) so it checks for a win.
+        static void ApplyLeaderOnOrder(BattleSlot mine, BattleSlot theirs, Battle b)
+        {
+            PlayerState ps = b.P[mine.P], opPs = b.P[1 - mine.P];
+            int lr = ps.LeaderCard / 2;
+            if (lr == 7) // Rukyuk Amberdeen: Bombard 3 (3 to a random rival hero)
+            {
+                var alive = new List<int>();
+                foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) alive.Add(kv.Key);
+                if (alive.Count > 0)
+                {
+                    int k; lock (_rng) k = alive[_rng.Next(alive.Count)];
+                    DamageEnemyAt(opPs, k / 10, k % 10, 3);
+                    Log("  LEADER (Rukyuk): Bombard 3 -> rival (" + (k / 10) + "," + (k % 10) + ")");
+                    if (theirs != null) ProcessImmediateDeaths(opPs, theirs, mine, b);
+                }
+            }
+            else if (lr == 13 && !ps.OrderedThisTurn) // Tatsumi: first order each turn -> draw 1 + gain 1 action
+            {
+                DrawCardsFor(mine, theirs, b, 1);
+                ps.ActionsRemaining += 1;
+                Log("  LEADER (Tatsumi): first order this turn -> drew 1 + gained 1 action");
+            }
+            ps.OrderedThisTurn = true;
         }
 
         // Recipient keys for an aura target relative to a source at (sx,sy). -1 means "the leader".
@@ -705,7 +875,7 @@ namespace PtoServer
         // Build a 20-byte update_buff payload for a unit at (x, y). All fields are 1 byte. s8 fields
         // default to -1 (sent as 255). We only vary atktype (ranged), inter(cept), and adpx (= grid_x,
         // which drives the client's wave-spell selection); everything else is the no-buff default.
-        static PacketWriter BuildBuff(int x, int y, byte atktype, bool intercept, bool counter, bool incorp, bool shield, bool silence, bool decoy)
+        static PacketWriter BuildBuff(int x, int y, byte atktype, bool intercept, bool counter, bool incorp, bool shield, bool silence, bool decoy, bool immort)
         {
             return new PacketWriter()
                 .WriteU8((byte)x).WriteU8((byte)y).WriteU8(atktype)
@@ -718,7 +888,7 @@ namespace PtoServer
                 .WriteBool(silence)       // silence
                 .WriteBool(false)         // rev
                 .WriteBool(counter)       // cnter
-                .WriteBool(false)         // immort
+                .WriteBool(immort)        // immort (vanguard Immortality)
                 .WriteBool(false)         // deathpro
                 .WriteU8((byte)x)         // adpx = grid_x (wave) -> spellid follows the unit on move
                 .WriteBool(true)          // can_attack
@@ -737,13 +907,15 @@ namespace PtoServer
             bool intercept = (unit.Abilities & UnitAbility.Intercept) != 0;
             bool counter = (unit.Abilities & UnitAbility.Counter) != 0;
             bool incorp = (unit.Abilities & UnitAbility.Incorporeal) != 0;
-            Send(ownerSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy).Frame(Op.UpdateBuff));
-            if (oppSlot != null) Send(oppSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy).Frame(Op.UpdateBuffGet));
+            bool immort = ownerSlot.Battle != null && IsImmortalVanguard(ownerSlot.Battle.P[ownerSlot.P], x);
+            Send(ownerSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy, immort).Frame(Op.UpdateBuff));
+            if (oppSlot != null) Send(oppSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy, immort).Frame(Op.UpdateBuffGet));
         }
 
         static int GetUnitArmor(ushort card, int wave)    { return PassiveOf(card, wave).Armor; }
         static int GetUnitStrength(ushort card, int wave) { return PassiveOf(card, wave).Strength; }
         static int GetUnitFinisher(ushort card, int wave) { return PassiveOf(card, wave).Finisher; }
+        static int GetUnitRevenge(ushort card, int wave)  { return PassiveOf(card, wave).RevengeStrength; }
 
         // ---- matchmaking / battle bootstrap -----------------------------------
 
@@ -786,13 +958,34 @@ namespace PtoServer
             public int LeaderMax = 20;
             public ushort LeaderCard;
             public List<ushort> Deck = new List<ushort>(); // draw pile (hero cards remaining)
+            public List<ushort> Discard = new List<ushort>(); // discard pile (played orders, cleared corpses, banished/entombed cards) — used by Phantom
+            public List<ushort> PhantomCards = new List<ushort>(); // card ids added by Phantom this turn: printed life = 1, vanish from hand at end of turn
             public int ActionsRemaining;
             public int Orbs;  // order resource: +1 each round, capped at OrbMax; spent on orders
             public int LeaderArmorBonus; // from "Leader: Armor N" auras (recomputed each RecomputeAuras)
-            public int LeaderStrBonus;   // from "Leader: Strength N" auras
+            public int LeaderStrBonus;   // from "Leader: Strength N" auras (recomputed each RecomputeAuras)
             public UnitAbility LeaderAbilities; // abilities granted to the leader by "Leader: X" / "Unit: X" auras
             public ushort LastSummonedCard;     // last hero recruited this battle (for the Summon spell = copy it)
             public bool LeaderShield;           // negate the next damage to the leader, then lose it (Shield Leader)
+            // Traps. The client plays a Trap card (card_init o_type==2) as a SUMMON (op10) to the reserve
+            // row grid_x==3 — NOT as an order (op28). HandleSummon arms it here and renders it face-down
+            // (op5/op6 istrap=true). It stays armed until the rival's next matching action (round >= 2),
+            // which it negates (rival still spends the action). *Lane = the reserve grid_y (0..2) holding
+            // the face-down card, so we can clear it (op32) when it triggers. -1 = not armed.
+            public bool TrapCancelAttack;       // Reflector: cancels the rival's next attack, then Backlashes the attacker
+            public bool TrapCancelSpell;        // Statistician: cancels the rival's next wave-spell; owner draws 1
+            public bool TrapCancelOrder;        // Mastermind: cancels the rival's next order
+            public int TrapAttackLane = -1;
+            public int TrapSpellLane = -1;
+            public int TrapOrderLane = -1;
+            // Ongoing effects.
+            public int ImmortalWaves;    // >0: your VANGUARD (grid_x==2) heroes can't die by any means; decrements each wave (Curse Knight order)
+            public int ImmortalLane = -1; // reserve lane holding the face-up Immortality operation card (-1 = none)
+            public bool RestructureFree; // this turn, MOVE and CLEAR CORPSE cost no action (Homunculus/Bannerman); cleared at end of your turn
+            public bool OrderedThisTurn; // has an order been played this turn (for Tatsumi's first-order-per-turn passive)
+            public int LeaderPermStr;    // Star Knight Iri: +1 leader attack per own hero defeated (persistent)
+            public int RoundStrBonus;    // Magdelina: +1 to all your heroes + leader each round (persistent, stacks)
+            public bool IsFirstPlayer;   // holds the first-player token this round (for Kallistar's conditional aura)
         }
 
         internal class BUnit
@@ -804,8 +997,10 @@ namespace PtoServer
             public int Armor;         // flat damage reduction
             public int Strength;      // bonus attack damage
             public int Finisher;      // +N attack damage vs an already-damaged hero (Finisher N passive)
+            public int Revenge;       // +N attack while THIS hero is itself damaged (Revenge: Strength N)
             public bool Shield;       // negate the next damage event to this unit, then lose it
-            public int TempStrength;  // Strength Buff: +N attack until the end of the caster's turn
+            public int TempStrength;  // Strength Buff: +N attack until the end of the wave
+            public int Enervate;      // -N attack (Enervate debuff); persistent until removed/silenced
             public bool Silenced;     // loses all innate abilities + applied status (Shield/Str buff) until removed
             public bool Decoy;        // enemy attacks must target this hero while it lives, if it's a legal target
             public UnitAbility Abilities;
@@ -1222,6 +1417,7 @@ namespace PtoServer
                 BattleSlot second = mine.FirstPlayer ? theirs : mine;
                 Battle b = mine.Battle;
                 b.Wave = 2; b.Round = 1; b.First = first.P; b.Active = first.P;
+                b.P[0].IsFirstPlayer = (b.First == 0); b.P[1].IsFirstPlayer = (b.First == 1); // Kallistar
                 b.P[b.Active].ActionsRemaining = ActionsPerWave;
                 b.Started = true;
                 // Orbs start at 0. No orbs are gained during the round-1 ceasefire — they only begin
@@ -1341,7 +1537,11 @@ namespace PtoServer
                          DamageRandom, DamageFrontEach, DamageLeader, WildSummon,
                          FinisherKill, Backlash, DamageIce, Banish, OrbBoost, OrbDrain, Retreat, Unsummon,
                          ShieldHero, ShieldLeader, ShieldVanguard, StrengthBuff, StrengthBuffVanguard, Silence,
-                         Decoy, Swap, Takedown, Seance, Replicate, Infusion, Polymorph, Copycat }
+                         Decoy, Swap, Takedown, Seance, Replicate, Infusion, Polymorph, Copycat,
+                         TrapCancelAttack, TrapCancelSpell, TrapCancelOrder,
+                         Immortality, Restructure, DamageSpread,
+                         Reload, MindControl, Duplicate, Transfusion, Enervate, Entomb, ForceCube,
+                         ResurrectAll, Phantom, Scry, LucHaste }
 
         struct OrderEffect { public OrderKind Kind; public int Amount; public bool Free; } // Free = no action cost
 
@@ -1353,7 +1553,7 @@ namespace PtoServer
             {
                 case 26: return new OrderEffect { Kind = OrderKind.DamageColumn, Amount = 5 }; // Fighter: Thunder 5 (column)
                 case 28: return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 8 }; // Berserker: Bombard 8 (random hero)
-                case 30: return new OrderEffect { Kind = OrderKind.DamageAll,    Amount = 1 }; // Alchemist: Poison 3 -> 1 to all
+                case 30: return new OrderEffect { Kind = OrderKind.DamageAll,    Amount = 3 }; // Alchemist: Poison 3 (official: X to ALL rival heroes)
                 case 31: return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 5 }; // Gunner: Bombard Row 5 (a row)
                 case 32: return new OrderEffect { Kind = OrderKind.HealAll,      Amount = 4 }; // Healer: Cure All 4
                 case 29: return new OrderEffect { Kind = OrderKind.KillHero };                  // Assassin: Assassinate
@@ -1380,10 +1580,25 @@ namespace PtoServer
                 case 94: return new OrderEffect { Kind = OrderKind.ShieldVanguard };            // Magus: Vanguard: Shield
                 case 96: return new OrderEffect { Kind = OrderKind.ShieldLeader };              // Squire: Shield Leader (Cure Leader part omitted)
                 case 110:return new OrderEffect { Kind = OrderKind.Decoy };                     // Occultist: Decoy (mark a friendly hero)
-                case 69: return new OrderEffect { Kind = OrderKind.DamageAll,  Amount = 10 };   // Warmage: Meteor Storm 10 (all rival heroes)
+                case 69: return new OrderEffect { Kind = OrderKind.DamageSpread, Amount = 10 };  // Warmage: Meteor Storm 10 (X divided randomly)
                 case 65: return new OrderEffect { Kind = OrderKind.Replicate, Free = true };    // Puppeteer: Quick Order: Replicate
                 case 60: return new OrderEffect { Kind = OrderKind.HealLeader, Amount = 4 };    // Chronicler: Infuse Leader 4
                 case 88: return new OrderEffect { Kind = OrderKind.Polymorph };                 // Biomancer: Polymorph (an enemy hero)
+                case 38: return new OrderEffect { Kind = OrderKind.Reload };                    // Oracle: Reload (shuffle hand into deck, draw that many + 1)
+                case 104:return new OrderEffect { Kind = OrderKind.Reload };                    // Magic Student: Reload
+                case 64: return new OrderEffect { Kind = OrderKind.Duplicate, Free = true };    // Doppelganger: Quick Order: Duplicate (copy a card in hand)
+                case 62: return new OrderEffect { Kind = OrderKind.Entomb, Amount = 2 };        // Diabloist: Entomb 2 (rival discards, placed as corpses in enemy spaces)
+                case 63: return new OrderEffect { Kind = OrderKind.ResurrectAll };             // Divinity: Resurrect All (revive every corpse on BOTH boards)
+                case 85: return new OrderEffect { Kind = OrderKind.Phantom, Amount = 2 };       // Wizard: Phantom x2 (2 discard copies -> hand)
+                case 46: return new OrderEffect { Kind = OrderKind.Scry, Amount = 6, Free = true }; // Summoner: Quick Order: Scry 6
+                case 54: return new OrderEffect { Kind = OrderKind.Scry, Amount = 4 };          // Air Elemental: Scry 4
+                case 66: return new OrderEffect { Kind = OrderKind.Scry, Amount = 4, Free = true }; // Relic Hunter: Quick Order: Scry 4
+                case 61: return new OrderEffect { Kind = OrderKind.Immortality };               // Curse Knight: Ongoing: Vanguard: Immortality (your vanguard heroes can't die for 3 waves)
+                case 33: return new OrderEffect { Kind = OrderKind.Restructure };               // Homunculus: Restructure (move + clear-corpse are free until end of turn)
+                case 95: return new OrderEffect { Kind = OrderKind.Restructure };               // Bannerman: Restructure
+                case 87: return new OrderEffect { Kind = OrderKind.TrapCancelAttack };          // Reflector: Trap: Cancel Attack, Backlash
+                case 106:return new OrderEffect { Kind = OrderKind.TrapCancelSpell };            // Statistician: Trap: Cancel Spell, Draw 1
+                case 112:return new OrderEffect { Kind = OrderKind.TrapCancelOrder };            // Mastermind: Trap: Cancel Order
                 default: return new OrderEffect { Kind = OrderKind.None };
             }
         }
@@ -1395,7 +1610,8 @@ namespace PtoServer
             return k == OrderKind.DamageSingle || k == OrderKind.DamageRow || k == OrderKind.DamageColumn
                 || k == OrderKind.DamageBlast || k == OrderKind.KillHero
                 || k == OrderKind.FinisherKill || k == OrderKind.Backlash || k == OrderKind.DamageIce
-                || k == OrderKind.Unsummon || k == OrderKind.Silence || k == OrderKind.Takedown;
+                || k == OrderKind.Unsummon || k == OrderKind.Silence || k == OrderKind.Takedown
+                || k == OrderKind.MindControl || k == OrderKind.Enervate || k == OrderKind.Entomb;
         }
 
         // Immediate death: any unit on `ps` at/over lethal damage becomes a CORPSE right now (or is
@@ -1413,8 +1629,17 @@ namespace PtoServer
             {
                 BUnit u = ps.Units[key];
                 int ux = key / 10, uy = key % 10;
+                // Immortality: a vanguard hero can't die — cap its damage just below lethal and re-sync.
+                if (IsImmortalVanguard(ps, ux))
+                {
+                    u.Damage = Math.Max(0, u.Max - 1);
+                    SendUnitUpdateToBoth(owner, opp, ux, uy, u, b);
+                    Log("  IMMORTAL: (" + ux + "," + uy + ") card " + u.Card + " survives lethal (vanguard immortality)");
+                    continue;
+                }
                 if ((u.Abilities & UnitAbility.Ephemeral) != 0)
                 {
+                    DiscardCard(ps, u.Card);
                     ps.Units.Remove(key);
                     SendClearCorpse(owner, opp, ux, uy);
                     Log("  DIED (ephemeral): (" + ux + "," + uy + ") card " + u.Card + " -> corpse cleared");
@@ -1428,6 +1653,7 @@ namespace PtoServer
                     if (!u.DeathSent) SendUnitUpdateToBoth(owner, opp, ux, uy, u, b);
                     Log("  DIED: (" + ux + "," + uy + ") card " + u.Card + " -> corpse");
                 }
+                OnHeroDefeated(owner, opp, b, u); // Iri / Shekhtur / Rexan
             }
         }
 
@@ -1535,6 +1761,7 @@ namespace PtoServer
             if (mine.P != b.Active) { Log("ORDER from non-active player (ignored)"); GrantAction(mine); return; }
 
             PlayerState ps = b.P[mine.P];
+            PlayerState opPs = b.P[1 - mine.P];
             if (ps.ActionsRemaining <= 0) { Log("ORDER rejected: no actions remaining"); GrantAction(mine); return; }
 
             OrderEffect eff = OrderOf(cardId);
@@ -1558,7 +1785,7 @@ namespace PtoServer
                 GrantAction(mine);
                 return;
             }
-            if ((eff.Kind == OrderKind.HealSingle || eff.Kind == OrderKind.Revive || eff.Kind == OrderKind.Resurrect || eff.Kind == OrderKind.Retreat || eff.Kind == OrderKind.ShieldHero || eff.Kind == OrderKind.StrengthBuff || eff.Kind == OrderKind.Decoy || eff.Kind == OrderKind.Seance) && !grid)
+            if ((eff.Kind == OrderKind.HealSingle || eff.Kind == OrderKind.Revive || eff.Kind == OrderKind.Resurrect || eff.Kind == OrderKind.Retreat || eff.Kind == OrderKind.ShieldHero || eff.Kind == OrderKind.StrengthBuff || eff.Kind == OrderKind.Decoy || eff.Kind == OrderKind.Seance || eff.Kind == OrderKind.Transfusion || eff.Kind == OrderKind.ForceCube) && !grid)
             {
                 Log("  -> ORDER rejected: heal/revive must target your OWN side (enemy board clicked)");
                 GrantAction(mine);
@@ -1586,6 +1813,7 @@ namespace PtoServer
             if (card < mine.Hand.Count && mine.Hand[card] == cardId)
             {
                 mine.Hand.RemoveAt(card);
+                DiscardCard(ps, cardId); // played orders go to the discard pile
                 Send(mine.Me.Ns, new PacketWriter().WriteU8(card).WriteU16(cardId).WriteBool(true).Frame(Op.HandCardRemove));
                 if (theirs != null)
                     Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, mine.Hand.Count)).WriteU8(card).WriteU16(cardId).Frame(Op.HandCardRemoveGet));
@@ -1596,9 +1824,25 @@ namespace PtoServer
             // op44/op45 pair brackets ResolveEffect (whose life-bar updates queue between them, so they
             // play right after the cast). Sent from here (not ResolveEffect) so Wild Summon's recursive
             // inner resolve doesn't emit a second cast pose.
+            // TRAP — Cancel Order: the rival's armed trap (round >= 2) negates this order. The card is
+            // already discarded and the orb already paid; the caster still spends the action. A trap-
+            // arming order is itself an order and can legitimately be cancelled by an opposing trap.
+            if (b.Round >= 2 && opPs.TrapCancelOrder)
+            {
+                opPs.TrapCancelOrder = false;
+                ClearTrapVisual(theirs, mine, opPs.TrapOrderLane); opPs.TrapOrderLane = -1;
+                Log("  -> TRAP: " + (theirs != null ? theirs.Me.User : "defender") + "'s Cancel Order negates " + mine.Me.User + "'s order");
+                ConsumeAction(mine, theirs, b);
+                BattleSlot t0 = mine.P == 0 ? mine : theirs, t1 = mine.P == 0 ? theirs : mine;
+                if (t0 != null && t1 != null) SyncUnitStates(t0, t1, b);
+                return;
+            }
+
             SendSpellCast(mine, theirs, 1, 1);
             ResolveEffect(eff, mine, theirs, b, x, y, 1, 1, grid); // grid(isgrid): 1=own board clicked (for either-board effects)
             SendSpellEnd(mine, theirs);
+            // Leader on-order passives (Rukyuk Bombard 3 / Tatsumi first-order draw+action).
+            if (!b.Over) ApplyLeaderOnOrder(mine, theirs, b);
         }
 
         // Apply an order/spell effect and push results to both clients. (x,y) are the raw client
@@ -1683,6 +1927,7 @@ namespace PtoServer
                         {
                             int bidx; lock (_rng) bidx = _rng.Next(theirs.Hand.Count);
                             ushort bc = theirs.Hand[bidx]; theirs.Hand.RemoveAt(bidx);
+                            DiscardCard(opPs, bc); // banished cards go to the rival's discard
                             Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)bidx).WriteU16(bc).WriteBool(true).Frame(Op.HandCardRemove));
                             Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, theirs.Hand.Count)).WriteU8((byte)bidx).WriteU16(bc).Frame(Op.HandCardRemoveGet));
                             Log("  BANISH: removed card " + bc + " from " + theirs.Me.User + " hand[" + bidx + "]");
@@ -1715,7 +1960,7 @@ namespace PtoServer
                         if (gx == 1 && enemyGy == 1) { Log("  unsummon: cannot return the leader"); break; }
                         if (theirs != null && opPs.Units.TryGetValue(uk, out u) && u != null && !u.IsCorpse)
                         {
-                            if ((u.Abilities & UnitAbility.Intercept) != 0) { Log("  unsummon: (" + gx + "," + enemyGy + ") has Intercept; cannot be unsummoned"); break; }
+                            // Official Unsummon: return any enemy hero to its owner's hand (no Intercept restriction).
                             opPs.Units.Remove(uk);
                             SendDestroyUnit(theirs, mine, gx, enemyGy);
                             AddCardToHand(theirs, mine, b, 1 - mine.P, u.Card);
@@ -1854,8 +2099,169 @@ namespace PtoServer
                         else Log("  copycat: need a living caster and a target hero on " + (targetSelf ? "own" : "enemy") + " board");
                     }
                     break;
-                case OrderKind.DamageAll:   // Poison: 1 damage to all rival heroes (Amount usually 1)
+                case OrderKind.Immortality: // Ongoing: your VANGUARD heroes can't die by any means for 3 waves
+                    ps.ImmortalWaves = 3;
+                    Log("  IMMORTALITY: " + mine.Me.User + "'s vanguard heroes can't die for 3 waves");
+                    break;
+                case OrderKind.Restructure: // this turn, MOVE and CLEAR CORPSE are free (no action cost)
+                    ps.RestructureFree = true;
+                    Log("  RESTRUCTURE: " + mine.Me.User + "'s moves + corpse-clears are free until end of turn");
+                    break;
+                case OrderKind.ResurrectAll: // restore ALL corpses to life on BOTH boards (full HP)
+                    ReviveAllCorpses(mine, theirs, b, ps);
+                    if (theirs != null) ReviveAllCorpses(theirs, mine, b, opPs);
+                    break;
+                case OrderKind.LucHaste: // Luc Von Gott leader ability: -1 leader life, +2 actions this turn
+                    ps.LeaderLife = Math.Max(0, ps.LeaderLife - 1);
+                    ps.ActionsRemaining += 2;
+                    SendLeaderHp(mine, theirs, ps);
+                    Log("  LEADER (Luc Von Gott): -1 leader life (now " + ps.LeaderLife + "), +2 actions");
+                    break;
+                case OrderKind.Scry: // INTERIM: auto-draw 1 (full "look at N, pick one, reorder" UI deferred — see notes)
+                    DrawCardsFor(mine, theirs, b, 1);
+                    Log("  SCRY " + eff.Amount + " (interim: auto-drew 1; interactive pick-and-reorder UI TODO)");
+                    break;
+                case OrderKind.Phantom: // add N copies of random discard cards to hand; life=1, vanish at end of turn
+                    {
+                        if (ps.Discard.Count == 0) { Log("  phantom: discard pile empty"); break; }
+                        int added = 0;
+                        for (int i = 0; i < Math.Max(1, eff.Amount); i++)
+                        {
+                            int pi2; lock (_rng) pi2 = _rng.Next(ps.Discard.Count);
+                            ushort pcard = ps.Discard[pi2]; // copy — the card stays in the discard pile
+                            AddCardToHand(mine, theirs, b, mine.P, pcard);
+                            ps.PhantomCards.Add(pcard);
+                            added++;
+                        }
+                        Log("  PHANTOM: added " + added + " discard copy(ies) to hand (life 1, vanish EOT)");
+                    }
+                    break;
+                case OrderKind.Reload: // shuffle your hand back into your deck, then draw that many + 1
+                    {
+                        int handSize = mine.Hand.Count;
+                        for (int pos = handSize - 1; pos >= 0; pos--)
+                        {
+                            ushort rc = mine.Hand[pos];
+                            ps.Deck.Add(rc);
+                            mine.Hand.RemoveAt(pos);
+                            Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)pos).WriteU16(rc).WriteBool(true).Frame(Op.HandCardRemove));
+                            if (theirs != null)
+                                Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, mine.Hand.Count)).WriteU8((byte)pos).WriteU16(rc).Frame(Op.HandCardRemoveGet));
+                        }
+                        lock (_rng) for (int i = ps.Deck.Count - 1; i > 0; i--) { int j = _rng.Next(i + 1); var t = ps.Deck[i]; ps.Deck[i] = ps.Deck[j]; ps.Deck[j] = t; }
+                        DrawCardsFor(mine, theirs, b, handSize + 1);
+                        Log("  RELOAD: shuffled " + handSize + " card(s) back, drew " + (handSize + 1));
+                    }
+                    break;
+                case OrderKind.Duplicate: // add a copy of a card in your hand to your hand (auto: random hand card)
+                    {
+                        if (mine.Hand.Count == 0) { Log("  duplicate: hand empty"); break; }
+                        int di; lock (_rng) di = _rng.Next(mine.Hand.Count);
+                        ushort dc = mine.Hand[di];
+                        AddCardToHand(mine, theirs, b, mine.P, dc);
+                        Log("  DUPLICATE: added a copy of hand card " + dc);
+                    }
+                    break;
+                case OrderKind.Transfusion: // heal ALL damage from a target ally hero; the caster takes that much
+                    {
+                        BUnit tf;
+                        if (ps.Units.TryGetValue(Key(gx, selfGy), out tf) && tf != null && !tf.IsCorpse)
+                        {
+                            int healed = tf.Damage;
+                            tf.Damage = 0;
+                            BUnit cf;
+                            if (ps.Units.TryGetValue(Key(casterX, casterY), out cf) && cf != null && !cf.IsCorpse)
+                                cf.Damage += healed;
+                            Log("  TRANSFUSION: healed " + healed + " from (" + gx + "," + selfGy + "); caster (" + casterX + "," + casterY + ") takes " + healed);
+                        }
+                        else Log("  transfusion: no ally hero at (" + gx + "," + selfGy + ")");
+                    }
+                    break;
+                case OrderKind.Enervate: // target enemy hero has -N attack (persistent debuff)
+                    {
+                        BUnit en;
+                        if (opPs.Units.TryGetValue(Key(gx, enemyGy), out en) && en != null && !en.IsCorpse)
+                        {
+                            en.Enervate += eff.Amount;
+                            Log("  ENERVATE -" + eff.Amount + " attack -> enemy (" + gx + "," + enemyGy + ")");
+                        }
+                        else Log("  enervate: no enemy hero at (" + gx + "," + enemyGy + ")");
+                    }
+                    break;
+                case OrderKind.MindControl: // swap the caster with an enemy hero; control swaps (you gain the enemy hero)
+                    {
+                        int mk = Key(casterX, casterY), ek = Key(gx, enemyGy);
+                        BUnit cu, eu;
+                        if (theirs != null && !(gx == 1 && enemyGy == 1)
+                            && ps.Units.TryGetValue(mk, out cu) && cu != null && !cu.IsCorpse
+                            && opPs.Units.TryGetValue(ek, out eu) && eu != null && !eu.IsCorpse)
+                        {
+                            ushort cCard = cu.Card, eCard = eu.Card; int cDmg = cu.Damage, eDmg = eu.Damage;
+                            ps.Units.Remove(mk); opPs.Units.Remove(ek);
+                            SendDestroyUnit(mine, theirs, casterX, casterY);
+                            SendDestroyUnit(theirs, mine, gx, enemyGy);
+                            PlaceUnit(mine, theirs, b, eCard, casterX, casterY, eDmg, true); // you gain the enemy hero
+                            PlaceUnit(theirs, mine, b, cCard, gx, enemyGy, cDmg, true);       // opponent gets your caster
+                            Log("  MIND CONTROL: (" + casterX + "," + casterY + ") <-> enemy (" + gx + "," + enemyGy + "); control swapped");
+                        }
+                        else Log("  mind control: need a living caster and a non-leader enemy hero");
+                    }
+                    break;
+                case OrderKind.ForceCube: // summon a Force Cube (card 90) into an empty space on your side
+                    {
+                        int fx, fy;
+                        if (gx >= 0 && gx <= 2 && selfGy >= 0 && selfGy <= 2 && !(gx == 1 && selfGy == 1) && !ps.Units.ContainsKey(Key(gx, selfGy)))
+                        { fx = gx; fy = selfGy; }
+                        else if (!FindEmptySlot(ps, b.Wave, out fx, out fy)) { Log("  force cube: no empty slot"); break; }
+                        PlaceUnit(mine, theirs, b, 90, fx, fy, 0, true);
+                        Log("  FORCE CUBE: summoned at (" + fx + "," + fy + ")");
+                    }
+                    break;
+                case OrderKind.Entomb: // rival discards N random cards; each becomes a CORPSE in an empty enemy space
+                    {
+                        int n = Math.Max(1, eff.Amount);
+                        for (int i = 0; i < n; i++)
+                        {
+                            if (theirs == null || theirs.Hand.Count == 0) { Log("  entomb: rival hand empty"); break; }
+                            int ex, ey;
+                            if (i == 0 && gx >= 0 && gx <= 2 && enemyGy >= 0 && enemyGy <= 2 && !(gx == 1 && enemyGy == 1) && !opPs.Units.ContainsKey(Key(gx, enemyGy)))
+                            { ex = gx; ey = enemyGy; }
+                            else if (!FindEmptySlot(opPs, 2, out ex, out ey)) { Log("  entomb: no empty enemy slot"); break; }
+                            int hi; lock (_rng) hi = _rng.Next(theirs.Hand.Count);
+                            ushort ec = theirs.Hand[hi]; theirs.Hand.RemoveAt(hi);
+                            Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)hi).WriteU16(ec).WriteBool(true).Frame(Op.HandCardRemove));
+                            Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, theirs.Hand.Count)).WriteU8((byte)hi).WriteU16(ec).Frame(Op.HandCardRemoveGet));
+                            var corpse = new BUnit { Card = ec, Max = LifeOf(ec), Damage = 0, IsCorpse = true, CorpseFresh = false };
+                            opPs.Units[Key(ex, ey)] = corpse;
+                            // Render: summon the unit on the enemy board, then push it as a corpse (dead=1).
+                            Send(theirs.Me.Ns, new PacketWriter().WriteU16(ec).WriteU8((byte)ex).WriteU8((byte)ey).WriteBool(false).Frame(Op.SummonUnit));
+                            Send(mine.Me.Ns, new PacketWriter().WriteU16(ec).WriteU8((byte)ex).WriteU8((byte)ey).WriteBool(false).Frame(Op.SummonUnitGet));
+                            SendUnitUpdateToBoth(theirs, mine, ex, ey, corpse, b);
+                            Log("  ENTOMB: " + theirs.Me.User + " discards card " + ec + " -> corpse at enemy (" + ex + "," + ey + ")");
+                        }
+                    }
+                    break;
+                case OrderKind.TrapCancelAttack: // arm: negate the rival's next attack (+ Backlash the attacker)
+                    ps.TrapCancelAttack = true; Log("  TRAP ARMED: Cancel Attack (" + mine.Me.User + ")");
+                    break;
+                case OrderKind.TrapCancelSpell:  // arm: negate the rival's next wave-spell (owner draws 1)
+                    ps.TrapCancelSpell = true; Log("  TRAP ARMED: Cancel Spell (" + mine.Me.User + ")");
+                    break;
+                case OrderKind.TrapCancelOrder:  // arm: negate the rival's next order
+                    ps.TrapCancelOrder = true; Log("  TRAP ARMED: Cancel Order (" + mine.Me.User + ")");
+                    break;
+                case OrderKind.DamageAll:   // Poison (official): X damage to ALL rival heroes
                     foreach (var kv in opPs.Units) DamageEnemyAt(opPs, kv.Key / 10, kv.Key % 10, eff.Amount);
+                    break;
+                case OrderKind.DamageSpread: // Meteor Storm (official): X damage DIVIDED randomly among enemy heroes (X separate 1-dmg hits)
+                    for (int i = 0; i < eff.Amount; i++)
+                    {
+                        var alive = new List<int>();
+                        foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) alive.Add(kv.Key);
+                        if (alive.Count == 0) { Log("  meteor storm: no enemy heroes left"); break; }
+                        int mk; lock (_rng) mk = alive[_rng.Next(alive.Count)];
+                        DamageEnemyAt(opPs, mk / 10, mk % 10, 1);
+                    }
                     break;
                 case OrderKind.HealSingle:
                     HealOwnAt(ps, gx, selfGy, eff.Amount);
@@ -1909,6 +2315,7 @@ namespace PtoServer
                         int hidx; lock (_rng) hidx = _rng.Next(theirs.Hand.Count);
                         ushort stolen = theirs.Hand[hidx];
                         theirs.Hand.RemoveAt(hidx);
+                        DiscardCard(opPs, stolen); // Wild Summon plays then discards the rival's card
                         // Rival's own hand view removes the card; caster's view of the rival hand-count shrinks.
                         Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)hidx).WriteU16(stolen).WriteBool(true).Frame(Op.HandCardRemove));
                         Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, theirs.Hand.Count)).WriteU8((byte)hidx).WriteU16(stolen).Frame(Op.HandCardRemoveGet));
@@ -1933,6 +2340,7 @@ namespace PtoServer
                         foreach (int ckey in corpses)
                         {
                             if (cleared >= eff.Amount) break;
+                            DiscardCard(ps, ps.Units[ckey].Card);
                             ps.Units.Remove(ckey);
                             SendClearCorpse(mine, theirs, ckey / 10, ckey % 10);
                             int sx, sy;
@@ -2075,6 +2483,11 @@ namespace PtoServer
         {
             switch (cardId / 2)
             {
+                // ---- LEADER active abilities (leader casts its Flank f_spell via the isSpell path at grid_x=1).
+                //      Leader REALs (0-25) never collide with hero REALs (26+). ----
+                case 19: return new OrderEffect { Kind = OrderKind.LucHaste, Free = true };      // Luc Von Gott: apply 1 dmg to leader, gain 2 actions
+                case 21: return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 };         // Khadath: Banish 1 (once/turn — client-gated)
+                case 23: return new OrderEffect { Kind = OrderKind.RaiseDead, Amount = 3 };      // Hepzibah: cast Raise Dead
                 case 28: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 5 }; break; // Berserker R: Bombard 5 (random)
                 case 29: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 4 };        // Assassin V: Backstab 4 (leader)
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 2 }; break; // Assassin R: Backstab 2 (leader)
@@ -2085,7 +2498,11 @@ namespace PtoServer
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 };
                          if (wave == 2) return new OrderEffect { Kind = OrderKind.Retreat };            break; // Illusionist R: Summon / F: Banish 1 / V: Retreat
                 case 46: if (wave == 1) return new OrderEffect { Kind = OrderKind.SummonRandom, Amount = 1 };
-                         if (wave == 2) return new OrderEffect { Kind = OrderKind.Unsummon };           break; // Summoner F: Summon / V: Unsummon
+                         if (wave == 2) return new OrderEffect { Kind = OrderKind.Unsummon };
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.Scry, Amount = 3 }; break; // Summoner F: Summon / V: Unsummon / R: Scry 3
+                case 38: if (wave == 2) return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 };       // Oracle V: Banish 1
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.Scry, Amount = 3 };        // Oracle F: Scry 3
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.Inspire }; break;          // Oracle R: Inspire
                 case 36: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Mascot V: Cure 4
                          return new OrderEffect { Kind = OrderKind.Inspire };                                       // Mascot F/R: Inspire
                 case 37: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 }; break; // Mystic V: Cure 4
@@ -2098,7 +2515,8 @@ namespace PtoServer
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.Seance }; break;                   // Witch R: Seance (corpse -> hand)
                 case 43: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageFrontEach, Amount = 3 };     // Pyromancer V: Blast 3 (front of each row)
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 3 }; break; // Pyromancer R: Fire 3 (row)
-                case 44: if (wave == 1) return new OrderEffect { Kind = OrderKind.DrawCards,    Amount = 2 };        // Scientist F: Draw 2
+                case 44: if (wave == 2) return new OrderEffect { Kind = OrderKind.ForceCube };                       // Scientist V: Force Cube (summon a Force Cube unit)
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.DrawCards,    Amount = 2 };        // Scientist F: Draw 2
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.Inspire };                 break; // Scientist R: Inspire
                 case 52: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRow,    Amount = 2 }; break; // Fire Elem R: Fire 2
                 case 53: if (wave == 0) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 3 }; break; // Water Elem R: Cure 3
@@ -2107,12 +2525,16 @@ namespace PtoServer
                 case 69: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 7 }; break; // Warmage R: Meteor 7 (single hero)
                 case 86: if (wave == 0) return new OrderEffect { Kind = OrderKind.FinisherKill }; break;            // Lancer R: Finisher Kill
                 case 87: if (wave == 0) return new OrderEffect { Kind = OrderKind.Backlash }; break;                // Reflector R: Backlash
-                case 104:if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 2, Free = true }; break; // Magic Student R: Quick Meteor 2
+                case 104:if (wave == 2) return new OrderEffect { Kind = OrderKind.Scry, Amount = 2, Free = true };  // Magic Student V: Quick Scry 2
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.DrawCards, Amount = 1, Free = true }; // Magic Student F: Quick Draw 1
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 2, Free = true }; break; // Magic Student R: Quick Meteor 2
                 case 112:if (wave == 2) return new OrderEffect { Kind = OrderKind.OrbBoost, Amount = 1 };            // Mastermind V: Orb Boost 1
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.Duplicate };                       // Mastermind F: Duplicate
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.OrbDrain, Amount = 1 }; break;    // Mastermind R: Orb Drain 1
                 case 84: if (wave == 0) return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 1 }; break; // Fencer R: Strength 1 (buff a hero)
                 case 85: if (wave == 2) return new OrderEffect { Kind = OrderKind.StrengthBuffVanguard, Amount = 1 }; // Wizard V: Vanguard: Strength 1
-                         if (wave == 1) return new OrderEffect { Kind = OrderKind.Silence }; break;                 // Wizard F: Silence (an enemy hero)
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.Silence };                        // Wizard F: Silence (an enemy hero)
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.Phantom, Amount = 1 }; break;      // Wizard R: Phantom
                 case 94: if (wave == 1) return new OrderEffect { Kind = OrderKind.ShieldLeader }; break;            // Magus F: Shield Leader
                 case 105:if (wave == 2) return new OrderEffect { Kind = OrderKind.ShieldHero }; break;              // Scholar V: Shield Hero
                 case 54: if (wave == 0) return new OrderEffect { Kind = OrderKind.Swap, Free = true }; break;       // Air Elemental R: Quick Swap
@@ -2122,12 +2544,22 @@ namespace PtoServer
                 case 97: if (wave == 0) return new OrderEffect { Kind = OrderKind.Takedown }; break;                // Dark Knight R: Takedown
                 case 27: if (wave == 2) return new OrderEffect { Kind = OrderKind.KillHero }; break;                // Dragon Mage V: Execute (defeat a hero)
                 case 68: if (wave == 1) return new OrderEffect { Kind = OrderKind.KillHero }; break;                // Sniper F: Execute
-                case 62: if (wave == 1) return new OrderEffect { Kind = OrderKind.Seance }; break;                  // Diabloist F: Seance
+                case 62: if (wave == 2) return new OrderEffect { Kind = OrderKind.Enervate, Amount = 3 };            // Diabloist V: Enervate 3 (-3 attack to an enemy hero)
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.Seance };                          // Diabloist F: Seance
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.Entomb, Amount = 1 }; break;       // Diabloist R: Entomb
                 case 60: if (wave == 2) return new OrderEffect { Kind = OrderKind.Infusion, Amount = 3 }; break;    // Chronicler V: Infusion (leader +N, this hero -N)
                 case 88: if (wave == 2 || wave == 1) return new OrderEffect { Kind = OrderKind.Polymorph }; break;  // Biomancer V/F: Polymorph
-                case 106:if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageAll, Amount = 7 };           // Statistician R: Meteor Storm 7
+                case 106:if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSpread, Amount = 7 };        // Statistician R: Meteor Storm 7 (X divided randomly)
                          if (wave == 2) return new OrderEffect { Kind = OrderKind.HealLeader, Amount = 3 }; break;  // Statistician V: Infuse Leader 3
                 case 114:if (wave == 1) return new OrderEffect { Kind = OrderKind.Copycat }; break;                 // Ghost F: Copycat
+                case 33: if (wave == 0) return new OrderEffect { Kind = OrderKind.Transfusion }; break;              // Homunculus R: Transfusion (heal all dmg from an ally, caster takes it)
+                case 65: if (wave == 2) return new OrderEffect { Kind = OrderKind.MindControl }; break;              // Puppeteer V: Mind Control (swap + steal an enemy hero)
+                case 110:if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 6 };         // Occultist V: Bombard 6
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 3 };        // Occultist F: Backstab 3
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.Phantom, Amount = 1 }; break;      // Occultist R: Phantom
+                case 95: if (wave == 2) return new OrderEffect { Kind = OrderKind.DrawCards, Amount = 2 };           // Bannerman V: Draw 2
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.Restructure };                     // Bannerman F: Restructure
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DrawCards, Amount = 1, Free = true }; break; // Bannerman R: Quick Draw 1
             }
             return new OrderEffect { Kind = OrderKind.None };
         }
@@ -2135,6 +2567,10 @@ namespace PtoServer
         // Defeat an enemy hero outright (Assassinate / Hero Killer effects). Applies lethal damage so
         // the unit renders dead during the turn and is finalized as a corpse at wave end by
         // ProcessCasualties. Leaders are not heroes and cannot be targeted.
+        // Immortality (Curse Knight ongoing): while ImmortalWaves>0, a VANGUARD (grid_x==2) hero on that
+        // board cannot die by any means. True if the unit at wave gx on ps is currently protected.
+        static bool IsImmortalVanguard(PlayerState ps, int gx) { return ps != null && ps.ImmortalWaves > 0 && gx == 2; }
+
         static void KillEnemyAt(PlayerState opPs, int gx, int gy)
         {
             if (gx < 0 || gx > 2 || gy < 0 || gy > 2) return;
@@ -2142,7 +2578,8 @@ namespace PtoServer
             BUnit u;
             if (opPs.Units.TryGetValue(Key(gx, gy), out u) && u != null && !u.IsCorpse)
             {
-                if ((u.Abilities & UnitAbility.Deathproof) != 0) { Log("    kill -> (" + gx + "," + gy + ") is Deathproof; effect cannot defeat it"); return; }
+                if (IsImmortalVanguard(opPs, gx)) { Log("    kill -> (" + gx + "," + gy + ") is an Immortal vanguard; cannot be defeated"); return; }
+                if ((u.Abilities & UnitAbility.Deathproof) != 0) { Log("    kill -> (" + gx + "," + gy + ") is Deathproof; immune to instant-kill effects"); return; }
                 u.Damage = u.Max;
                 Log("    kill -> enemy (" + gx + "," + gy + ") card " + u.Card + " DEFEATED");
             }
@@ -2170,6 +2607,26 @@ namespace PtoServer
                 Log("  draw (effect): " + mine.Me.User + " drew card " + card + " (deck now " + ps.Deck.Count + ")");
             }
         }
+
+        // Revive every corpse on `ps` (owner's board) to full life (Resurrect All). Fresh, summon-sick.
+        static void ReviveAllCorpses(BattleSlot owner, BattleSlot opp, Battle b, PlayerState ps)
+        {
+            var corpses = new List<int>();
+            foreach (var kv in ps.Units) if (kv.Value != null && kv.Value.IsCorpse) corpses.Add(kv.Key);
+            foreach (int ck in corpses)
+            {
+                ushort card = ps.Units[ck].Card;
+                int cx = ck / 10, cy = ck % 10;
+                ps.Units.Remove(ck);
+                SendClearCorpse(owner, opp, cx, cy);
+                PlaceUnit(owner, opp, b, card, cx, cy, 0, true); // full HP
+            }
+            if (corpses.Count > 0) Log("  RESURRECT ALL: revived " + corpses.Count + " corpse(s) for " + owner.Me.User);
+        }
+
+        // Add a card to a player's discard pile (server-side only; Phantom pulls copies from here).
+        // Sources: an order played from hand, a cleared corpse, a Banished/Wild-Summoned card.
+        static void DiscardCard(PlayerState ps, ushort card) { if (ps != null && card != 0) ps.Discard.Add(card); }
 
         // Find an empty (non-leader) slot on ps's board, preferring `preferWave`. Returns false if full.
         static bool FindEmptySlot(PlayerState ps, int preferWave, out int gx, out int gy)
@@ -2202,6 +2659,7 @@ namespace PtoServer
                 Armor = GetUnitArmor(card, gx),
                 Strength = GetUnitStrength(card, gx),
                 Finisher = GetUnitFinisher(card, gx),
+                Revenge = GetUnitRevenge(card, gx),
                 Abilities = GetUnitAbilities(card, gx),
                 Cover = PassiveOf(card, gx).Cover,
                 IsCorpse = false,
@@ -2234,8 +2692,9 @@ namespace PtoServer
             BUnit u;
             if (opPs.Units.TryGetValue(Key(gx, gy), out u) && u != null && !u.IsCorpse)
             {
-                if ((u.Abilities & UnitAbility.Deathproof) != 0) { Log("    deathproof: (" + gx + "," + gy + ") immune to effect damage"); return; }
                 if (u.Shield) { u.Shield = false; Log("    SHIELD absorbed the effect at (" + gx + "," + gy + ")"); return; }
+                // Deathproof (official) = immune to INSTANT-KILL effects only (blocked in KillEnemyAt).
+                // Ordinary effect DAMAGE applies normally and can kill via accumulation — no special case.
                 int actual = dmg; // no armor on effect damage
                 u.Damage += actual;
                 Log("    damage -> enemy (" + gx + "," + gy + ") card " + u.Card + " -" + actual + " (now " + Math.Max(0, u.Max - u.Damage) + "/" + u.Max + ")");
@@ -2284,6 +2743,10 @@ namespace PtoServer
             // Validate hand index
             if (handIndex >= mine.Hand.Count) { Log("SUMMON rejected: invalid hand index " + handIndex); GrantAction(mine); return; }
 
+            // Reserve row (grid_x==3): the client plays Traps (o_type 2) AND Operations/Ongoing (o_type 1,
+            // e.g. Immortality) here, not as a normal summon. Arm the reserve card.
+            if (gx == 3) { HandleReservePlace(mine, theirs, b, ps, handIndex, gy); return; }
+
             // Validate target cell is in current wave (gx = wave position: 0=Rear, 1=Flank, 2=Vanguard)
             if (gx != b.Wave) { Log("SUMMON rejected: target x=" + gx + " not in wave " + b.Wave); GrantAction(mine); return; }
 
@@ -2307,12 +2770,15 @@ namespace PtoServer
                 Armor = GetUnitArmor(card, gx),
                 Strength = GetUnitStrength(card, gx),
                 Finisher = GetUnitFinisher(card, gx),
+                Revenge = GetUnitRevenge(card, gx),
                 Abilities = GetUnitAbilities(card, gx),
                 Cover = PassiveOf(card, gx).Cover,
                 IsCorpse = false,
                 RecruitedThisWave = true,
                 HasAttackedThisWave = false,
             };
+            // Phantom card: its printed life becomes 1.
+            if (ps.PhantomCards.Remove(card)) { unit.Max = 1; unit.Damage = 0; Log("  (phantom summon: printed life -> 1)"); }
             ps.Units[key] = unit;
             ps.LastSummonedCard = card; // for the Summon spell (copy the last recruited hero)
             RecomputeAuras(ps); // the new unit may grant/receive auras -> refresh effective stats
@@ -2345,8 +2811,74 @@ namespace PtoServer
                 SyncUnitStates(mine.P == 0 ? mine : theirs, mine.P == 0 ? theirs : mine, b);
             }
 
-            // Consume action
+            // Consume action — unless the leader is Lesandra (recruiting is a free action).
+            if (ps.LeaderCard / 2 == 11) { Log("  LEADER (Lesandra): recruit was free"); GrantAction(mine); }
+            else ConsumeAction(mine, theirs, b);
+        }
+
+        // ---- trap placement (op 10 into the reserve row grid_x==3) ------------
+        // A Trap card (card_init o_type==2) is dragged onto a reserve slot; the client sends it as a
+        // summon to (3, lane). We arm the trap (a hidden pending flag), render it face-down (op5/op6
+        // istrap=true), and remember its reserve lane so the face-down card can be cleared when it
+        // triggers. Costs 1 orb + 1 action (the client's summon_ui_script gates on orbs>=cost too).
+        static void HandleReservePlace(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState ps, int handIndex, int lane)
+        {
+            if (lane < 0 || lane > 2) { Log("RESERVE rejected: bad lane " + lane); GrantAction(mine); return; }
+            ushort card = mine.Hand[handIndex];
+            OrderEffect eff = OrderOf(card);
+            bool isTrap = eff.Kind == OrderKind.TrapCancelAttack || eff.Kind == OrderKind.TrapCancelSpell || eff.Kind == OrderKind.TrapCancelOrder;
+            bool isImmortality = eff.Kind == OrderKind.Immortality; // an Operation (o_type 1), played face-up to reserve
+            if (!isTrap && !isImmortality)
+            { Log("RESERVE rejected: card " + card + " is not a trap or operation"); GrantAction(mine); return; }
+
+            // One reserve card per lane.
+            if (ps.TrapAttackLane == lane || ps.TrapSpellLane == lane || ps.TrapOrderLane == lane || ps.ImmortalLane == lane)
+            { Log("RESERVE rejected: lane " + lane + " already occupied"); GrantAction(mine); return; }
+
+            // Orb cost (same as the client gate).
+            int cost = OrbCostOf(card);
+            if (ps.Orbs < cost) { Log("RESERVE rejected: not enough orbs (" + ps.Orbs + "/" + cost + ")"); GrantAction(mine); return; }
+            ps.Orbs -= cost;
+            { BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine; if (q0 != null && q1 != null) SendOrbs(q0, q1, b); }
+
+            // Arm the effect + remember its reserve lane. Traps are hidden (face-down); operations (the
+            // Immortality "Ongoing") are visible (face-up).
+            bool faceDown;
+            switch (eff.Kind)
+            {
+                case OrderKind.TrapCancelAttack: ps.TrapCancelAttack = true; ps.TrapAttackLane = lane; faceDown = true; break;
+                case OrderKind.TrapCancelSpell:  ps.TrapCancelSpell  = true; ps.TrapSpellLane  = lane; faceDown = true; break;
+                case OrderKind.TrapCancelOrder:  ps.TrapCancelOrder  = true; ps.TrapOrderLane  = lane; faceDown = true; break;
+                default: // Immortality
+                    ps.ImmortalWaves = 3; ps.ImmortalLane = lane; faceDown = false;
+                    Log("  IMMORTALITY: " + mine.Me.User + "'s vanguard heroes can't die for 3 waves");
+                    break;
+            }
+
+            // Discard the played card from hand (op12 to owner, op13 count to opponent).
+            mine.Hand.RemoveAt(handIndex);
+            Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)handIndex).WriteU16(card).WriteBool(true).Frame(Op.HandCardRemove));
+            if (theirs != null)
+                Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, mine.Hand.Count)).WriteU8((byte)handIndex).WriteU16(card).Frame(Op.HandCardRemoveGet));
+
+            // Render the card in the reserve slot (grid_x=3). istrap=true => face-down (trap); false =>
+            // face-up (operation, drawn as the card's spell sprite). script_summon sets obj_unit.trap.
+            Send(mine.Me.Ns, new PacketWriter().WriteU16(card).WriteU8(3).WriteU8((byte)lane).WriteBool(faceDown).Frame(Op.SummonUnit));
+            if (theirs != null)
+                Send(theirs.Me.Ns, new PacketWriter().WriteU16(card).WriteU8(3).WriteU8((byte)lane).WriteBool(faceDown).Frame(Op.SummonUnitGet));
+
+            Log((isTrap ? "TRAP PLACED: " : "OPERATION PLACED: ") + mine.Me.User + " -> " + eff.Kind + " in reserve lane " + lane + " (card " + card + ")");
             ConsumeAction(mine, theirs, b);
+            // Immortality takes effect immediately — refresh so vanguard units show the immort icon + are protected.
+            if (isImmortality)
+            { BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine; if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b); }
+        }
+
+        // Clear the face-down card for a triggered trap from the OWNER's reserve slot on both clients.
+        static void ClearTrapVisual(BattleSlot owner, BattleSlot opp, int lane)
+        {
+            if (owner == null || lane < 0 || lane > 2) return;
+            SendDestroyUnit(owner, opp, 3, lane);
         }
 
         // ---- attack (op 22) ---------------------------------------------------
@@ -2414,7 +2946,8 @@ namespace PtoServer
                                   || seff.Kind == OrderKind.Resurrect || seff.Kind == OrderKind.Retreat
                                   || seff.Kind == OrderKind.ShieldHero || seff.Kind == OrderKind.StrengthBuff
                                   || seff.Kind == OrderKind.Decoy || seff.Kind == OrderKind.Swap
-                                  || seff.Kind == OrderKind.Seance);
+                                  || seff.Kind == OrderKind.Seance || seff.Kind == OrderKind.Transfusion
+                                  || seff.Kind == OrderKind.ForceCube);
                 if (IsEnemyTargeting(seff.Kind) && selectGrid)
                 {
                     Log("  -> SPELL rejected: " + seff.Kind + " must target an ENEMY hero (own board clicked)");
@@ -2431,7 +2964,25 @@ namespace PtoServer
                     if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b);
                     return;
                 }
+                // TRAP — Cancel Spell: the rival's armed trap (round >= 2) negates this wave-spell; the
+                // caster still spends its action and the trap owner (Statistician) draws 1.
+                {
+                    PlayerState defTrap = b.P[1 - mine.P];
+                    if (b.Round >= 2 && defTrap.TrapCancelSpell)
+                    {
+                        defTrap.TrapCancelSpell = false;
+                        ClearTrapVisual(theirs, mine, defTrap.TrapSpellLane); defTrap.TrapSpellLane = -1;
+                        Log("  -> TRAP: " + (theirs != null ? theirs.Me.User : "defender") + "'s Cancel Spell negates " + mine.Me.User + "'s spell; owner draws 1");
+                        if (theirs != null) DrawCardsFor(theirs, mine, b, 1);
+                        ConsumeAction(mine, theirs, b);
+                        BattleSlot t0 = mine.P == 0 ? mine : theirs, t1 = mine.P == 0 ? theirs : mine;
+                        if (t0 != null && t1 != null) SyncUnitStates(t0, t1, b);
+                        return;
+                    }
+                }
                 ResolveEffect(seff, mine, theirs, b, tx, ty, ax, ay, selectGrid); // caster cell (Swap/Takedown) + clicked board (either-board effects)
+                // Seth: any wave-spell also triggers Scry 3 (interim: draw 1).
+                if (!b.Over && ps.LeaderCard / 2 == 15) { DrawCardsFor(mine, theirs, b, 1); Log("  LEADER (Seth): any wave-spell -> Scry 3 (interim: drew 1)"); }
                 return;
             }
 
@@ -2469,6 +3020,76 @@ namespace PtoServer
             // Validate attacker was not recruited this wave (Swift units ignore summon-sickness).
             if (!attackerIsLeader && attacker.RecruitedThisWave && (attacker.Abilities & UnitAbility.Swift) == 0)
             { Log("ATTACK rejected: attacker was recruited this wave"); GrantAction(mine); return; }
+
+            // TRAP — Cancel Attack: if the defender armed one (round >= 2), negate this attack before any
+            // targeting resolves. The attacker still spends its action. Reflector's trap also BACKLASHES
+            // the attacker: it takes damage equal to its own attack. This can defeat the attacker (or the
+            // attacking leader -> loss).
+            {
+                PlayerState defTrap = b.P[1 - mine.P];
+                if (b.Round >= 2 && defTrap.TrapCancelAttack)
+                {
+                    defTrap.TrapCancelAttack = false;
+                    int backlash = Math.Max(1, attacker.Atk);
+                    Log("  -> TRAP: " + (theirs != null ? theirs.Me.User : "defender") + "'s Cancel Attack negates " + mine.Me.User + "'s attack; Backlash " + backlash);
+                    // Play the attack so the block is VISIBLE: the attacker lunges at its target, which
+                    // takes 0 damage (its life is unchanged). Without this the attacker just stands still
+                    // and the trap silently vanishes — which reads as "nothing happened". Uses the raw
+                    // clicked target cell (before any intercept/cover redirect, which we skip anyway).
+                    bool animRanged = !attackerIsLeader && (attacker.Abilities & UnitAbility.RangedAttack) != 0;
+                    BUnit animTgt; b.P[1 - mine.P].Units.TryGetValue(Key(tx, serverTy), out animTgt);
+                    if ((tx == 1 && serverTy == 1) || animTgt == null || animTgt.IsCorpse)
+                        SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, 0, attackerIsLeader, b.P[1 - mine.P], animRanged, false, b);
+                    else
+                        SendAttackAndUpdate(mine, theirs, ax, ay, tx, serverTy, 0, attackerIsLeader, animTgt, animRanged, false, b);
+                    // Then remove the face-down trap card and Backlash the attacker.
+                    ClearTrapVisual(theirs, mine, defTrap.TrapAttackLane); defTrap.TrapAttackLane = -1;
+                    bool selfLeaderDied = false;
+                    if (attackerIsLeader)
+                    {
+                        ps.LeaderLife -= backlash;
+                        selfLeaderDied = ps.LeaderLife <= 0;
+                        SendLeaderHp(mine, theirs, ps);
+                    }
+                    else
+                    {
+                        attacker.Damage += backlash;
+                        attacker.HasAttackedThisWave = true; // used its action attacking into the trap
+                        SendUnitUpdateToBoth(mine, theirs, ax, ay, attacker, b);
+                        ProcessImmediateDeaths(ps, mine, theirs, b);
+                    }
+                    { BattleSlot t0 = mine.P == 0 ? mine : theirs, t1 = mine.P == 0 ? theirs : mine; if (t0 != null && t1 != null) SyncUnitStates(t0, t1, b); }
+                    if (selfLeaderDied)
+                    {
+                        b.Over = true;
+                        Log("BATTLE END: " + (theirs != null ? theirs.Me.User : "defender") + " wins (attacking leader Backlashed to death by trap)");
+                        if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
+                        Send(mine.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                        return;
+                    }
+                    ConsumeAction(mine, theirs, b);
+                    return;
+                }
+            }
+
+            // Arec: the defender's leader makes ALL incoming attacks target a RANDOM enemy hero. Redirect
+            // to a random frontmost-alive enemy (keeps it a legal melee/ranged target); leave the leader
+            // as the target only if the board is empty.
+            {
+                PlayerState arecPs = b.P[1 - mine.P];
+                if (arecPs.LeaderCard / 2 == 9)
+                {
+                    var fronts = new List<int>();
+                    for (int lane = 0; lane < 3; lane++)
+                        for (int w = 2; w >= 0; w--) { BUnit fu; if (arecPs.Units.TryGetValue(Key(w, lane), out fu) && fu != null && !fu.IsCorpse) { fronts.Add(Key(w, lane)); break; } }
+                    if (fronts.Count > 0)
+                    {
+                        int rk; lock (_rng) rk = fronts[_rng.Next(fronts.Count)];
+                        tx = (byte)(rk / 10); serverTy = (byte)(rk % 10);
+                        Log("  LEADER (Arec): incoming attack retargeted at random -> (" + tx + "," + serverTy + ")");
+                    }
+                }
+            }
 
             // Determine attack type: ranged if unit has RangedAttack ability
             // Ranged is decided by the same table the client's atktype (update_buff) uses, so the
@@ -2573,6 +3194,13 @@ namespace PtoServer
 
             // --- Resolve damage ---
             int rawDmg = Math.Max(1, attacker.Atk);
+            // Revenge N: this hero attacks for +N while IT is itself damaged. It's a flat attack bonus
+            // (independent of the target), so fold it into rawDmg here — this covers unit AND leader hits.
+            if (!attackerIsLeader && attacker.Revenge > 0 && attacker.Damage > 0)
+            {
+                rawDmg += attacker.Revenge;
+                Log("  -> REVENGE: +" + attacker.Revenge + " (attacker is damaged), attack now " + rawDmg);
+            }
             bool targetDied = false;
             bool leaderDied = false;
 
@@ -2591,6 +3219,7 @@ namespace PtoServer
                 SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, ldmg, attackerIsLeader, opPs, isRanged, false, b);
                 ApplyVamp(mine, theirs, b, attacker, attackerIsLeader, ldmg, ax, ay);
                 ApplyMercy(mine, theirs, b, attacker, attackerIsLeader, ldmg);
+                ApplyLeaderReflect(mine, theirs, b, opPs, attacker, attackerIsLeader, ldmg, ax, ay);
             }
             else
             {
@@ -2654,6 +3283,7 @@ namespace PtoServer
                     SendAttackAndLeaderUpdate(mine, theirs, ax, ay, 1, 1, ldmg2, attackerIsLeader, opPs, isRanged, false, b);
                     ApplyVamp(mine, theirs, b, attacker, attackerIsLeader, ldmg2, ax, ay);
                     ApplyMercy(mine, theirs, b, attacker, attackerIsLeader, ldmg2);
+                    ApplyLeaderReflect(mine, theirs, b, opPs, attacker, attackerIsLeader, ldmg2, ax, ay);
                 }
             }
 
@@ -2690,10 +3320,9 @@ namespace PtoServer
                 return;
             }
 
-            // Consume action — UNLESS the attacker is Swift (its attack is free).
-            if (!attackerIsLeader && (attacker.Abilities & UnitAbility.Swift) != 0)
-            { Log("  -> SWIFT: attack was free (no action spent)"); GrantAction(mine); }
-            else ConsumeAction(mine, theirs, b);
+            // Swift (official) only lets a hero act the turn it's summoned (summon-sickness bypass handled
+            // above) — the attack still costs an action, like any other.
+            ConsumeAction(mine, theirs, b);
         }
 
         // Melee: can the attacker target the leader at (1,1)?
@@ -2854,9 +3483,12 @@ namespace PtoServer
             // play during the attacker's turn — NOT batched into the wave-advance burst, where it
             // would block the incoming turn_get and freeze both clients. (Corpses keep Damage=0 after
             // ProcessCasualties, hence the IsCorpse check for 0 HP.)
-            bool dead = unit.IsCorpse || unit.Damage >= unit.Max;
+            // Immortality: a protected vanguard hero is never sent as dead (even at/over lethal damage),
+            // so the client won't play its death animation; it shows at least 1 HP until protection ends.
+            bool immVan = IsImmortalVanguard(b.P[ownerSlot.P], x);
+            bool dead = !immVan && (unit.IsCorpse || unit.Damage >= unit.Max);
             if (dead) unit.DeathSent = true;  // client now knows it's dead; never re-send (would replay the death anim)
-            int curLife = dead ? 0 : Math.Max(0, unit.Max - unit.Damage);
+            int curLife = dead ? 0 : Math.Max(immVan ? 1 : 0, unit.Max - unit.Damage);
             // Ready = alive, hasn't acted, not summon-sick (see SyncPlayerUnits). Must use `dead` (which
             // includes lethal-but-not-yet-corpse) NOT just IsCorpse: on a killing blow IsCorpse isn't set
             // until ProcessImmediateDeaths runs a moment later, so sending active=1 with dead=1 makes the
@@ -2869,8 +3501,8 @@ namespace PtoServer
             // The client shows attack = atk + str (+ mstr for melee), so send the BASE atk here and the
             // Strength bonus in the str field — otherwise strength double-counts (unit.Atk already folds it in).
             // Include TempStrength (Strength Buff) so the displayed attack reflects the buff.
-            byte baseAtk = (byte)AtkOf(unit.Card);
-            byte dispStr = (byte)Math.Max(0, Math.Min(255, unit.Strength + unit.TempStrength));
+            byte baseAtk = (byte)Math.Max(0, AtkOf(unit.Card) - unit.Enervate); // Enervate lowers the shown base attack
+            byte dispStr = (byte)Math.Max(0, Math.Min(255, unit.Strength + unit.TempStrength + (unit.Damage > 0 ? unit.Revenge : 0)));
             // UpdateUnit to owner — raw Y (unit stored at slot_get_id(x, y))
             Send(ownerSlot.Me.Ns, new PacketWriter()
                 .WriteU8((byte)x).WriteU8((byte)y).WriteU8(baseAtk).WriteU16((ushort)curLife)
@@ -2934,6 +3566,7 @@ namespace PtoServer
             unit.Strength = GetUnitStrength(unit.Card, x2);
             unit.Armor = GetUnitArmor(unit.Card, x2);
             unit.Finisher = GetUnitFinisher(unit.Card, x2);
+            unit.Revenge = GetUnitRevenge(unit.Card, x2);
             unit.Abilities = GetUnitAbilities(unit.Card, x2);
             unit.Cover = PassiveOf(unit.Card, x2).Cover;
 
@@ -2964,7 +3597,9 @@ namespace PtoServer
                         + " ranged=" + (((moved.Abilities & UnitAbility.RangedAttack) != 0) ? 1 : 0));
             }
 
-            ConsumeAction(mine, theirs, b);
+            // Restructure makes moves free this turn.
+            if (ps.RestructureFree) { Log("  RESTRUCTURE: move was free"); GrantAction(mine); }
+            else ConsumeAction(mine, theirs, b);
         }
 
         // ---- clear corpse (op 24) ---------------------------------------------
@@ -2991,6 +3626,7 @@ namespace PtoServer
             if (!ps.Units.TryGetValue(key, out unit) || !unit.IsCorpse)
             { Log("CLEAR_CORPSE rejected: no corpse at (" + cx + "," + cy + ")"); GrantAction(mine); return; }
 
+            DiscardCard(ps, unit.Card); // a cleared corpse goes to the discard pile
             ps.Units.Remove(key);
             Log("CLEAR_CORPSE " + mine.Me.User + ": removed corpse at (" + cx + "," + cy + ")");
 
@@ -3002,7 +3638,9 @@ namespace PtoServer
                 // container_clear_corpse_get mirrors Y: yy = 2 - buffer_read
                 Send(theirs.Me.Ns, new PacketWriter().WriteU8(cx).WriteU8(cy).WriteBool(false).Frame(Op.ClearCorpseGet));
 
-            ConsumeAction(mine, theirs, b);
+            // Restructure makes corpse-clears free this turn.
+            if (ps.RestructureFree) { Log("  RESTRUCTURE: clear-corpse was free"); GrantAction(mine); }
+            else ConsumeAction(mine, theirs, b);
         }
 
         // ---- action management ------------------------------------------------
@@ -3034,7 +3672,6 @@ namespace PtoServer
                     .Frame(Op.UpdateUnitGet));
         }
 
-        // Vamp: when a hero deals damage, heal its owner's leader by that much (capped at leader max).
         // Vamp: whenever this hero deals attack damage, remove that much damage from ITSELF (self-heal).
         static void ApplyVamp(BattleSlot mine, BattleSlot theirs, Battle b, BUnit attacker, bool attackerIsLeader, int dealt, int ax, int ay)
         {
@@ -3060,7 +3697,6 @@ namespace PtoServer
             }
         }
 
-        // Mercy: when it deals attack damage, the hero heals ITSELF by that much. Pushes its new HP.
         // Mercy: whenever this hero deals attack damage, remove `dealt` damage from a RANDOM damaged
         // hero on the attacker's side (its owner's units, itself included; leaders are not heroes).
         static void ApplyMercy(BattleSlot mine, BattleSlot theirs, Battle b, BUnit attacker, bool attackerIsLeader, int dealt)
@@ -3077,6 +3713,17 @@ namespace PtoServer
             tgt.Damage = Math.Max(0, tgt.Damage - dealt);
             Log("  -> MERCY: heal random damaged hero (" + (key / 10) + "," + (key % 10) + ") by " + (before - tgt.Damage));
             SendUnitUpdateToBoth(mine, theirs, key / 10, key % 10, tgt, b);
+        }
+
+        // Leader: Reflect Damage (aura, e.g. Statistician Flank) — when the leader takes ATTACK damage,
+        // deal that much back to the attacking unit. (Leader-vs-leader attackers are not reflected.)
+        static void ApplyLeaderReflect(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState opPs, BUnit attacker, bool attackerIsLeader, int ldmg, int ax, int ay)
+        {
+            if (attackerIsLeader || attacker == null || ldmg <= 0) return;
+            if ((opPs.LeaderAbilities & UnitAbility.Reflect) == 0) return;
+            attacker.Damage += ldmg;
+            Log("  -> LEADER REFLECT: " + ldmg + " back to attacker (" + attacker.Damage + "/" + attacker.Max + ")");
+            SendUnitUpdateToBoth(mine, theirs, ax, ay, attacker, b);
         }
 
         // ---- end turn (op 14 empty = end turn) --------------------------------
@@ -3106,9 +3753,26 @@ namespace PtoServer
 
             // Regen N: at the end of each of your turns, heal N damage from each of your Regen heroes.
             ApplyRegen(b.P[mine.P]);
+            // Leader end-of-turn passives (Kavri heal / Marmelee draw) for the player whose turn is ending.
+            ApplyLeaderEndOfTurn(mine, theirs, b);
 
-            // Strength Buff lasts "until end of turn" — expire the caster's temp strength now.
-            foreach (var kv in b.P[mine.P].Units) if (kv.Value != null) kv.Value.TempStrength = 0;
+            // Restructure ("free move/clear-corpse until end of turn") expires at end of turn.
+            // (Strength Buff lasts until end of WAVE — cleared in ResetWaveFlags, not here.)
+            b.P[mine.P].RestructureFree = false;
+            // Phantom cards vanish from the ending player's hand at end of their turn.
+            {
+                PlayerState eps = b.P[mine.P];
+                foreach (ushort pc in eps.PhantomCards)
+                {
+                    int idx = mine.Hand.IndexOf(pc);
+                    if (idx < 0) continue;
+                    mine.Hand.RemoveAt(idx);
+                    Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)idx).WriteU16(pc).WriteBool(true).Frame(Op.HandCardRemove));
+                    if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, mine.Hand.Count)).WriteU8((byte)idx).WriteU16(pc).Frame(Op.HandCardRemoveGet));
+                }
+                if (eps.PhantomCards.Count > 0) Log("  PHANTOM: expired " + eps.PhantomCards.Count + " phantom card(s) from " + mine.Me.User + "'s hand");
+                eps.PhantomCards.Clear();
+            }
 
             if (b.Active == b.First)
             {
@@ -3135,8 +3799,21 @@ namespace PtoServer
                 // Rear wave done -> process casualties, new round
                 ProcessCasualties(b, p0, p1);
                 if (b.Over) return;
+                // Leader end-of-round passives (Lixis rival damage / Mikhail resurrect), then re-check rout.
+                ApplyLeaderEndOfRound(b, p0, p1);
+                for (int pi = 0; pi < 2 && !b.Over; pi++)
+                    if (b.P[pi].LeaderLife <= 0)
+                    {
+                        b.Over = true;
+                        BattleSlot win = pi == 0 ? p1 : p0, lose = pi == 0 ? p0 : p1;
+                        Log("BATTLE END: player " + pi + " leader routed by an end-of-round leader passive");
+                        Send(win.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
+                        Send(lose.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                    }
+                if (b.Over) return;
                 b.Round++;
                 b.First = 1 - b.First;
+                b.P[0].IsFirstPlayer = (b.First == 0); b.P[1].IsFirstPlayer = (b.First == 1); // Kallistar
                 b.Wave = 2;
                 b.Active = b.First;
                 if (b.Round >= 2) GrantWaveOrbs(b); // first grant is entering round 2 (ceasefire just ended)
@@ -3161,13 +3838,19 @@ namespace PtoServer
                 PlayerState ps = b.P[pi];
                 List<int> deadKeys = new List<int>();
 
-                // A unit dies when its accumulated ATTACK damage reaches its life (order/effect damage
-                // can't kill a Deathproof unit — it's blocked at the source, so no special case here).
+                // A unit dies when its accumulated damage reaches its life. Deathproof needs no special
+                // case here: it only blocks INSTANT-KILL effects (KillEnemyAt); ordinary damage (attacks
+                // AND damage effects) accumulates and can defeat it normally.
                 foreach (var kvp in ps.Units)
                 {
                     BUnit u = kvp.Value;
                     if (u == null || u.IsCorpse) continue;
-                    if (u.Damage >= u.Max) { deadKeys.Add(kvp.Key); anyCasualties = true; }
+                    if (u.Damage >= u.Max)
+                    {
+                        // Immortality: a vanguard hero can't die — cap just below lethal and skip.
+                        if (IsImmortalVanguard(ps, kvp.Key / 10)) { u.Damage = Math.Max(0, u.Max - 1); continue; }
+                        deadKeys.Add(kvp.Key); anyCasualties = true;
+                    }
                 }
 
                 foreach (int key in deadKeys)
@@ -3179,8 +3862,10 @@ namespace PtoServer
                     if ((u.Abilities & UnitAbility.Ephemeral) != 0)
                     {
                         Log("  EPHEMERAL: player " + pi + " unit(" + ux + "," + uy + ") card " + u.Card + " defeated -> corpse cleared");
+                        DiscardCard(ps, u.Card);
                         ps.Units.Remove(key);
                         SendClearCorpse(own, opp, ux, uy);
+                        OnHeroDefeated(own, opp, b, u); // Iri / Shekhtur / Rexan
                         continue;
                     }
                     Log("  CASUALTY: player " + pi + " unit(" + ux + "," + uy + ") card " + u.Card + " (damage " + u.Damage + " >= life " + u.Max + ")");
@@ -3188,6 +3873,7 @@ namespace PtoServer
                     u.Damage = 0;
                     u.CorpseFresh = true;
                     SendUnitUpdateToBoth(own, opp, ux, uy, u, b);
+                    OnHeroDefeated(own, opp, b, u); // Iri / Shekhtur / Rexan
                 }
             }
 
@@ -3230,6 +3916,22 @@ namespace PtoServer
                 }
             }
 
+            // Immortality counts down one per wave (it protected this wave's casualties above, then ticks).
+            for (int pi = 0; pi < 2; pi++)
+                if (b.P[pi].ImmortalWaves > 0)
+                {
+                    b.P[pi].ImmortalWaves--;
+                    Log("  IMMORTALITY: player " + pi + " has " + b.P[pi].ImmortalWaves + " wave(s) of vanguard immortality left");
+                    // Expired: clear the face-up operation card from the reserve slot.
+                    if (b.P[pi].ImmortalWaves == 0 && b.P[pi].ImmortalLane >= 0)
+                    {
+                        BattleSlot own = pi == 0 ? p0 : p1, opp = pi == 0 ? p1 : p0;
+                        SendDestroyUnit(own, opp, 3, b.P[pi].ImmortalLane);
+                        b.P[pi].ImmortalLane = -1;
+                        Log("  IMMORTALITY: player " + pi + " operation expired -> reserve card cleared");
+                    }
+                }
+
             if (!anyCasualties)
                 Log("  No casualties this wave.");
         }
@@ -3247,6 +3949,8 @@ namespace PtoServer
                         u.RecruitedThisWave = false;
                         u.HasAttackedThisWave = false;
                     }
+                    // Strength Buff (official) lasts "until end of the wave" — clear it as the wave turns over.
+                    if (u != null) u.TempStrength = 0;
                 }
             }
         }
@@ -3260,6 +3964,7 @@ namespace PtoServer
             Send(p0.Me.Ns, new PacketWriter().WriteU16((ushort)(active == 0 ? 0 : 1)).WriteBool(true).Frame(Op.TurnGet));
             Send(p1.Me.Ns, new PacketWriter().WriteU16((ushort)(active == 1 ? 0 : 1)).WriteBool(true).Frame(Op.TurnGet));
             BattleSlot act = active == 0 ? p0 : p1;
+            if (act.Battle != null) act.Battle.P[active].OrderedThisTurn = false; // reset Tatsumi's first-order tracker
             GrantAction(act);
             // Any corpse alive at a turn boundary has finished its death animation client-side, so it's
             // now safe (and necessary) to re-send it — mark it settled so SyncUnitStates re-greys it.
@@ -3368,20 +4073,21 @@ namespace PtoServer
                 // anim_wave_update's activate=1 refresh and paints the whole board exhausted.
                 // Render dead on lethal damage (or corpse) so the death animation plays during the
                 // turn, not in the wave-advance burst (see SendUnitUpdateToBoth). Corpses keep 0 HP.
-                bool unitDead = u.IsCorpse || u.Damage >= u.Max;
+                bool immVanS = IsImmortalVanguard(ps, ux); // protected vanguard: never dead
+                bool unitDead = !immVanS && (u.IsCorpse || u.Damage >= u.Max);
                 // active must exclude dead/dying units (see SendUnitUpdateToBoth) — else a corpse renders
                 // as a live, movable unit on the client.
                 bool unitActive = !unitDead && !u.HasAttackedThisWave && !u.RecruitedThisWave;
                 if (unitDead) u.DeathSent = true;  // sent once; future syncs skip it (see the continue above)
-                int curLife = unitDead ? 0 : Math.Max(0, u.Max - u.Damage);
+                int curLife = unitDead ? 0 : Math.Max(immVanS ? 1 : 0, u.Max - u.Damage);
                 if (PacketLog)
                     Log("  unit (" + ux + "," + uy + ") active=" + (unitActive ? 1 : 0)
                         + " wave=" + b.Wave + " ux=" + ux + " isCorpse=" + u.IsCorpse);
 
                     // Send BASE atk + Strength bonus separately (client shows atk+str+mstr).
                     // str includes TempStrength (Strength Buff) so the display reflects the buff.
-                byte uBaseAtk = (byte)AtkOf(u.Card);
-                byte uDispStr = (byte)Math.Max(0, Math.Min(255, u.Strength + u.TempStrength));
+                byte uBaseAtk = (byte)Math.Max(0, AtkOf(u.Card) - u.Enervate); // Enervate lowers the shown base attack
+                byte uDispStr = (byte)Math.Max(0, Math.Min(255, u.Strength + u.TempStrength + (u.Damage > 0 ? u.Revenge : 0)));
                     // UpdateUnit to owner — raw Y
                 Send(ownerSlot.Me.Ns, new PacketWriter()
                     .WriteU8((byte)ux).WriteU8((byte)uy).WriteU8(uBaseAtk).WriteU16((ushort)curLife)
