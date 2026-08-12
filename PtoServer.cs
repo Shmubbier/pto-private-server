@@ -72,6 +72,8 @@ namespace PtoServer
         public const byte ActionGet    = 16;  // battle: opponent's remaining action count (cosmetic)
         public const byte HandCardRemove = 12;
         public const byte HandCardRemoveGet = 13; // opponent's view of a card leaving their hand: [handsize u8][pos u8][cardid u16]
+        public const byte DiscardCard    = 30; // add a card (u8) to the owner's client-side discard pile (container_discard_card)
+        public const byte DiscardCardGet = 31; // opponent's view of that discard (container_discard_card_get)
         public const byte DestroyUnit  = 32;  // remove a unit from the owner's board [x u8, y u8]
         public const byte DestroyUnitGet = 33; // opponent's view of that removal (y mirrored client-side)
         public const byte WaveUpdate   = 17;
@@ -85,6 +87,7 @@ namespace PtoServer
         public const byte SpellCreate  = 44;  // battle: caster cast-pose + spell text; blocks queue (next_que_effect=0) [isMe u8/bool, xx u8, yy u8]
         public const byte Effect       = 41;  // battle: effect projectile/hit [isOrder,xf,yf,gridf,xt,yt,gridt,eid u16,isheal,dmg]
         public const byte SpellRemove  = 45;  // battle: end the cast window; releases queue (next_que_effect=1) [no payload]
+        public const byte ScryResult   = 51;  // client->server: scry pick result [u8 handSize][handSize bools: 0=draw this, 1=shuffle back]
         public const byte DeckUpdate   = 54;
         public const byte CardHover    = 7;   // client->server: card hover (cosmetic)
         public const byte ArrowPos     = 34;  // client->server: arrow position (cosmetic)
@@ -187,6 +190,10 @@ namespace PtoServer
         // so we can identify which eid is a real projectile that RELEASES the client queue (only
         // obj_arrow_effect does). Default -1 = off (normal play, cast-pose only). See [[spell-order-protocol]].
         static readonly int EfxProbeId = ParseIntEnv("PTO_EFXID", -1);
+        // Confirmed (user-tested 2026-08-12): eid 0 = obj_single_arrow_target, a queue-safe single-target
+        // projectile (plays a projectile AND releases the queue). Used in production for single-target
+        // enemy-damage orders/spells. PTO_EFXID overrides it for further calibration.
+        const int EfxArrow = 0;
         static int ParseIntEnv(string name, int dflt)
         { int v; return int.TryParse(Environment.GetEnvironmentVariable(name), out v) ? v : dflt; }
         const int TurnSeconds = 60;     // a turn auto-advances after this many seconds of inactivity
@@ -335,6 +342,7 @@ namespace PtoServer
                         case Op.DrawCard:   HandleDraw(ns); break;
                         case Op.TurnGet:    HandleEndTurn(ns); break;
                         case Op.ClearCorpse:HandleClearCorpse(ns, payload); break;
+                        case Op.ScryResult: HandleScryResult(ns, payload); break;
                         case Op.Ping:       Send(ns, new PacketWriter().Frame(Op.Ping)); break;
                         case Op.CardHover:
                         case Op.ArrowPos:
@@ -960,6 +968,7 @@ namespace PtoServer
             public List<ushort> Deck = new List<ushort>(); // draw pile (hero cards remaining)
             public List<ushort> Discard = new List<ushort>(); // discard pile (played orders, cleared corpses, banished/entombed cards) — used by Phantom
             public List<ushort> PhantomCards = new List<ushort>(); // card ids added by Phantom this turn: printed life = 1, vanish from hand at end of turn
+            public List<ushort> PendingScry = null; // cards pulled off the top of the deck for an open Scry UI, awaiting the op51 pick
             public int ActionsRemaining;
             public int Orbs;  // order resource: +1 each round, capped at OrbMax; spent on orders
             public int LeaderArmorBonus; // from "Leader: Armor N" auras (recomputed each RecomputeAuras)
@@ -1527,6 +1536,57 @@ namespace PtoServer
             ConsumeAction(mine, theirs, b);
         }
 
+        // ---- scry pick (op 51) ------------------------------------------------
+        // The player finished the Scry UI. Payload = u8 handSize, then handSize bools. The client
+        // front-inserts the scry cards (reversing our send order), so packet bool[k] maps directly to
+        // the k-th card we sent (PendingScry[k]). cancel==0 => draw that card; cancel==1 => shuffle back.
+        static void HandleScryResult(NetworkStream ns, byte[] payload)
+        {
+            BattleSlot mine, theirs = null;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out mine)) return;
+                if (mine.Opp != null) _battles.TryGetValue(mine.Opp.Ns, out theirs);
+            }
+            Battle b = mine.Battle;
+            if (b == null) return;
+            PlayerState ps = b.P[mine.P];
+            var pend = ps.PendingScry;
+            ps.PendingScry = null;
+            if (pend == null || pend.Count == 0) { Log("SCRY result: no pending scry (ignored)"); return; }
+
+            int n = payload.Length > 0 ? payload[0] : pend.Count;
+            ushort drawn = 0; bool haveDraw = false;
+            var back = new List<ushort>();
+            for (int k = 0; k < n && k < pend.Count; k++)
+            {
+                bool cancel = (1 + k < payload.Length) ? (payload[1 + k] != 0) : true; // 0 = draw, 1 = shuffle back
+                if (!cancel && !haveDraw) { drawn = pend[k]; haveDraw = true; }
+                else back.Add(pend[k]);
+            }
+            for (int k = n; k < pend.Count; k++) back.Add(pend[k]); // any extras go back
+
+            // Shuffle the un-chosen cards back into the deck.
+            ps.Deck.AddRange(back);
+            lock (_rng) for (int i = ps.Deck.Count - 1; i > 0; i--) { int j = _rng.Next(i + 1); var t = ps.Deck[i]; ps.Deck[i] = ps.Deck[j]; ps.Deck[j] = t; }
+
+            if (haveDraw)
+            {
+                mine.Hand.Insert(0, drawn); // client draws to the front (scry=false op8 -> obj_hand)
+                byte deckLeft = (byte)Math.Min(255, ps.Deck.Count);
+                byte handSize = (byte)Math.Min(255, mine.Hand.Count);
+                Send(mine.Me.Ns, new PacketWriter()
+                    .WriteBool(false).WriteU8(deckLeft).WriteU16(drawn).WriteBool(false)
+                    .WriteU8(0).WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCard));
+                if (theirs != null)
+                    Send(theirs.Me.Ns, new PacketWriter()
+                        .WriteBool(false).WriteU8(deckLeft).WriteU8(handSize).WriteU8(0)
+                        .WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCardGet));
+                Log("SCRY result: " + mine.Me.User + " drew card " + drawn + ", shuffled " + back.Count + " back");
+            }
+            else Log("SCRY result: " + mine.Me.User + " drew nothing, shuffled " + back.Count + " back");
+        }
+
         // ---- order / targeted spell (op 28) -----------------------------------
         // Client sends: u8 card, bool grid, u8 x, u8 y, u16 cardId (see battle_order_attack).
         // cardId == 0 is a cancel (player clicked empty). Effects are server-authoritative: we
@@ -1639,7 +1699,7 @@ namespace PtoServer
                 }
                 if ((u.Abilities & UnitAbility.Ephemeral) != 0)
                 {
-                    DiscardCard(ps, u.Card);
+                    DiscardCard(owner, opp, u.Card);
                     ps.Units.Remove(key);
                     SendClearCorpse(owner, opp, ux, uy);
                     Log("  DIED (ephemeral): (" + ux + "," + uy + ") card " + u.Card + " -> corpse cleared");
@@ -1813,7 +1873,7 @@ namespace PtoServer
             if (card < mine.Hand.Count && mine.Hand[card] == cardId)
             {
                 mine.Hand.RemoveAt(card);
-                DiscardCard(ps, cardId); // played orders go to the discard pile
+                DiscardCard(mine, theirs, cardId); // played orders go to the discard pile
                 Send(mine.Me.Ns, new PacketWriter().WriteU8(card).WriteU16(cardId).WriteBool(true).Frame(Op.HandCardRemove));
                 if (theirs != null)
                     Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, mine.Hand.Count)).WriteU8(card).WriteU16(cardId).Frame(Op.HandCardRemoveGet));
@@ -1927,7 +1987,7 @@ namespace PtoServer
                         {
                             int bidx; lock (_rng) bidx = _rng.Next(theirs.Hand.Count);
                             ushort bc = theirs.Hand[bidx]; theirs.Hand.RemoveAt(bidx);
-                            DiscardCard(opPs, bc); // banished cards go to the rival's discard
+                            DiscardCard(theirs, mine, bc); // banished cards go to the rival's discard
                             Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)bidx).WriteU16(bc).WriteBool(true).Frame(Op.HandCardRemove));
                             Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, theirs.Hand.Count)).WriteU8((byte)bidx).WriteU16(bc).Frame(Op.HandCardRemoveGet));
                             Log("  BANISH: removed card " + bc + " from " + theirs.Me.User + " hand[" + bidx + "]");
@@ -2117,9 +2177,8 @@ namespace PtoServer
                     SendLeaderHp(mine, theirs, ps);
                     Log("  LEADER (Luc Von Gott): -1 leader life (now " + ps.LeaderLife + "), +2 actions");
                     break;
-                case OrderKind.Scry: // INTERIM: auto-draw 1 (full "look at N, pick one, reorder" UI deferred — see notes)
-                    DrawCardsFor(mine, theirs, b, 1);
-                    Log("  SCRY " + eff.Amount + " (interim: auto-drew 1; interactive pick-and-reorder UI TODO)");
+                case OrderKind.Scry: // open the interactive Scry UI: show top N, player picks one to draw (op51)
+                    OpenScry(mine, ps, eff.Amount);
                     break;
                 case OrderKind.Phantom: // add N copies of random discard cards to hand; life=1, vanish at end of turn
                     {
@@ -2315,7 +2374,7 @@ namespace PtoServer
                         int hidx; lock (_rng) hidx = _rng.Next(theirs.Hand.Count);
                         ushort stolen = theirs.Hand[hidx];
                         theirs.Hand.RemoveAt(hidx);
-                        DiscardCard(opPs, stolen); // Wild Summon plays then discards the rival's card
+                        DiscardCard(theirs, mine, stolen); // Wild Summon plays then discards the rival's card
                         // Rival's own hand view removes the card; caster's view of the rival hand-count shrinks.
                         Send(theirs.Me.Ns, new PacketWriter().WriteU8((byte)hidx).WriteU16(stolen).WriteBool(true).Frame(Op.HandCardRemove));
                         Send(mine.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, theirs.Hand.Count)).WriteU8((byte)hidx).WriteU16(stolen).Frame(Op.HandCardRemoveGet));
@@ -2340,7 +2399,7 @@ namespace PtoServer
                         foreach (int ckey in corpses)
                         {
                             if (cleared >= eff.Amount) break;
-                            DiscardCard(ps, ps.Units[ckey].Card);
+                            DiscardCard(mine, theirs, ps.Units[ckey].Card);
                             ps.Units.Remove(ckey);
                             SendClearCorpse(mine, theirs, ckey / 10, ckey % 10);
                             int sx, sy;
@@ -2401,12 +2460,34 @@ namespace PtoServer
                     break;
             }
 
-            // CALIBRATION probe (PTO_EFXID>=0): fire the effect from the leader (1,1) to the ENEMY leader
-            // (1,1) — center lane, symmetric, so no Y-mirror ambiguity while we hunt for a queue-safe eid.
-            if (EfxProbeId >= 0)
+            // EFFECT PROJECTILE (op41): fire the confirmed queue-safe arrow (eid 0) from the caster along
+            // the real trajectory to the target, for single-target enemy-damage effects. The cast-pose
+            // bracket (op44/op45 in HandleOrder) gates next_que_effect around it. PTO_EFXID (>=0) overrides
+            // the eid AND fires for every effect (calibration mode).
+            if (theirs != null)
             {
-                Log("  EFX PROBE: firing eid=" + EfxProbeId + " leader->enemy-leader (dmg=" + eff.Amount + ")");
-                SendEffect(mine, theirs, 1, 1, 1, 1, false, EfxProbeId, false, eff.Amount);
+                if (EfxProbeId >= 0)
+                {
+                    Log("  EFX PROBE: eid=" + EfxProbeId + " (" + casterX + "," + casterY + ") -> enemy (" + gx + "," + enemyGy + ")");
+                    SendEffect(mine, theirs, casterX, casterY, gx, enemyGy, false, EfxProbeId, false, eff.Amount);
+                }
+                else
+                {
+                    int etx = gx, ety = enemyGy; bool fire = false;
+                    switch (eff.Kind)
+                    {
+                        case OrderKind.DamageSingle: case OrderKind.DamageIce: case OrderKind.Backlash:
+                        case OrderKind.KillHero: case OrderKind.FinisherKill: case OrderKind.Takedown:
+                            fire = true; break;                       // clicked enemy hero
+                        case OrderKind.DamageLeader:
+                            fire = true; etx = 1; ety = 1; break;     // the rival leader
+                    }
+                    if (fire)
+                    {
+                        Log("  EFX: arrow eid=" + EfxArrow + " (" + casterX + "," + casterY + ") -> enemy (" + etx + "," + ety + ")");
+                        SendEffect(mine, theirs, casterX, casterY, etx, ety, false, EfxArrow, false, eff.Amount);
+                    }
+                }
             }
 
             // Turn any enemy units the effect just killed into corpses immediately (kept in sync).
@@ -2608,6 +2689,22 @@ namespace PtoServer
             }
         }
 
+        // Open the interactive Scry UI: pull the top N cards off `ps`'s deck, store them as PendingScry,
+        // and send op8 (scry=true) per card so the client shows them for a pick (resolved by op51).
+        static void OpenScry(BattleSlot mine, PlayerState ps, int n)
+        {
+            if (mine == null || ps == null || ps.Deck == null || ps.Deck.Count == 0) { Log("  scry: deck empty"); return; }
+            var scryCards = new List<ushort>();
+            for (int i = 0; i < Math.Max(1, n) && ps.Deck.Count > 0; i++) { scryCards.Add(ps.Deck[0]); ps.Deck.RemoveAt(0); }
+            ps.PendingScry = scryCards;
+            byte deckLeft = (byte)Math.Min(255, ps.Deck.Count);
+            foreach (ushort sc in scryCards)
+                Send(mine.Me.Ns, new PacketWriter()
+                    .WriteBool(true).WriteU8(deckLeft).WriteU16(sc).WriteBool(false)
+                    .WriteU8(0).WriteBool(false).WriteU8(0).WriteU8(0).Frame(Op.DrawCard));
+            Log("  SCRY " + scryCards.Count + ": opened scry UI (awaiting op51 pick)");
+        }
+
         // Revive every corpse on `ps` (owner's board) to full life (Resurrect All). Fresh, summon-sick.
         static void ReviveAllCorpses(BattleSlot owner, BattleSlot opp, Battle b, PlayerState ps)
         {
@@ -2624,9 +2721,17 @@ namespace PtoServer
             if (corpses.Count > 0) Log("  RESURRECT ALL: revived " + corpses.Count + " corpse(s) for " + owner.Me.User);
         }
 
-        // Add a card to a player's discard pile (server-side only; Phantom pulls copies from here).
+        // Add a card to a player's discard pile and sync the client's (hidden) discard pile.
         // Sources: an order played from hand, a cleared corpse, a Banished/Wild-Summoned card.
-        static void DiscardCard(PlayerState ps, ushort card) { if (ps != null && card != 0) ps.Discard.Add(card); }
+        // The client tracks obj_deck.discard[player] via op30 (own) / op31 (opponent view); there is no
+        // viewer UI yet, but we keep it accurate for when one is added. Card is sent as a u8.
+        static void DiscardCard(BattleSlot ownerSlot, BattleSlot oppSlot, ushort card)
+        {
+            if (ownerSlot == null || ownerSlot.Battle == null || card == 0) return;
+            ownerSlot.Battle.P[ownerSlot.P].Discard.Add(card);
+            Send(ownerSlot.Me.Ns, new PacketWriter().WriteU8((byte)card).Frame(Op.DiscardCard));
+            if (oppSlot != null) Send(oppSlot.Me.Ns, new PacketWriter().WriteU8((byte)card).Frame(Op.DiscardCardGet));
+        }
 
         // Find an empty (non-leader) slot on ps's board, preferring `preferWave`. Returns false if full.
         static bool FindEmptySlot(PlayerState ps, int preferWave, out int gx, out int gy)
@@ -2981,8 +3086,8 @@ namespace PtoServer
                     }
                 }
                 ResolveEffect(seff, mine, theirs, b, tx, ty, ax, ay, selectGrid); // caster cell (Swap/Takedown) + clicked board (either-board effects)
-                // Seth: any wave-spell also triggers Scry 3 (interim: draw 1).
-                if (!b.Over && ps.LeaderCard / 2 == 15) { DrawCardsFor(mine, theirs, b, 1); Log("  LEADER (Seth): any wave-spell -> Scry 3 (interim: drew 1)"); }
+                // Seth: any wave-spell also triggers Scry 3 (opens the scry UI — unless one is already open).
+                if (!b.Over && ps.LeaderCard / 2 == 15 && ps.PendingScry == null) { Log("  LEADER (Seth): any wave-spell -> Scry 3"); OpenScry(mine, ps, 3); }
                 return;
             }
 
@@ -3626,7 +3731,7 @@ namespace PtoServer
             if (!ps.Units.TryGetValue(key, out unit) || !unit.IsCorpse)
             { Log("CLEAR_CORPSE rejected: no corpse at (" + cx + "," + cy + ")"); GrantAction(mine); return; }
 
-            DiscardCard(ps, unit.Card); // a cleared corpse goes to the discard pile
+            DiscardCard(mine, theirs, unit.Card); // a cleared corpse goes to the discard pile
             ps.Units.Remove(key);
             Log("CLEAR_CORPSE " + mine.Me.User + ": removed corpse at (" + cx + "," + cy + ")");
 
@@ -3862,7 +3967,7 @@ namespace PtoServer
                     if ((u.Abilities & UnitAbility.Ephemeral) != 0)
                     {
                         Log("  EPHEMERAL: player " + pi + " unit(" + ux + "," + uy + ") card " + u.Card + " defeated -> corpse cleared");
-                        DiscardCard(ps, u.Card);
+                        DiscardCard(own, opp, u.Card);
                         ps.Units.Remove(key);
                         SendClearCorpse(own, opp, ux, uy);
                         OnHeroDefeated(own, opp, b, u); // Iri / Shekhtur / Rexan
