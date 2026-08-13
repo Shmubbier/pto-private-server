@@ -1824,7 +1824,7 @@ namespace PtoServer
             if (eid < 0) return;
 
             var cells = new List<int>();
-            bool targetIsMine = false;
+            bool targetIsMine = false, telegraph = false;
             switch (eff.Kind)
             {
                 case OrderKind.DamageSingle: case OrderKind.DamageIce: case OrderKind.Backlash:
@@ -1834,15 +1834,15 @@ namespace PtoServer
                 case OrderKind.DamageLeader:
                     cells.Add(Key(1, 1)); break;
                 case OrderKind.DamageRow:
-                    for (int cx = 0; cx <= 2; cx++) cells.Add(Key(cx, enemyGy)); break;
+                    for (int cx = 0; cx <= 2; cx++) cells.Add(Key(cx, enemyGy)); telegraph = true; break;
                 case OrderKind.DamageColumn:
-                    for (int cy = 0; cy <= 2; cy++) cells.Add(Key(gx, cy)); break;
+                    for (int cy = 0; cy <= 2; cy++) cells.Add(Key(gx, cy)); telegraph = true; break;
                 case OrderKind.DamageAll: case OrderKind.DamageSpread:
-                    foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) cells.Add(kv.Key); break;
+                    foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) cells.Add(kv.Key); telegraph = true; break;
                 case OrderKind.DamageBlast: case OrderKind.DamageFrontEach:
                     for (int lane = 0; lane < 3; lane++)
                         for (int w = 2; w >= 0; w--) { BUnit fu; if (opPs.Units.TryGetValue(Key(w, lane), out fu) && fu != null && !fu.IsCorpse) { cells.Add(Key(w, lane)); break; } }
-                    break;
+                    telegraph = true; break;
                 // own single cell (heal / strength buff / revive / resurrect)
                 case OrderKind.HealSingle: case OrderKind.StrengthBuff:
                 case OrderKind.Revive: case OrderKind.Resurrect:
@@ -1859,6 +1859,11 @@ namespace PtoServer
             }
             if (cells.Count == 0) return;
             bool isheal = (eid == 7 || eid == 8); // heal-number style only for actual heals
+            // Telegraph: obj_single_arrow_target (eid 24, at-target reticle) marks every unit that will be hit
+            // by an AoE damage effect. Queue-safe: consecutive 24s chain via can_unque_same_effect and the last
+            // releases into the damage splash. Enemy board (targetIsMine=false), no damage number.
+            if (telegraph)
+                foreach (int c in cells) SendEffect(mine, theirs, casterX, casterY, c / 10, c % 10, false, 24, false, 0);
             foreach (int c in cells) SendEffect(mine, theirs, casterX, casterY, c / 10, c % 10, targetIsMine, eid, isheal, a);
         }
 
