@@ -1763,60 +1763,56 @@ namespace PtoServer
                     .WriteU16((ushort)eid).WriteBool(isheal).WriteU8(d).Frame(Op.Effect));
         }
 
-        // Effect id per effect kind, from the user's 2026-08-12 in-game sweep (eid -> visual):
-        // 1=explosion, 2=poison, 5=lightning, 7=heal, 9/11=buff glow, 12=silence, 13=death, 14=backstab,
-        // 15=revive, 16=attack-up flex, 17=targeting preview, 18=unsummon lift, 20=resurrect(red).
-        // eids 3/4 freeze (never used). -1 = no themed effect.
+        // Effect id per effect kind. AUTHORITATIVE map from the data.win object dump (2026-08-12), NOT the
+        // earlier visual guesses. eid -> object: 1 obj_quick_fire(fire), 2 obj_single_poison, 3 obj_first_ice
+        // / 4 obj_second_ice (BOTH FREEZE standalone -> avoid; Ice uses fire), 5 obj_first_thunder(lightning),
+        // 7 obj_single_heal, 8 obj_many_heal, 9 obj_single_ress, 10 obj_many_ress, 11 obj_single_revive,
+        // 12 obj_single_haste, 13 obj_silence_intro, 14 obj_single_execute(defeat), 15 obj_single_backstab,
+        // 17 obj_single_summon, 18 obj_str_up, 19 obj_mass_str_up, 22 obj_single_polymorph, 25 obj_wild_summon.
+        // No client object exists for Shield/Decoy/Enervate/etc -> those stay -1 (no effect).
         static int EfxOf(OrderKind k)
         {
             switch (k)
             {
-                case OrderKind.DamageAll:          return 2;   // Poison cloud
-                case OrderKind.DamageColumn:       return 5;   // Thunder = lightning
-                case OrderKind.DamageLeader:       return 14;  // Backstab
+                case OrderKind.DamageAll:            return 2;   // poison
+                case OrderKind.DamageColumn:         return 5;   // thunder (lightning)
+                case OrderKind.DamageLeader:         return 15;  // backstab
                 case OrderKind.KillHero:
                 case OrderKind.FinisherKill:
-                case OrderKind.Takedown:           return 13;  // defeat
-                case OrderKind.Silence:            return 12;  // silence
-                case OrderKind.Revive:             return 15;  // revive
-                case OrderKind.Resurrect:
-                case OrderKind.ResurrectAll:       return 20;  // resurrect (red)
-                case OrderKind.StrengthBuff:
-                case OrderKind.StrengthBuffVanguard: return 16; // attack-up flex
+                case OrderKind.Takedown:             return 14;  // execute (defeat)
+                case OrderKind.Silence:              return 13;  // silence
+                case OrderKind.GainActions:          return 12;  // haste
                 case OrderKind.HealSingle:
-                case OrderKind.HealAll:
                 case OrderKind.HealLeader:
-                case OrderKind.Infusion:           return 7;   // heal glow
-                case OrderKind.ShieldHero:
-                case OrderKind.ShieldLeader:
-                case OrderKind.ShieldVanguard:
-                case OrderKind.GainActions:        // Haste
-                case OrderKind.Immortality:
-                case OrderKind.LucHaste:           return 9;   // buff glow
-                case OrderKind.Decoy:              return 11;  // mark glow (green)
+                case OrderKind.Infusion:             return 7;   // heal (single)
+                case OrderKind.HealAll:              return 8;   // heal (many)
+                case OrderKind.Revive:               return 11;  // revive
+                case OrderKind.Resurrect:            return 9;   // resurrect (single)
+                case OrderKind.ResurrectAll:         return 10;  // resurrect (many)
+                case OrderKind.StrengthBuff:         return 18;  // strength up (single)
+                case OrderKind.StrengthBuffVanguard: return 19;  // strength up (mass)
                 case OrderKind.DamageSingle:
-                case OrderKind.DamageRow:
+                case OrderKind.DamageRow:            // Fire
                 case OrderKind.DamageBlast:
                 case OrderKind.DamageRandom:
                 case OrderKind.DamageFrontEach:
-                case OrderKind.DamageIce:
+                case OrderKind.DamageIce:            // real ice (eid 3/4) freezes -> use fire
                 case OrderKind.DamageSpread:
-                case OrderKind.Backlash:           return 1;   // explosion (client has no themed fire/ice)
-                default:                           return -1;  // summon/draw/orb/control/trap/etc: no effect
+                case OrderKind.Backlash:             return 1;   // fire/explosion (no generic damage object)
+                default:                             return -1;  // no matching client effect object
             }
         }
 
         // Fire the themed op41 effect(s) for a resolved order/spell along the real caster->target path.
-        // AoE kinds fire one effect per affected cell (same-eid effects chain via can_unque_same_effect,
-        // so they don't freeze) and get an eid-17 "targeting preview" flash first. Own-target heals/buffs
-        // land on the caster's board (targetIsMine=true; isheal only for actual heals).
+        // AoE fires one effect per affected cell (same-eid effects chain via can_unque_same_effect, so they
+        // don't freeze). Own-target heals/buffs land on the caster's board (targetIsMine=true).
         static void FireEffect(OrderEffect eff, BattleSlot mine, BattleSlot theirs, Battle b, int casterX, int casterY, int gx, int enemyGy, int selfGy)
         {
             if (theirs == null) return;
             PlayerState ps = b.P[mine.P], opPs = b.P[1 - mine.P];
             int a = eff.Amount;
 
-            // Transfusion is a two-part visual: heal glow on the ally, explosion on the caster.
+            // Transfusion is a two-part visual: heal glow on the ally, fire on the caster.
             if (eff.Kind == OrderKind.Transfusion)
             {
                 SendEffect(mine, theirs, casterX, casterY, gx, selfGy, true, 7, true, a);
@@ -1828,7 +1824,7 @@ namespace PtoServer
             if (eid < 0) return;
 
             var cells = new List<int>();
-            bool targetIsMine = false, aoePreview = false;
+            bool targetIsMine = false;
             switch (eff.Kind)
             {
                 case OrderKind.DamageSingle: case OrderKind.DamageIce: case OrderKind.Backlash:
@@ -1838,35 +1834,31 @@ namespace PtoServer
                 case OrderKind.DamageLeader:
                     cells.Add(Key(1, 1)); break;
                 case OrderKind.DamageRow:
-                    for (int cx = 0; cx <= 2; cx++) cells.Add(Key(cx, enemyGy)); aoePreview = true; break;
+                    for (int cx = 0; cx <= 2; cx++) cells.Add(Key(cx, enemyGy)); break;
                 case OrderKind.DamageColumn:
-                    for (int cy = 0; cy <= 2; cy++) cells.Add(Key(gx, cy)); aoePreview = true; break;
+                    for (int cy = 0; cy <= 2; cy++) cells.Add(Key(gx, cy)); break;
                 case OrderKind.DamageAll: case OrderKind.DamageSpread:
-                    foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) cells.Add(kv.Key); aoePreview = true; break;
+                    foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) cells.Add(kv.Key); break;
                 case OrderKind.DamageBlast: case OrderKind.DamageFrontEach:
                     for (int lane = 0; lane < 3; lane++)
                         for (int w = 2; w >= 0; w--) { BUnit fu; if (opPs.Units.TryGetValue(Key(w, lane), out fu) && fu != null && !fu.IsCorpse) { cells.Add(Key(w, lane)); break; } }
-                    aoePreview = true; break;
-                // own single cell (heal / buff / revive / decoy)
-                case OrderKind.HealSingle: case OrderKind.StrengthBuff: case OrderKind.Revive:
-                case OrderKind.Resurrect: case OrderKind.ShieldHero: case OrderKind.Decoy:
+                    break;
+                // own single cell (heal / strength buff / revive / resurrect)
+                case OrderKind.HealSingle: case OrderKind.StrengthBuff:
+                case OrderKind.Revive: case OrderKind.Resurrect:
                     cells.Add(Key(gx, selfGy)); targetIsMine = true; break;
-                case OrderKind.HealLeader: case OrderKind.Infusion: case OrderKind.ShieldLeader:
-                case OrderKind.GainActions: case OrderKind.LucHaste:
+                case OrderKind.HealLeader: case OrderKind.Infusion: case OrderKind.GainActions:
                     cells.Add(Key(1, 1)); targetIsMine = true; break;
                 // own all units
                 case OrderKind.HealAll: case OrderKind.ResurrectAll:
                     foreach (var kv in ps.Units) if (kv.Value != null) cells.Add(kv.Key); targetIsMine = true; break;
                 // own vanguard
-                case OrderKind.StrengthBuffVanguard: case OrderKind.ShieldVanguard: case OrderKind.Immortality:
+                case OrderKind.StrengthBuffVanguard:
                     for (int lane = 0; lane < 3; lane++) { BUnit vu; if (ps.Units.TryGetValue(Key(2, lane), out vu) && vu != null && !vu.IsCorpse) cells.Add(Key(2, lane)); }
                     targetIsMine = true; break;
             }
             if (cells.Count == 0) return;
-            bool isheal = (eid == 7); // heal-number style only for actual heals
-
-            // Targeting preview (eid 17) on the enemy cells before the themed effect, for AoE damage.
-            if (aoePreview) foreach (int c in cells) SendEffect(mine, theirs, casterX, casterY, c / 10, c % 10, false, 17, false, 0);
+            bool isheal = (eid == 7 || eid == 8); // heal-number style only for actual heals
             foreach (int c in cells) SendEffect(mine, theirs, casterX, casterY, c / 10, c % 10, targetIsMine, eid, isheal, a);
         }
 
@@ -2119,7 +2111,6 @@ namespace PtoServer
                         if (ps.Units.TryGetValue(rk, out u) && u != null && !u.IsCorpse)
                         {
                             ps.Units.Remove(rk);
-                            SendEffect(mine, theirs, casterX, casterY, gx, selfGy, true, 18, false, 0); // lift-up (eid 18) before removal
                             SendDestroyUnit(mine, theirs, gx, selfGy);
                             AddCardToHand(mine, theirs, b, mine.P, u.Card);
                             Log("  RETREAT: " + mine.Me.User + " returned (" + gx + "," + selfGy + ") card " + u.Card + " to hand");
@@ -2136,7 +2127,6 @@ namespace PtoServer
                         {
                             // Official Unsummon: return any enemy hero to its owner's hand (no Intercept restriction).
                             opPs.Units.Remove(uk);
-                            SendEffect(mine, theirs, casterX, casterY, gx, enemyGy, false, 18, false, 0); // lift-up (eid 18) before removal
                             SendDestroyUnit(theirs, mine, gx, enemyGy);
                             AddCardToHand(theirs, mine, b, 1 - mine.P, u.Card);
                             Log("  UNSUMMON: " + mine.Me.User + " returned enemy (" + gx + "," + enemyGy + ") card " + u.Card + " to " + theirs.Me.User + "'s hand");
@@ -2251,7 +2241,7 @@ namespace PtoServer
                         {
                             ushort nc; lock (_rng) nc = PolyPool[_rng.Next(PolyPool.Length)];
                             tb.Units.Remove(pk);
-                            SendEffect(mine, theirs, casterX, casterY, gx, y, targetSelf, 18, false, 0); // lift-up (eid 18) before transform
+                            SendEffect(mine, theirs, casterX, casterY, gx, y, targetSelf, 22, false, 0); // obj_single_polymorph
                             SendDestroyUnit(tOwner, tOpp, gx, y);
                             PlaceUnit(tOwner, tOpp, b, nc, gx, y, 0, false);
                             Log("  POLYMORPH: " + (targetSelf ? "own" : "enemy") + " (" + gx + "," + y + ") -> card " + nc);
