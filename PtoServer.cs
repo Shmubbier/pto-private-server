@@ -172,6 +172,8 @@ namespace PtoServer
         Mercy           = 2048,  // when it deals attack damage, heals a RANDOM damaged friendly hero by that much
         DoubleAttack    = 4096,  // makes its melee attack twice
         Reflect         = 8192,  // reflects attack damage it takes back to the attacker
+        FreeAttack      = 16384, // "Free Attack" / Quick Attack: its basic attacks do NOT cost an action
+                                 // (official Quick = "does not consume an action"); still exhausts (once/wave)
     }
 
     class Program
@@ -497,6 +499,7 @@ namespace PtoServer
             if (p.Mercy)           a |= UnitAbility.Mercy;
             if (p.DoubleAttack)    a |= UnitAbility.DoubleAttack;
             if (p.Reflect)         a |= UnitAbility.Reflect;
+            if (p.FreeAttack)      a |= UnitAbility.FreeAttack;
             if (IsRangedAtWave(card, wave)) a |= UnitAbility.RangedAttack;
             return a;
         }
@@ -506,7 +509,7 @@ namespace PtoServer
         // Vanguard: prefix — those are auras, a later tier). Strength here folds in "Melee Strength"
         // (nearly all our melee units), so it's added to the unit's attack stat. Armor is flat damage
         // reduction. Intercept/Counter are combat flags. wave index: 2=Vanguard, 1=Flank, 0=Rear.
-        struct SelfPassive { public bool Intercept; public bool Counter; public bool HeroKiller; public bool Vamp; public bool Deathproof; public bool Ephemeral; public bool RImmunity; public bool InterceptKiller; public bool Swift; public bool Incorporeal; public bool Mercy; public bool DoubleAttack; public bool Reflect; public CoverType Cover; public int Strength; public int Armor; public int Regen; public int Finisher; public int RevengeStrength; }
+        struct SelfPassive { public bool Intercept; public bool Counter; public bool HeroKiller; public bool Vamp; public bool Deathproof; public bool Ephemeral; public bool RImmunity; public bool InterceptKiller; public bool Swift; public bool Incorporeal; public bool Mercy; public bool DoubleAttack; public bool Reflect; public bool FreeAttack; public CoverType Cover; public int Strength; public int Armor; public int Regen; public int Finisher; public int RevengeStrength; }
         static readonly SelfPassive[,] _passive = BuildPassives();
         static SelfPassive[,] BuildPassives()
         {
@@ -563,6 +566,9 @@ namespace PtoServer
             p[81, 2].DoubleAttack = true; // Twinblade Vanguard
             // -- Reflect Damage (reflects damage taken back to attacker) --
             p[87, 2].Reflect = true; // Reflector Vanguard
+            // -- Free Attack (Quick Attack: basic attacks cost no action; still exhausts once/wave) --
+            p[91, 1].FreeAttack = true; // Commando Flank:   "Free Attack"
+            p[93, 2].FreeAttack = true; // Pistolier Vanguard: "Free Attack, R. Attack"
             // -- Regen N (heal N at end of each of your turns) --
             p[67, 2].Regen = 2; // Sage Vanguard: "Intercept, Regen 2"
             // -- Finisher N (this hero's attack deals +N to an ALREADY-damaged hero) --
@@ -3260,6 +3266,11 @@ namespace PtoServer
             if (!attackerIsLeader && attacker.RecruitedThisWave && (attacker.Abilities & UnitAbility.Swift) == 0)
             { Log("ATTACK rejected: attacker was recruited this wave"); GrantAction(mine); return; }
 
+            // Free Attack (Quick Attack): this hero's basic attacks do NOT cost an action. The unit still
+            // exhausts (HasAttackedThisWave), so it attacks only once/wave -- this just refunds the action.
+            bool freeAtk = !attackerIsLeader && (attacker.Abilities & UnitAbility.FreeAttack) != 0;
+            if (freeAtk) Log("  FREE ATTACK: (" + ax + "," + ay + ") attacks without spending an action");
+
             // TRAP — Cancel Attack: if the defender armed one (round >= 2), negate this attack before any
             // targeting resolves. The attacker still spends its action. Reflector's trap also BACKLASHES
             // the attacker: it takes damage equal to its own attack. This can defeat the attacker (or the
@@ -3306,7 +3317,7 @@ namespace PtoServer
                         Send(mine.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
                         return;
                     }
-                    ConsumeAction(mine, theirs, b);
+                    if (freeAtk) GrantAction(mine); else ConsumeAction(mine, theirs, b);
                     return;
                 }
             }
@@ -3560,8 +3571,9 @@ namespace PtoServer
             }
 
             // Swift (official) only lets a hero act the turn it's summoned (summon-sickness bypass handled
-            // above) — the attack still costs an action, like any other.
-            ConsumeAction(mine, theirs, b);
+            // above) — the attack still costs an action, like any other. Free Attack (Quick Attack) is the
+            // exception: the attack is refunded (no action spent); the unit still exhausts for the wave.
+            if (freeAtk) GrantAction(mine); else ConsumeAction(mine, theirs, b);
         }
 
         // Melee: can the attacker target the leader at (1,1)?
