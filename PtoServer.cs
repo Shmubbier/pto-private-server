@@ -2709,6 +2709,15 @@ namespace PtoServer
                 case 19: return new OrderEffect { Kind = OrderKind.LucHaste, Free = true };      // Luc Von Gott: apply 1 dmg to leader, gain 2 actions
                 case 21: return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 };         // Khadath: Banish 1 (once/turn — client-gated)
                 case 23: return new OrderEffect { Kind = OrderKind.RaiseDead, Amount = 3 };      // Hepzibah: cast Raise Dead
+                // ---- gen-2 leader actives (same isSpell path; f_spell=4/5 makes the client always offer the
+                //      cast). Mapped to existing effects; minor riders noted (leader life/str cost, discard) TODO.
+                case 70: return new OrderEffect { Kind = OrderKind.ShieldHero, Free = true };    // Merjoram: Quick: give a hero Shield (rider: -2 leader life TODO)
+                case 73: return new OrderEffect { Kind = OrderKind.Phantom, Amount = 1 };        // Luca: cast Phantom (return a random discard to hand)
+                case 74: return new OrderEffect { Kind = OrderKind.FinisherKill, Free = true };  // Rayne: Quick: defeat a DAMAGED enemy hero (rider: discard a random card TODO)
+                case 77: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2 };   // Ivo: give a hero Strength 2 (passive +Str/hero is a separate aura TODO)
+                case 79: return new OrderEffect { Kind = OrderKind.Polymorph };                  // Riflam: transform target hero into a random hero (new hero enters full-life)
+                case 99: return new OrderEffect { Kind = OrderKind.Silence };                    // Baenvier: Silence an enemy hero (rider: +1 leader Strength TODO)
+                case 111:return new OrderEffect { Kind = OrderKind.OrbBoost, Amount = 1 };        // Malandrax: gain an orb (rider: discard a random card + 6-orb cap TODO)
                 case 28: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 5 }; break; // Berserker R: Bombard 5 (random)
                 case 29: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 4 };        // Assassin V: Backstab 4 (leader)
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 2 }; break; // Assassin R: Backstab 2 (leader)
