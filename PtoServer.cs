@@ -548,6 +548,8 @@ namespace PtoServer
             p[96, 1].Cover = CoverType.Leader;     // Squire  Flank: Cover: Leader
             p[96, 0].Cover = CoverType.Forerunner; // Squire  Rear:  Cover: Forerunner
             p[98, 1].Cover = CoverType.Forerunner; // White Knight Flank: Cover: Forerunner
+            p[40, 1].Cover = CoverType.Forerunner; // Paladin Flank:  Forerunner: Cover
+            p[53, 1].Cover = CoverType.Forerunner; // Water Elemental Flank: Forerunner: Cover
 
             // -- R.Immunity (cannot be targeted by ranged) --
             p[48, 2].RImmunity = true; // Trapper Vanguard: "Intercept, R.Immunity"
@@ -625,6 +627,7 @@ namespace PtoServer
                 case 37: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2, Armor = 1 }); break; // Mystic F
                 case 41: if (wave == 1) { list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.RangedAttack });
                                           list.Add(new Aura { Target = AuraTarget.Supporter, Grant = UnitAbility.RangedAttack }); } break; // Planestalker F
+                case 43: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.RangedAttack }); break; // Pyromancer F: Forerunner: R.Attack
                 case 48: if (wave == 1) { list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.Intercept });
                                           list.Add(new Aura { Target = AuraTarget.Supporter, Grant = UnitAbility.RangedAttack }); } break; // Trapper F
                 case 57: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Armor = 2 });
@@ -637,7 +640,11 @@ namespace PtoServer
                 case 66: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Unit, Strength = 1 });
                          if (wave == 2) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Deathproof }); break; // Relic Hunter F / V
                 case 80: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2 }); break; // Warrior F
-                case 83: if (wave == 0) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Intercept }); break; // Defender R
+                case 81: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.DoubleAttack }); break; // Twinblade F: Forerunner: Double Attack
+                case 83: if (wave == 0) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Intercept });
+                         if (wave == 1) list.Add(new Aura { Target = AuraTarget.Leader, Armor = 2 }); break; // Defender R: Vanguard Intercept / F: Leader Armor 2
+                case 86: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Vanguard, Grant = UnitAbility.Deathproof }); break; // Lancer F: Vanguard: Deathproof
+                case 109:if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.Deathproof }); break; // Druid F: Forerunner: Deathproof
                 case 94: if (wave == 0) list.Add(new Aura { Target = AuraTarget.Forerunner, Strength = 2 }); break; // Magus R
                 case 87: if (wave == 1) list.Add(new Aura { Target = AuraTarget.Forerunner, Grant = UnitAbility.Reflect }); break; // Reflector F: Forerunner: Reflect Damage
                 case 106:if (wave == 1) list.Add(new Aura { Target = AuraTarget.Leader, Grant = UnitAbility.Reflect }); break;     // Statistician F: Leader: Reflect Damage
