@@ -1769,7 +1769,10 @@ namespace PtoServer
         // 7 obj_single_heal, 8 obj_many_heal, 9 obj_single_ress, 10 obj_many_ress, 11 obj_single_revive,
         // 12 obj_single_haste, 13 obj_silence_intro, 14 obj_single_execute(defeat), 15 obj_single_backstab,
         // 17 obj_single_summon, 18 obj_str_up, 19 obj_mass_str_up, 22 obj_single_polymorph, 25 obj_wild_summon.
-        // No client object exists for Shield/Decoy/Enervate/etc -> those stay -1 (no effect).
+        // Shield/Silence/Decoy are NOT op41 effects -> they're persistent per-hero flags in the buff packet
+        // (BuildBuff/anim_update_buff): the client draws spr_eff_shield/spr_eff_silenced/spr_decoy while the
+        // flag is set and auto-spawns obj_shield_break (spr_eff_shield_break) when shield flips 1->0. So they
+        // stay -1 here (SyncUnitStates carries them). Enervate/etc genuinely have no visual.
         static int EfxOf(OrderKind k)
         {
             switch (k)
@@ -1781,7 +1784,8 @@ namespace PtoServer
                 case OrderKind.FinisherKill:
                 case OrderKind.Takedown:             return 14;  // execute (defeat)
                 case OrderKind.Silence:              return 13;  // silence
-                case OrderKind.GainActions:          return 12;  // haste
+                case OrderKind.GainActions:
+                case OrderKind.LucHaste:             return 12;  // haste (spr_single_haste)
                 case OrderKind.HealSingle:
                 case OrderKind.HealLeader:
                 case OrderKind.Infusion:             return 7;   // heal (single)
@@ -1848,6 +1852,7 @@ namespace PtoServer
                 case OrderKind.Revive: case OrderKind.Resurrect:
                     cells.Add(Key(gx, selfGy)); targetIsMine = true; break;
                 case OrderKind.HealLeader: case OrderKind.Infusion: case OrderKind.GainActions:
+                case OrderKind.LucHaste:
                     cells.Add(Key(1, 1)); targetIsMine = true; break;
                 // own all units
                 case OrderKind.HealAll: case OrderKind.ResurrectAll:
