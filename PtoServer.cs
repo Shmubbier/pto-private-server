@@ -1724,6 +1724,20 @@ namespace PtoServer
                 case 87: return new OrderEffect { Kind = OrderKind.TrapCancelAttack };          // Reflector: Trap: Cancel Attack, Backlash
                 case 106:return new OrderEffect { Kind = OrderKind.TrapCancelSpell };            // Statistician: Trap: Cancel Spell, Draw 1
                 case 112:return new OrderEffect { Kind = OrderKind.TrapCancelOrder };            // Mastermind: Trap: Cancel Order
+                case 37: return new OrderEffect { Kind = OrderKind.DrawCards,   Amount = 3 };    // Mystic: Draw 3
+                case 40: return new OrderEffect { Kind = OrderKind.Revive, Free = true };        // Paladin: Quick Order: Revive
+                case 59: return new OrderEffect { Kind = OrderKind.Resurrect };                  // Ghost (59): Resurrect
+                case 80: return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 4 };    // Warrior: Cure 4 (Strength Buff 2 rider omitted)
+                case 81: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2 };   // Twinblade: Strength Buff 2 (Inspire rider omitted)
+                case 89: return new OrderEffect { Kind = OrderKind.Inspire };                    // Legionnaire: Inspire
+                case 90: return new OrderEffect { Kind = OrderKind.HealLeader,  Amount = 5 };    // Nurse: Cure Leader 5
+                case 91: return new OrderEffect { Kind = OrderKind.GainActions, Amount = 1, Free = true }; // Commando: Quick Order: Haste 1
+                case 92: return new OrderEffect { Kind = OrderKind.DrawCards,   Amount = 2 };    // Treasure Hunter: Draw 2
+                case 93: return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 6 };   // Pistolier: Bombard 6
+                case 97: return new OrderEffect { Kind = OrderKind.RaiseDead,   Amount = 3 };    // Dark Knight: Raise Dead x3
+                case 98: return new OrderEffect { Kind = OrderKind.Resurrect };                  // White Knight: Resurrect
+                case 114:return new OrderEffect { Kind = OrderKind.Resurrect };                  // Ghost (114): Resurrect
+                case 115:return new OrderEffect { Kind = OrderKind.DamageAll,   Amount = 1 };    // Plague Doctor: Poison 1 (all)
                 default: return new OrderEffect { Kind = OrderKind.None };
             }
         }
@@ -2799,7 +2813,8 @@ namespace PtoServer
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.Inspire }; break;          // Oracle R: Inspire
                 case 36: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Mascot V: Cure 4
                          return new OrderEffect { Kind = OrderKind.Inspire };                                       // Mascot F/R: Inspire
-                case 37: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 }; break; // Mystic V: Cure 4
+                case 37: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Mystic V: Cure 4
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DrawCards,    Amount = 1, Free = true }; break; // Mystic R: Quick Draw 1
                 case 39: if (wave == 1 || wave == 0) return new OrderEffect { Kind = OrderKind.Inspire }; break;     // Overlord F/R: Inspire
                 case 42: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 4 };        // Priestess V: Cure 4
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.HealLeader,   Amount = 2 };        // Priestess F: Cure Leader 2
@@ -2816,7 +2831,8 @@ namespace PtoServer
                 case 53: if (wave == 0) return new OrderEffect { Kind = OrderKind.HealSingle,   Amount = 3 }; break; // Water Elem R: Cure 3
                 case 56: if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageColumn, Amount = 2 }; break; // Lightning Elem F: Thunder 2 (column)
                 case 48: if (wave == 0) return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 }; break;      // Trapper R: Banish 1
-                case 69: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 7 }; break; // Warmage R: Meteor 7 (single hero)
+                case 69: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSingle, Amount = 7 };        // Warmage R: Meteor 7 (single hero)
+                         if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageFrontEach, Amount = 5 }; break; // Warmage V: Blast 5 (front of each row)
                 case 86: if (wave == 0) return new OrderEffect { Kind = OrderKind.FinisherKill }; break;            // Lancer R: Finisher Kill
                 case 87: if (wave == 0) return new OrderEffect { Kind = OrderKind.Backlash }; break;                // Reflector R: Backlash
                 case 104:if (wave == 2) return new OrderEffect { Kind = OrderKind.Scry, Amount = 2, Free = true };  // Magic Student V: Quick Scry 2
@@ -2835,25 +2851,49 @@ namespace PtoServer
                 case 64: if (wave == 0) return new OrderEffect { Kind = OrderKind.Swap, Free = true };              // Doppelganger R: Quick Swap
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.Replicate };                       // Doppelganger F: Replicate
                          if (wave == 2) return new OrderEffect { Kind = OrderKind.Copycat, Free = true }; break;     // Doppelganger V: Quick Copycat
-                case 97: if (wave == 0) return new OrderEffect { Kind = OrderKind.Takedown }; break;                // Dark Knight R: Takedown
+                case 97: if (wave == 0) return new OrderEffect { Kind = OrderKind.Takedown };                       // Dark Knight R: Takedown
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageRow, Amount = 3 }; break;   // Dark Knight F: Fire 3
                 case 27: if (wave == 2) return new OrderEffect { Kind = OrderKind.KillHero }; break;                // Dragon Mage V: Execute (defeat a hero)
-                case 68: if (wave == 1) return new OrderEffect { Kind = OrderKind.KillHero }; break;                // Sniper F: Execute
+                case 68: if (wave == 1) return new OrderEffect { Kind = OrderKind.KillHero };                       // Sniper F: Execute
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 }; break;      // Sniper R: Banish
                 case 62: if (wave == 2) return new OrderEffect { Kind = OrderKind.Enervate, Amount = 3 };            // Diabloist V: Enervate 3 (-3 attack to an enemy hero)
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.Seance };                          // Diabloist F: Seance
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.Entomb, Amount = 1 }; break;       // Diabloist R: Entomb
-                case 60: if (wave == 2) return new OrderEffect { Kind = OrderKind.Infusion, Amount = 3 }; break;    // Chronicler V: Infusion (leader +N, this hero -N)
-                case 88: if (wave == 2 || wave == 1) return new OrderEffect { Kind = OrderKind.Polymorph }; break;  // Biomancer V/F: Polymorph
+                case 60: if (wave == 2) return new OrderEffect { Kind = OrderKind.Infusion, Amount = 3 };           // Chronicler V: Infusion (leader +N, this hero -N)
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.HealLeader, Amount = 2 }; break;  // Chronicler R: Cure Leader 2
+                case 88: if (wave == 2 || wave == 1) return new OrderEffect { Kind = OrderKind.Polymorph };         // Biomancer V/F: Polymorph
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.SummonRandom, Amount = 1 }; break; // Biomancer R: Summon
                 case 106:if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageSpread, Amount = 7 };        // Statistician R: Meteor Storm 7 (X divided randomly)
                          if (wave == 2) return new OrderEffect { Kind = OrderKind.HealLeader, Amount = 3 }; break;  // Statistician V: Infuse Leader 3
-                case 114:if (wave == 1) return new OrderEffect { Kind = OrderKind.Copycat }; break;                 // Ghost F: Copycat
+                case 114:if (wave == 1) return new OrderEffect { Kind = OrderKind.Copycat };                        // Ghost(114) F: Copycat
+                         if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 3 };        // Ghost(114) V: Backstab 3
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DrawCards, Amount = 2 }; break;    // Ghost(114) R: Draw 2
                 case 33: if (wave == 0) return new OrderEffect { Kind = OrderKind.Transfusion }; break;              // Homunculus R: Transfusion (heal all dmg from an ally, caster takes it)
-                case 65: if (wave == 2) return new OrderEffect { Kind = OrderKind.MindControl }; break;              // Puppeteer V: Mind Control (swap + steal an enemy hero)
+                case 65: if (wave == 2) return new OrderEffect { Kind = OrderKind.MindControl };                     // Puppeteer V: Mind Control (swap + steal an enemy hero)
+                         if (wave == 1 || wave == 0) return new OrderEffect { Kind = OrderKind.Inspire }; break;     // Puppeteer F/R: Inspire
                 case 110:if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 6 };         // Occultist V: Bombard 6
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 3 };        // Occultist F: Backstab 3
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.Phantom, Amount = 1 }; break;      // Occultist R: Phantom
                 case 95: if (wave == 2) return new OrderEffect { Kind = OrderKind.DrawCards, Amount = 2 };           // Bannerman V: Draw 2
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.Restructure };                     // Bannerman F: Restructure
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DrawCards, Amount = 1, Free = true }; break; // Bannerman R: Quick Draw 1
+                case 40: if (wave == 0) return new OrderEffect { Kind = OrderKind.HealAll,     Amount = 2 }; break;   // Paladin R: Cure All 2
+                case 49: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 2 }; break;  // Vampire R: Backstab 2 (Cure Leader 2 omitted)
+                case 55: if (wave == 0) return new OrderEffect { Kind = OrderKind.Banish,      Amount = 1 }; break;   // Dark Elemental R: Banish 1
+                case 59: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 3 };         // Ghost(59) V: Backstab 3
+                         if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageAll,   Amount = 2 };          // Ghost(59) F: Poison 2
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DrawCards,   Amount = 2 }; break;   // Ghost(59) R: Draw 2
+                case 63: if (wave == 2) return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 4 }; break;   // Divinity V: Cure 4
+                case 67: if (wave == 1) return new OrderEffect { Kind = OrderKind.Unsummon };                         // Sage F: Unsummon
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRow,   Amount = 3 }; break;   // Sage R: Fire 3
+                case 89: if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageColumn, Amount = 2 }; break;  // Legionnaire F: Thunder 2
+                case 90: if (wave == 1) return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 2, Free = true };   // Nurse F: Quick Cure 2
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 4, Free = true }; break; // Nurse R: Quick Cure 4
+                case 98: if (wave == 0) return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 4 }; break;   // White Knight R: Cure 4
+                case 109:if (wave == 0) return new OrderEffect { Kind = OrderKind.Revive }; break;                    // Druid R: Revive
+                case 113:if (wave == 0) return new OrderEffect { Kind = OrderKind.Banish,      Amount = 1 }; break;   // Shadow Elemental R: Banish 1
+                case 115:if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageAll,   Amount = 3 };          // Plague Doctor F: Poison 3
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 3 }; break;   // Plague Doctor R: Cure 3
             }
             return new OrderEffect { Kind = OrderKind.None };
         }
