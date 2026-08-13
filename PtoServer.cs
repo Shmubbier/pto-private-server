@@ -609,8 +609,32 @@ namespace PtoServer
         // A source at (sx,sy) projects each aura onto a set of recipient cells:
         //   Forerunner -> (sx+1,sy)   Supporter -> (sx-1,sy)   Vanguard -> all (2,*)   Rear -> all (0,*)
         //   Unit -> all your heroes + leader   Leader -> the leader (1,1)
-        enum AuraTarget : byte { Forerunner, Supporter, Vanguard, Rear, Unit, Leader }
+        internal enum AuraTarget : byte { Forerunner, Supporter, Vanguard, Rear, Unit, Leader }
         struct Aura { public AuraTarget Target; public int Strength; public int Armor; public UnitAbility Grant; }
+
+        // A persistent "Ongoing: <region>: <effect>" operation (o_type 1), reserved face-up in a lane. Unlike
+        // the hero auras (which come from a hero at a cell), an ongoing is board-global and lasts the game.
+        internal struct OngoingOp { public AuraTarget Target; public int Strength; public int Armor; public int Regen; public UnitAbility Grant; public ushort Card; public int Lane; }
+
+        // Map an operation card to its ongoing aura (region + bonus). Returns false if the card is not an
+        // ongoing operation. Cards (o_type 1): Templar/Earth Elem Unit:Armor2, Vampire Unit:Vamp, Adventure
+        // Ranger Unit:MeleeStr2, Sage Unit:Regen2, Sniper Rear:R.Attack, Defender Vanguard:Intercept, Druid
+        // Unit:Deathproof. (Curse Knight's Immortality is a separate wave-limited op, handled on its own.)
+        static bool TryOngoingOp(ushort card, out OngoingOp op)
+        {
+            op = new OngoingOp { Card = card, Lane = -1 };
+            switch (card / 2)
+            {
+                case 47: case 57: op.Target = AuraTarget.Unit; op.Armor = 2; return true;               // Templar / Earth Elemental: Ongoing Unit: Armor 2
+                case 49: op.Target = AuraTarget.Unit; op.Grant = UnitAbility.Vamp; return true;          // Vampire: Ongoing Unit: Vamp
+                case 58: op.Target = AuraTarget.Unit; op.Strength = 2; return true;                      // Adventure Ranger: Ongoing Unit: Melee Strength 2
+                case 67: op.Target = AuraTarget.Unit; op.Regen = 2; return true;                         // Sage: Ongoing Unit: Regen 2
+                case 68: op.Target = AuraTarget.Rear; op.Grant = UnitAbility.RangedAttack; return true;  // Sniper: Ongoing Rear: R. Attack
+                case 83: op.Target = AuraTarget.Vanguard; op.Grant = UnitAbility.Intercept; return true; // Defender: Ongoing Vanguard: Intercept
+                case 109: op.Target = AuraTarget.Unit; op.Grant = UnitAbility.Deathproof; return true;   // Druid: Ongoing Unit: Deathproof
+            }
+            return false;
+        }
 
         // Aura sources by card+wave. R.Immunity / Cover-grant auras are omitted (no underlying ability yet).
         static List<Aura> AurasOf(ushort card, int wave)
@@ -686,6 +710,15 @@ namespace PtoServer
             }
             // 2.5 Leader passive grants that apply to ALL your heroes (a leader-wide aura).
             ApplyLeaderUnitGrants(ps);
+            // 2.6 Ongoing operations (persistent region auras placed in reserve). Regen is applied in
+            // ApplyRegen, not here (it isn't a combat stat). Source cell is irrelevant for Unit/Vanguard/Rear.
+            foreach (var op in ps.Ongoing)
+                foreach (int rk in AuraRecipients(op.Target, 0, 0, ps))
+                {
+                    if (rk < 0) { ps.LeaderArmorBonus += op.Armor; ps.LeaderStrBonus += op.Strength; ps.LeaderAbilities |= op.Grant; continue; }
+                    BUnit r; if (!ps.Units.TryGetValue(rk, out r) || r == null || r.IsCorpse) continue;
+                    r.Strength += op.Strength; r.Atk += op.Strength; r.Armor += op.Armor; r.Abilities |= op.Grant;
+                }
             // 3. Silence: a silenced hero loses ALL innate abilities + applied status (auras, Str buff,
             // Shield) — only its base attack remains. Applied last so nothing above leaks through.
             foreach (var kv in ps.Units)
@@ -1019,6 +1052,7 @@ namespace PtoServer
             // Ongoing effects.
             public int ImmortalWaves;    // >0: your VANGUARD (grid_x==2) heroes can't die by any means; decrements each wave (Curse Knight order)
             public int ImmortalLane = -1; // reserve lane holding the face-up Immortality operation card (-1 = none)
+            public List<OngoingOp> Ongoing = new List<OngoingOp>(); // persistent unit/region auras (o_type 1 operations), one per reserve lane
             public bool RestructureFree; // this turn, MOVE and CLEAR CORPSE cost no action (Homunculus/Bannerman); cleared at end of your turn
             public bool OrderedThisTurn; // has an order been played this turn (for Tatsumi's first-order-per-turn passive)
             public int LeaderPermStr;    // Star Knight Iri: +1 leader attack per own hero defeated (persistent)
@@ -3125,11 +3159,13 @@ namespace PtoServer
             OrderEffect eff = OrderOf(card);
             bool isTrap = eff.Kind == OrderKind.TrapCancelAttack || eff.Kind == OrderKind.TrapCancelSpell || eff.Kind == OrderKind.TrapCancelOrder;
             bool isImmortality = eff.Kind == OrderKind.Immortality; // an Operation (o_type 1), played face-up to reserve
-            if (!isTrap && !isImmortality)
+            OngoingOp ongoing; bool isOngoing = TryOngoingOp(card, out ongoing); // persistent region-aura operation
+            if (!isTrap && !isImmortality && !isOngoing)
             { Log("RESERVE rejected: card " + card + " is not a trap or operation"); GrantAction(mine); return; }
 
             // One reserve card per lane.
-            if (ps.TrapAttackLane == lane || ps.TrapSpellLane == lane || ps.TrapOrderLane == lane || ps.ImmortalLane == lane)
+            bool ongoingLaneTaken = false; foreach (var o in ps.Ongoing) if (o.Lane == lane) { ongoingLaneTaken = true; break; }
+            if (ps.TrapAttackLane == lane || ps.TrapSpellLane == lane || ps.TrapOrderLane == lane || ps.ImmortalLane == lane || ongoingLaneTaken)
             { Log("RESERVE rejected: lane " + lane + " already occupied"); GrantAction(mine); return; }
 
             // Orb cost (same as the client gate).
@@ -3139,17 +3175,28 @@ namespace PtoServer
             { BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine; if (q0 != null && q1 != null) SendOrbs(q0, q1, b); }
 
             // Arm the effect + remember its reserve lane. Traps are hidden (face-down); operations (the
-            // Immortality "Ongoing") are visible (face-up).
+            // Immortality "Ongoing" and the region auras) are visible (face-up).
             bool faceDown;
-            switch (eff.Kind)
+            if (isTrap)
             {
-                case OrderKind.TrapCancelAttack: ps.TrapCancelAttack = true; ps.TrapAttackLane = lane; faceDown = true; break;
-                case OrderKind.TrapCancelSpell:  ps.TrapCancelSpell  = true; ps.TrapSpellLane  = lane; faceDown = true; break;
-                case OrderKind.TrapCancelOrder:  ps.TrapCancelOrder  = true; ps.TrapOrderLane  = lane; faceDown = true; break;
-                default: // Immortality
-                    ps.ImmortalWaves = 3; ps.ImmortalLane = lane; faceDown = false;
-                    Log("  IMMORTALITY: " + mine.Me.User + "'s vanguard heroes can't die for 3 waves");
-                    break;
+                switch (eff.Kind)
+                {
+                    case OrderKind.TrapCancelAttack: ps.TrapCancelAttack = true; ps.TrapAttackLane = lane; break;
+                    case OrderKind.TrapCancelSpell:  ps.TrapCancelSpell  = true; ps.TrapSpellLane  = lane; break;
+                    case OrderKind.TrapCancelOrder:  ps.TrapCancelOrder  = true; ps.TrapOrderLane  = lane; break;
+                }
+                faceDown = true;
+            }
+            else if (isImmortality)
+            {
+                ps.ImmortalWaves = 3; ps.ImmortalLane = lane; faceDown = false;
+                Log("  IMMORTALITY: " + mine.Me.User + "'s vanguard heroes can't die for 3 waves");
+            }
+            else // ongoing region-aura operation (persistent)
+            {
+                ongoing.Lane = lane; ps.Ongoing.Add(ongoing); faceDown = false;
+                Log("  ONGOING: " + mine.Me.User + " placed " + ongoing.Target + " aura (str+" + ongoing.Strength
+                    + " armor+" + ongoing.Armor + " regen+" + ongoing.Regen + " grant=" + ongoing.Grant + ") card " + card);
             }
 
             // Discard the played card from hand (op12 to owner, op13 count to opponent).
@@ -3164,10 +3211,10 @@ namespace PtoServer
             if (theirs != null)
                 Send(theirs.Me.Ns, new PacketWriter().WriteU16(card).WriteU8(3).WriteU8((byte)lane).WriteBool(faceDown).Frame(Op.SummonUnitGet));
 
-            Log((isTrap ? "TRAP PLACED: " : "OPERATION PLACED: ") + mine.Me.User + " -> " + eff.Kind + " in reserve lane " + lane + " (card " + card + ")");
+            Log((isTrap ? "TRAP PLACED: " : "OPERATION PLACED: ") + mine.Me.User + " -> " + (isTrap ? eff.Kind.ToString() : "operation") + " in reserve lane " + lane + " (card " + card + ")");
             ConsumeAction(mine, theirs, b);
-            // Immortality takes effect immediately — refresh so vanguard units show the immort icon + are protected.
-            if (isImmortality)
+            // Operations take effect immediately — refresh so units show the new stats/abilities/protection.
+            if (isImmortality || isOngoing)
             { BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine; if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b); }
         }
 
@@ -4022,12 +4069,22 @@ namespace PtoServer
             {
                 BUnit u = kv.Value; if (u == null || u.IsCorpse) continue;
                 int regen = PassiveOf(u.Card, kv.Key / 10).Regen;
+                // Ongoing "Unit/Rear: Regen N" operations add to this hero's regen (Sage: Unit: Regen 2).
+                foreach (var op in ps.Ongoing) if (op.Regen > 0 && OngoingHits(op.Target, kv.Key, ps)) regen += op.Regen;
                 if (regen > 0 && u.Damage > 0)
                 {
                     u.Damage = Math.Max(0, u.Damage - regen);
                     Log("  REGEN: (" + (kv.Key / 10) + "," + (kv.Key % 10) + ") card " + u.Card + " heals " + regen);
                 }
             }
+        }
+
+        // Does an ongoing op with region `t` cover the cell `key` on ps's board? (Source-independent for
+        // Unit/Vanguard/Rear — the only regions ongoing operations use.)
+        static bool OngoingHits(AuraTarget t, int key, PlayerState ps)
+        {
+            foreach (int rk in AuraRecipients(t, 0, 0, ps)) if (rk == key) return true;
+            return false;
         }
 
         // Mercy: whenever this hero deals attack damage, remove `dealt` damage from a RANDOM damaged
