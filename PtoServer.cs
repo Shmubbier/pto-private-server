@@ -1765,7 +1765,7 @@ namespace PtoServer
 
         // Effect id per effect kind. AUTHORITATIVE map from the data.win object dump (2026-08-12), NOT the
         // earlier visual guesses. eid -> object: 1 obj_quick_fire(fire), 2 obj_single_poison, 3 obj_first_ice
-        // / 4 obj_second_ice (BOTH FREEZE standalone -> avoid; Ice uses fire), 5 obj_first_thunder(lightning),
+        // / 4 obj_second_ice (both RELEASE the queue; Ice handled specially in FireEffect), 5 obj_first_thunder,
         // 7 obj_single_heal, 8 obj_many_heal, 9 obj_single_ress, 10 obj_many_ress, 11 obj_single_revive,
         // 12 obj_single_haste, 13 obj_silence_intro, 14 obj_single_execute(defeat), 15 obj_single_backstab,
         // 17 obj_single_summon, 18 obj_str_up, 19 obj_mass_str_up, 22 obj_single_polymorph, 25 obj_wild_summon.
@@ -1800,7 +1800,6 @@ namespace PtoServer
                 case OrderKind.DamageBlast:
                 case OrderKind.DamageRandom:
                 case OrderKind.DamageFrontEach:
-                case OrderKind.DamageIce:            // real ice (eid 3/4) freezes -> use fire
                 case OrderKind.DamageSpread:
                 case OrderKind.Backlash:             return 1;   // fire/explosion (no generic damage object)
                 default:                             return -1;  // no matching client effect object
@@ -1824,6 +1823,22 @@ namespace PtoServer
                 return;
             }
 
+            // Ice N (target + 4 orthogonal neighbours): obj_first_ice (eid 3) on the primary target,
+            // obj_second_ice (eid 4) on each adjacent enemy hero. Both release the queue (first_ice calls
+            // can_unque_damage unconditionally; the second_ice group chains via can_unque_same_effect).
+            if (eff.Kind == OrderKind.DamageIce)
+            {
+                SendEffect(mine, theirs, casterX, casterY, gx, enemyGy, false, 3, false, a);
+                int[] ax = { gx - 1, gx + 1, gx, gx }, ay = { enemyGy, enemyGy, enemyGy - 1, enemyGy + 1 };
+                for (int i = 0; i < 4; i++)
+                {
+                    if (ax[i] < 0 || ax[i] > 2 || ay[i] < 0 || ay[i] > 2) continue;
+                    BUnit nu; if (opPs.Units.TryGetValue(Key(ax[i], ay[i]), out nu) && nu != null && !nu.IsCorpse)
+                        SendEffect(mine, theirs, casterX, casterY, ax[i], ay[i], false, 4, false, a);
+                }
+                return;
+            }
+
             int eid = EfxOf(eff.Kind);
             if (eid < 0) return;
 
@@ -1831,7 +1846,7 @@ namespace PtoServer
             bool targetIsMine = false, telegraph = false;
             switch (eff.Kind)
             {
-                case OrderKind.DamageSingle: case OrderKind.DamageIce: case OrderKind.Backlash:
+                case OrderKind.DamageSingle: case OrderKind.Backlash:
                 case OrderKind.KillHero: case OrderKind.FinisherKill: case OrderKind.Takedown:
                 case OrderKind.Silence: case OrderKind.DamageRandom:
                     cells.Add(Key(gx, enemyGy)); break;
