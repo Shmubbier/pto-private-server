@@ -991,7 +991,8 @@ namespace PtoServer
             public List<ushort> PhantomCards = new List<ushort>(); // card ids added by Phantom this turn: printed life = 1, vanish from hand at end of turn
             public List<ushort> PendingScry = null; // cards pulled off the top of the deck for an open Scry UI, awaiting the op51 pick
             public int ActionsRemaining;
-            public int Orbs;  // order resource: +1 each round, capped at OrbMax; spent on orders
+            public int Orbs;  // order resource: +1 each round, capped at OrbCap; spent on orders
+            public int OrbCap = 3;  // max orbs (OrbMax default; Malandrax raises his own to 6)
             public int LeaderArmorBonus; // from "Leader: Armor N" auras (recomputed each RecomputeAuras)
             public int LeaderStrBonus;   // from "Leader: Strength N" auras (recomputed each RecomputeAuras)
             public UnitAbility LeaderAbilities; // abilities granted to the leader by "Leader: X" / "Unit: X" auras
@@ -1263,6 +1264,7 @@ namespace PtoServer
                 var ps = slot.Battle.P[slot.P];
                 ps.LeaderCard = leader;
                 ps.LeaderMax = ps.LeaderLife = Math.Max(1, LifeOf(leader));
+                ps.OrbCap = (leader / 2 == 111) ? 6 : OrbMax; // Malandrax: "maximum of 6 Orbs"
             }
             ushort myBack = md != null ? md.Back : (ushort)0, myLand = md != null ? md.Land : (ushort)0;
             ushort opBack = od != null ? od.Back : (ushort)0, opLand = od != null ? od.Land : (ushort)0;
@@ -1483,7 +1485,7 @@ namespace PtoServer
         static void GrantWaveOrbs(Battle b)
         {
             for (int pi = 0; pi < 2; pi++)
-                b.P[pi].Orbs = Math.Min(OrbMax, b.P[pi].Orbs + OrbGainPerWave);
+                b.P[pi].Orbs = Math.Min(b.P[pi].OrbCap, b.P[pi].Orbs + OrbGainPerWave);
             Log("  ORBS granted (+ " + OrbGainPerWave + ", cap " + OrbMax + "): P0=" + b.P[0].Orbs + " P1=" + b.P[1].Orbs);
         }
 
@@ -2141,7 +2143,7 @@ namespace PtoServer
                         }
                     break;
                 case OrderKind.OrbBoost: // +N of your own orbs (capped)
-                    ps.Orbs = Math.Min(OrbMax, ps.Orbs + Math.Max(1, eff.Amount));
+                    ps.Orbs = Math.Min(ps.OrbCap, ps.Orbs + Math.Max(1, eff.Amount));
                     { BattleSlot z0 = mine.P == 0 ? mine : theirs, z1 = mine.P == 0 ? theirs : mine; if (z0 != null && z1 != null) SendOrbs(z0, z1, b); }
                     Log("  ORB BOOST: " + mine.Me.User + " orbs now " + ps.Orbs);
                     break;
@@ -2903,6 +2905,19 @@ namespace PtoServer
             if (oppSlot != null) Send(oppSlot.Me.Ns, new PacketWriter().WriteU8((byte)card).Frame(Op.DiscardCardGet));
         }
 
+        // Discard a RANDOM card from the owner's own hand (a cost paid by some leader actives:
+        // Rayne, Malandrax). Mirrors the Banish hand-removal packets but for the owner's own hand.
+        static void DiscardRandomFromHand(BattleSlot owner, BattleSlot opp, Battle b)
+        {
+            if (owner == null || owner.Hand == null || owner.Hand.Count == 0) { Log("  discard cost: hand empty"); return; }
+            int idx; lock (_rng) idx = _rng.Next(owner.Hand.Count);
+            ushort card = owner.Hand[idx]; owner.Hand.RemoveAt(idx);
+            DiscardCard(owner, opp, card);
+            Send(owner.Me.Ns, new PacketWriter().WriteU8((byte)idx).WriteU16(card).WriteBool(true).Frame(Op.HandCardRemove));
+            if (opp != null) Send(opp.Me.Ns, new PacketWriter().WriteU8((byte)Math.Min(255, owner.Hand.Count)).WriteU8((byte)idx).WriteU16(card).Frame(Op.HandCardRemoveGet));
+            Log("  DISCARD (cost): " + owner.Me.User + " discarded card " + card + " from hand[" + idx + "]");
+        }
+
         // Find an empty (non-leader) slot on ps's board, preferring `preferWave`. Returns false if full.
         static bool FindEmptySlot(PlayerState ps, int preferWave, out int gx, out int gy)
         {
@@ -3271,6 +3286,10 @@ namespace PtoServer
                             ps.LeaderPermStr += 1;
                             Log("  LEADER (Baenvier): +1 permanent leader Strength (now +" + ps.LeaderPermStr + ")");
                             break;
+                        case 74: // Rayne: "discard a random card to defeat a Hero with damage on it."
+                        case 111:// Malandrax: "Discard a random card and gain an orb."
+                            DiscardRandomFromHand(mine, theirs, b);
+                            break;
                     }
                 }
                 return;
@@ -3315,6 +3334,10 @@ namespace PtoServer
             // exhausts (HasAttackedThisWave), so it attacks only once/wave -- this just refunds the action.
             bool freeAtk = !attackerIsLeader && (attacker.Abilities & UnitAbility.FreeAttack) != 0;
             if (freeAtk) Log("  FREE ATTACK: (" + ax + "," + ay + ") attacks without spending an action");
+
+            // Uriah: "This LEADER cannot attack." Reject a leader-initiated attack for Uriah's owner.
+            if (attackerIsLeader && ps.LeaderCard / 2 == 76)
+            { Log("ATTACK rejected: Uriah leader cannot attack"); GrantAction(mine); return; }
 
             // TRAP — Cancel Attack: if the defender armed one (round >= 2), negate this attack before any
             // targeting resolves. The attacker still spends its action. Reflector's trap also BACKLASHES
@@ -3504,6 +3527,7 @@ namespace PtoServer
                 // Damage goes to opponent's leader (reduced by "Leader: Armor N" auras).
                 int ldmg = Math.Max(1, rawDmg - opPs.LeaderArmorBonus);
                 if (opPs.LeaderShield) { opPs.LeaderShield = false; ldmg = 0; Log("  -> LEADER SHIELD absorbed the hit"); }
+                if (opPs.LeaderCard / 2 == 76 && ldmg > 4) { ldmg = 4; Log("  -> URIAH: single-attack damage capped at 4"); }
                 opPs.LeaderLife -= ldmg;
                 leaderDied = opPs.LeaderLife <= 0;
                 Log("  -> LEADER takes " + ldmg + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
@@ -3515,6 +3539,7 @@ namespace PtoServer
                 ApplyVamp(mine, theirs, b, attacker, attackerIsLeader, ldmg, ax, ay);
                 ApplyMercy(mine, theirs, b, attacker, attackerIsLeader, ldmg);
                 ApplyLeaderReflect(mine, theirs, b, opPs, attacker, attackerIsLeader, ldmg, ax, ay);
+                ApplyLeaderCounter(mine, theirs, b, opPs, attacker, attackerIsLeader, isRanged, ax, ay);
             }
             else
             {
@@ -3571,6 +3596,7 @@ namespace PtoServer
                     // No unit at target, damage goes to leader (reduced by "Leader: Armor N" auras).
                     int ldmg2 = Math.Max(1, rawDmg - opPs.LeaderArmorBonus);
                     if (opPs.LeaderShield) { opPs.LeaderShield = false; ldmg2 = 0; Log("  -> LEADER SHIELD absorbed the hit"); }
+                    if (opPs.LeaderCard / 2 == 76 && ldmg2 > 4) { ldmg2 = 4; Log("  -> URIAH: single-attack damage capped at 4"); }
                     opPs.LeaderLife -= ldmg2;
                     leaderDied = opPs.LeaderLife <= 0;
                     Log("  -> LEADER (no unit at target) takes " + ldmg2 + " (life " + opPs.LeaderLife + (leaderDied ? ", DEAD" : "") + ")");
@@ -3579,8 +3605,12 @@ namespace PtoServer
                     ApplyVamp(mine, theirs, b, attacker, attackerIsLeader, ldmg2, ax, ay);
                     ApplyMercy(mine, theirs, b, attacker, attackerIsLeader, ldmg2);
                     ApplyLeaderReflect(mine, theirs, b, opPs, attacker, attackerIsLeader, ldmg2, ax, ay);
+                    ApplyLeaderCounter(mine, theirs, b, opPs, attacker, attackerIsLeader, isRanged, ax, ay);
                 }
             }
+
+            // Andrus: the attacker's Leader casts a free Ice 2 (melee) / Fire 2 row (ranged) on the target.
+            ApplyAndrus(mine, theirs, b, ps, opPs, attackerIsLeader, targetIsLeader, isRanged, tx, serverTy);
 
             // --- Counter-attack (melee only). The ORIGINALLY-targeted unit counters if it has Counter,
             // is alive (a covered unit is undamaged and still counters), was not recruited this wave, and
@@ -4020,6 +4050,42 @@ namespace PtoServer
             attacker.Damage += ldmg;
             Log("  -> LEADER REFLECT: " + ldmg + " back to attacker (" + attacker.Damage + "/" + attacker.Max + ")");
             SendUnitUpdateToBoth(mine, theirs, ax, ay, attacker, b);
+        }
+
+        // Uriah: leader Counter — when the Uriah leader is hit in MELEE, it strikes the attacker back for
+        // its own attack (minus the attacker's Armor). Mirrors ApplyLeaderReflect's damage-only update.
+        static void ApplyLeaderCounter(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState opPs, BUnit attacker, bool attackerIsLeader, bool isRanged, int ax, int ay)
+        {
+            if (attackerIsLeader || isRanged || attacker == null || attacker.IsCorpse) return;
+            if (opPs.LeaderCard / 2 != 76 || attacker.Damage >= attacker.Max) return;
+            int catk = Math.Max(1, AtkOf(opPs.LeaderCard) + opPs.LeaderStrBonus - attacker.Armor);
+            attacker.Damage += catk;
+            Log("  -> LEADER COUNTER (Uriah): " + catk + " to attacker (" + ax + "," + ay + ") (" + attacker.Damage + "/" + attacker.Max + ")");
+            SendUnitUpdateToBoth(mine, theirs, ax, ay, attacker, b);
+        }
+
+        // Andrus: after a hero in your unit attacks, the Leader casts a free follow-up on the target —
+        // Ice 2 (target + orthogonal neighbours) after a MELEE attack, Fire 2 (the target's whole row)
+        // after a RANGED attack. Effect damage (armor/cover don't apply); pushed via SyncUnitStates.
+        static void ApplyAndrus(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState ps, PlayerState opPs, bool attackerIsLeader, bool targetIsLeader, bool isRanged, int tx, int ty)
+        {
+            if (attackerIsLeader || theirs == null || ps.LeaderCard / 2 != 72) return;
+            if (isRanged)
+            {
+                Log("  LEADER (Andrus): ranged attack -> Fire 2 on row (lane " + ty + ")");
+                for (int wx = 0; wx <= 2; wx++) DamageEnemyAt(opPs, wx, ty, 2);
+            }
+            else
+            {
+                if (targetIsLeader) return; // Ice needs a hero target
+                Log("  LEADER (Andrus): melee attack -> Ice 2 on (" + tx + "," + ty + ") + adjacent");
+                DamageEnemyAt(opPs, tx, ty, 2);
+                DamageEnemyAt(opPs, tx - 1, ty, 2); DamageEnemyAt(opPs, tx + 1, ty, 2);
+                DamageEnemyAt(opPs, tx, ty - 1, 2); DamageEnemyAt(opPs, tx, ty + 1, 2);
+            }
+            ProcessImmediateDeaths(opPs, theirs, mine, b);
+            BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
+            if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b);
         }
 
         // ---- end turn (op 14 empty = end turn) --------------------------------
