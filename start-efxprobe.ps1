@@ -20,7 +20,7 @@
 #
 # For each: cast a DAMAGE order at an enemy. Splash plays + you can continue = KEEPER (tell me the eid +
 # what it looked like: fire? ice? thunder? poison?). Freeze = BAD, next id. I'll map each shape to its eid.
-param([int]$EfxId = 0)
+param([int]$EfxId = 0, [switch]$Cycle)
 Set-Location $PSScriptRoot
 
 $holder = (Get-NetTCPConnection -LocalPort 51338 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
@@ -41,16 +41,26 @@ Set-Content ".\data\player.decks" -Value $deck -Encoding utf8
 $env:PTO_BOT = "1"
 $env:PTO_NOSHUFFLE = "1"
 $env:PTO_EFXID = "$EfxId"
+if ($Cycle) { $env:PTO_EFXCYCLE = "1" } else { $env:PTO_EFXCYCLE = "0" }
 Remove-Item ".\server_live.log" -ErrorAction SilentlyContinue
 $srv = Start-Process ".\PtoServer.exe" -RedirectStandardOutput ".\server_live.log" -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 1
 
 $listening = (Get-NetTCPConnection -LocalPort 51338 -State Listen -ErrorAction SilentlyContinue | Measure-Object).Count
 Write-Host ""
-if ($listening -ge 1) { Write-Host "SERVER RUNNING on port 51338 (BOT enabled, PTO_EFXID=$EfxId)." -ForegroundColor Green }
+if ($listening -ge 1) { Write-Host "SERVER RUNNING on port 51338 (BOT enabled, PTO_EFXID=$EfxId, cycle=$($Cycle.IsPresent))." -ForegroundColor Green }
 else { Write-Host "Server did not start listening - check server_live.log" -ForegroundColor Red }
 Write-Host ""
-Write-Host "PHASE 2 sweep (at-target splashes). Cast a DAMAGE order at an ENEMY hero; it fires eid $EfxId."
-Write-Host "  - Splash plays (fire/ice/thunder/poison?) AND you can keep playing -> KEEPER (note the look)"
-Write-Host "  - Game freezes / stuck after casting                              -> BAD (next id)"
-Write-Host "Sweep:  .\start-efxprobe.ps1 2   (then 3,4,5,6,7,8,9,10,11,13,14,15,17,18,19,20,22,24,25)"
+if ($Cycle) {
+  Write-Host "AUTO-CYCLE sweep (starts at eid $EfxId, +1 each cast, skips the known projectiles 0/12/16/21/23)." -ForegroundColor Cyan
+  Write-Host "Just keep casting DAMAGE orders at an enemy - EACH cast fires the NEXT eid. The log records"
+  Write-Host "  the eid + objIndex per cast:  Get-Content .\server_live.log -Wait   (look for 'EFX CYCLE: eid=..')"
+  Write-Host "For each cast, note the VISUAL (fire/ice/thunder/poison/heal/nothing) and whether play continues."
+  Write-Host "If a cast FREEZES the game, note the last eid that fired, then resume from the next:"
+  Write-Host "  .\start-efxprobe.ps1 <nextEid> -Cycle"
+  Write-Host "When done, send me the server_live.log (or the eid->visual list). I'll map each shape to its eid."
+} else {
+  Write-Host "SINGLE-EID mode. Cast a DAMAGE order at an enemy; it fires eid $EfxId caster->target."
+  Write-Host "  - Splash plays AND you can keep playing -> KEEPER   |   Freeze -> BAD"
+  Write-Host "TIP: add -Cycle to sweep automatically:  .\start-efxprobe.ps1 1 -Cycle"
+}
