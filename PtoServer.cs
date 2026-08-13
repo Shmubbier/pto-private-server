@@ -661,6 +661,7 @@ namespace PtoServer
                 u.Finisher = GetUnitFinisher(u.Card, wave);
                 u.Revenge = GetUnitRevenge(u.Card, wave);
                 u.Abilities = GetUnitAbilities(u.Card, wave);
+                if (u.GrantedRanged) u.Abilities |= UnitAbility.RangedAttack; // Lizaveta's persistent grant
                 u.Cover = PassiveOf(u.Card, wave).Cover;
             }
             // 2. Apply each source's auras onto its recipients. Silenced units grant nothing.
@@ -706,8 +707,10 @@ namespace PtoServer
                     case 6:  u.Strength += 2; u.Atk += 2; break;                  // Hikaru: Melee Attack Strength 2
                     case 12: u.Abilities |= UnitAbility.Swift; break;             // Borneo: all your heroes have Swift
                     case 17: u.Abilities |= UnitAbility.RangedAttack; break;      // Zaamassal Kett: gain Ranged Attack
-                    case 20: if (u.Revenge < 5) u.Revenge = 5; break;            // Eligor Larington: Revenge: Strength 5
+                    case 20:
+                    case 75: if (u.Revenge < 5) u.Revenge = 5; break;            // Eligor Larington / Eligor: Revenge: Strength 5
                     case 22: u.Abilities |= UnitAbility.Vamp; break;              // Demitras: gain Vamp
+                    case 71: if (kv.Key / 10 == 2) u.Abilities |= UnitAbility.Intercept | UnitAbility.Deathproof; break; // Cague: your Vanguard heroes have Intercept + Deathproof
                 }
                 // Magdelina: persistent +Strength to all your heroes each round.
                 if (ps.RoundStrBonus > 0) { u.Strength += ps.RoundStrBonus; u.Atk += ps.RoundStrBonus; }
@@ -715,6 +718,12 @@ namespace PtoServer
                 if ((lr == 16 || lr == 23) && u.Card / 2 == 51) { u.Strength += 1; u.Atk += 1; }
             }
             if (lr == 6) ps.LeaderStrBonus += 2; // Hikaru: the Leader also has Melee Attack Strength 2
+            if (lr == 77) // Ivo: the Leader has Strength 1 for each hero in your unit
+            {
+                int heroes = 0;
+                foreach (var kv in ps.Units) if (kv.Value != null && !kv.Value.IsCorpse) heroes++;
+                ps.LeaderStrBonus += heroes;
+            }
             // Star Knight Iri (per-defeat) + Magdelina (per-round) also boost the LEADER's attack.
             ps.LeaderStrBonus += ps.LeaderPermStr + ps.RoundStrBonus;
         }
@@ -1034,6 +1043,7 @@ namespace PtoServer
                                       // needed (anim_wave_update un-greys corpses; a re-send re-greys them).
             public bool RecruitedThisWave;  // cannot attack on the turn recruited
             public bool HasAttackedThisWave; // can only attack once per wave
+            public bool GrantedRanged;      // Lizaveta leader active: persistently granted Ranged Attack
         }
 
         // What a Cover:X unit protects. It takes damage that would land on the covered position.
@@ -1613,7 +1623,7 @@ namespace PtoServer
                          TrapCancelAttack, TrapCancelSpell, TrapCancelOrder,
                          Immortality, Restructure, DamageSpread,
                          Reload, MindControl, Duplicate, Transfusion, Enervate, Entomb, ForceCube,
-                         ResurrectAll, Phantom, Scry, LucHaste }
+                         ResurrectAll, Phantom, Scry, LucHaste, GrantRanged }
 
         struct OrderEffect { public OrderKind Kind; public int Amount; public bool Free; } // Free = no action cost
 
@@ -1801,6 +1811,7 @@ namespace PtoServer
                 case OrderKind.ResurrectAll:         return 10;  // resurrect (many)
                 case OrderKind.StrengthBuff:         return 18;  // strength up (single)
                 case OrderKind.StrengthBuffVanguard: return 19;  // strength up (mass)
+                case OrderKind.GrantRanged:          return 20;  // obj_give_ranged (Lizaveta)
                 case OrderKind.DamageSingle:
                 case OrderKind.DamageRow:            // Fire
                 case OrderKind.DamageBlast:
@@ -1868,9 +1879,9 @@ namespace PtoServer
                     for (int lane = 0; lane < 3; lane++)
                         for (int w = 2; w >= 0; w--) { BUnit fu; if (opPs.Units.TryGetValue(Key(w, lane), out fu) && fu != null && !fu.IsCorpse) { cells.Add(Key(w, lane)); break; } }
                     telegraph = true; break;
-                // own single cell (heal / strength buff / revive / resurrect)
+                // own single cell (heal / strength buff / revive / resurrect / grant ranged)
                 case OrderKind.HealSingle: case OrderKind.StrengthBuff:
-                case OrderKind.Revive: case OrderKind.Resurrect:
+                case OrderKind.Revive: case OrderKind.Resurrect: case OrderKind.GrantRanged:
                     cells.Add(Key(gx, selfGy)); targetIsMine = true; break;
                 case OrderKind.HealLeader: case OrderKind.Infusion: case OrderKind.GainActions:
                 case OrderKind.LucHaste:
@@ -2176,6 +2187,15 @@ namespace PtoServer
                         BUnit u;
                         if (ps.Units.TryGetValue(Key(gx, selfGy), out u) && u != null && !u.IsCorpse) { u.Shield = true; Log("  SHIELD -> (" + gx + "," + selfGy + ")"); }
                         else Log("  shield: no friendly hero at (" + gx + "," + selfGy + ")");
+                    }
+                    break;
+                case OrderKind.GrantRanged: // Lizaveta: give a friendly hero Ranged Attack (persistent)
+                    {
+                        if (gx == 1 && selfGy == 1) { Log("  grant ranged: choose a hero, not the leader"); break; }
+                        BUnit u;
+                        if (ps.Units.TryGetValue(Key(gx, selfGy), out u) && u != null && !u.IsCorpse)
+                        { u.GrantedRanged = true; u.Abilities |= UnitAbility.RangedAttack; Log("  GRANT RANGED -> (" + gx + "," + selfGy + ")"); }
+                        else Log("  grant ranged: no friendly hero at (" + gx + "," + selfGy + ")");
                     }
                     break;
                 case OrderKind.ShieldLeader: // give your leader Shield
@@ -2714,7 +2734,8 @@ namespace PtoServer
                 case 70: return new OrderEffect { Kind = OrderKind.ShieldHero, Free = true };    // Merjoram: Quick: give a hero Shield (rider: -2 leader life TODO)
                 case 73: return new OrderEffect { Kind = OrderKind.Phantom, Amount = 1 };        // Luca: cast Phantom (return a random discard to hand)
                 case 74: return new OrderEffect { Kind = OrderKind.FinisherKill, Free = true };  // Rayne: Quick: defeat a DAMAGED enemy hero (rider: discard a random card TODO)
-                case 77: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2 };   // Ivo: give a hero Strength 2 (passive +Str/hero is a separate aura TODO)
+                case 77: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2 };   // Ivo: give a hero Strength 2 (+ passive +Str/hero aura, done in ApplyLeaderUnitGrants)
+                case 78: return new OrderEffect { Kind = OrderKind.GrantRanged };                // Lizaveta: give a friendly hero Ranged Attack (persistent)
                 case 79: return new OrderEffect { Kind = OrderKind.Polymorph };                  // Riflam: transform target hero into a random hero (new hero enters full-life)
                 case 99: return new OrderEffect { Kind = OrderKind.Silence };                    // Baenvier: Silence an enemy hero (rider: +1 leader Strength TODO)
                 case 111:return new OrderEffect { Kind = OrderKind.OrbBoost, Amount = 1 };        // Malandrax: gain an orb (rider: discard a random card + 6-orb cap TODO)
@@ -3201,7 +3222,7 @@ namespace PtoServer
                                   || seff.Kind == OrderKind.ShieldHero || seff.Kind == OrderKind.StrengthBuff
                                   || seff.Kind == OrderKind.Decoy || seff.Kind == OrderKind.Swap
                                   || seff.Kind == OrderKind.Seance || seff.Kind == OrderKind.Transfusion
-                                  || seff.Kind == OrderKind.ForceCube);
+                                  || seff.Kind == OrderKind.ForceCube || seff.Kind == OrderKind.GrantRanged);
                 if (IsEnemyTargeting(seff.Kind) && selectGrid)
                 {
                     Log("  -> SPELL rejected: " + seff.Kind + " must target an ENEMY hero (own board clicked)");
@@ -3237,6 +3258,21 @@ namespace PtoServer
                 ResolveEffect(seff, mine, theirs, b, tx, ty, ax, ay, selectGrid); // caster cell (Swap/Takedown) + clicked board (either-board effects)
                 // Seth: any wave-spell also triggers Scry 3 (opens the scry UI — unless one is already open).
                 if (!b.Over && ps.LeaderCard / 2 == 15 && ps.PendingScry == null) { Log("  LEADER (Seth): any wave-spell -> Scry 3"); OpenScry(mine, ps, 3); }
+                // Gen-2 leader-active RIDERS: extra cost/bonus attached to a leader's own cast (ax,ay = 1,1).
+                if (ax == 1 && ay == 1)
+                {
+                    switch (ps.LeaderCard / 2)
+                    {
+                        case 70: // Merjoram: "Give a HERO shield, then lose 2 life."
+                            ps.LeaderLife = Math.Max(0, ps.LeaderLife - 2); SendLeaderHp(mine, theirs, ps);
+                            Log("  LEADER (Merjoram): -2 leader life (now " + ps.LeaderLife + ")");
+                            break;
+                        case 99: // Baenvier: "cast Silence ... and give this Leader Strength 1."
+                            ps.LeaderPermStr += 1;
+                            Log("  LEADER (Baenvier): +1 permanent leader Strength (now +" + ps.LeaderPermStr + ")");
+                            break;
+                    }
+                }
                 return;
             }
 
