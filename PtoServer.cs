@@ -900,6 +900,20 @@ namespace PtoServer
             ps.OrderedThisTurn = true;
         }
 
+        // Lukas: "the first time you [play] a Trap, Ongoing or Order this turn, summon that randomly in your
+        // unit." Bonus-summons a copy of the just-played card as a summon-sick hero in a random empty slot,
+        // once per turn. Called from HandleOrder (orders) and HandleReservePlace (traps/operations).
+        static void ApplyLukas(BattleSlot mine, BattleSlot theirs, Battle b, ushort card)
+        {
+            PlayerState ps = b.P[mine.P];
+            if (ps.LeaderCard / 2 != 107 || ps.LukasTriggeredThisTurn || card == 0) return;
+            ps.LukasTriggeredThisTurn = true;
+            int gx, gy;
+            if (!FindEmptySlot(ps, b.Wave, out gx, out gy)) { Log("  LEADER (Lukas): no empty slot for the bonus summon (card " + card + ")"); return; }
+            PlaceUnit(mine, theirs, b, card, gx, gy, 0, true);
+            Log("  LEADER (Lukas): first play this turn -> bonus-summoned card " + card + " at (" + gx + "," + gy + ")");
+        }
+
         // Recipient keys for an aura target relative to a source at (sx,sy). -1 means "the leader".
         static IEnumerable<int> AuraRecipients(AuraTarget t, int sx, int sy, PlayerState ps)
         {
@@ -1055,6 +1069,7 @@ namespace PtoServer
             public List<OngoingOp> Ongoing = new List<OngoingOp>(); // persistent unit/region auras (o_type 1 operations), one per reserve lane
             public bool RestructureFree; // this turn, MOVE and CLEAR CORPSE cost no action (Homunculus/Bannerman); cleared at end of your turn
             public bool OrderedThisTurn; // has an order been played this turn (for Tatsumi's first-order-per-turn passive)
+            public bool LukasTriggeredThisTurn; // Lukas: has the first Trap/Ongoing/Order bonus-summon fired this turn
             public int LeaderPermStr;    // Star Knight Iri: +1 leader attack per own hero defeated (persistent)
             public int RoundStrBonus;    // Magdelina: +1 to all your heroes + leader each round (persistent, stacks)
             public bool IsFirstPlayer;   // holds the first-player token this round (for Kallistar's conditional aura)
@@ -2109,6 +2124,8 @@ namespace PtoServer
             SendSpellEnd(mine, theirs);
             // Leader on-order passives (Rukyuk Bombard 3 / Tatsumi first-order draw+action).
             if (!b.Over) ApplyLeaderOnOrder(mine, theirs, b);
+            // Lukas: the first order this turn also bonus-summons a copy of the card.
+            if (!b.Over) ApplyLukas(mine, theirs, b, cardId);
         }
 
         // Apply an order/spell effect and push results to both clients. (x,y) are the raw client
@@ -3300,6 +3317,8 @@ namespace PtoServer
             // Operations take effect immediately — refresh so units show the new stats/abilities/protection.
             if (isImmortality || isOngoing)
             { BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine; if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b); }
+            // Lukas: the first Trap/Ongoing placed this turn also bonus-summons a copy of the card.
+            if (!b.Over) ApplyLukas(mine, theirs, b, card);
         }
 
         // Clear the face-down card for a triggered trap from the OWNER's reserve slot on both clients.
@@ -4480,7 +4499,7 @@ namespace PtoServer
             Send(p0.Me.Ns, new PacketWriter().WriteU16((ushort)(active == 0 ? 0 : 1)).WriteBool(true).Frame(Op.TurnGet));
             Send(p1.Me.Ns, new PacketWriter().WriteU16((ushort)(active == 1 ? 0 : 1)).WriteBool(true).Frame(Op.TurnGet));
             BattleSlot act = active == 0 ? p0 : p1;
-            if (act.Battle != null) act.Battle.P[active].OrderedThisTurn = false; // reset Tatsumi's first-order tracker
+            if (act.Battle != null) { act.Battle.P[active].OrderedThisTurn = false; act.Battle.P[active].LukasTriggeredThisTurn = false; } // reset Tatsumi + Lukas per-turn trackers
             GrantAction(act);
             // Any corpse alive at a turn boundary has finished its death animation client-side, so it's
             // now safe (and necessary) to re-send it — mark it settled so SyncUnitStates re-greys it.
