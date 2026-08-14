@@ -1686,7 +1686,7 @@ namespace PtoServer
                 case 29: return new OrderEffect { Kind = OrderKind.KillHero };                  // Assassin: Assassinate
                 case 34: return new OrderEffect { Kind = OrderKind.WildSummon }; // Illusionist: Wild Summon (play a random card from the rival's hand as an order, then discard it)
                 case 35: return new OrderEffect { Kind = OrderKind.DamageFrontEach, Amount = 4 }; // Knight: Blast 4 (front of each row)
-                case 36: return new OrderEffect { Kind = OrderKind.DrawCards,    Amount = 2 }; // Mascot: Inspire, Draw 2 (Draw part)
+                case 36: return new OrderEffect { Kind = OrderKind.Inspire, Kind2 = OrderKind.DrawCards, Amount2 = 2 }; // Mascot: Inspire + Draw 2 (Inspire targets a friendly hero, like Legionnaire)
                 case 39: return new OrderEffect { Kind = OrderKind.SummonRandom, Amount = 3 }; // Overlord: Summon x3
                 case 42: return new OrderEffect { Kind = OrderKind.Resurrect };                // Priestess: Resurrect
                 case 44: return new OrderEffect { Kind = OrderKind.GainActions,  Amount = 2, Free = true }; // Scientist: Haste 2 (free)
@@ -1705,7 +1705,7 @@ namespace PtoServer
                 case 27: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 5 };  // Dragon Mage: Give Strength Buff 5
                 case 84: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 3 };  // Fencer: Strength 3 (buff a hero)
                 case 94: return new OrderEffect { Kind = OrderKind.ShieldVanguard };            // Magus: Vanguard: Shield
-                case 96: return new OrderEffect { Kind = OrderKind.ShieldLeader };              // Squire: Shield Leader (Cure Leader part omitted)
+                case 96: return new OrderEffect { Kind = OrderKind.ShieldLeader, Kind2 = OrderKind.HealLeader, Amount2 = 2 }; // Squire: Shield Leader + Cure Leader 2
                 case 110:return new OrderEffect { Kind = OrderKind.Decoy };                     // Occultist: Decoy (mark a friendly hero)
                 case 69: return new OrderEffect { Kind = OrderKind.DamageSpread, Amount = 10 };  // Warmage: Meteor Storm 10 (X divided randomly)
                 case 65: return new OrderEffect { Kind = OrderKind.Replicate, Free = true };    // Puppeteer: Quick Order: Replicate
