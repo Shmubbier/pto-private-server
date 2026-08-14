@@ -685,7 +685,7 @@ namespace PtoServer
             foreach (var kv in ps.Units)
             {
                 BUnit u = kv.Value; if (u == null) continue;
-                int wave = kv.Key / 10;
+                int wave = (u.MarkedWave >= 0) ? u.MarkedWave : kv.Key / 10; // Pendros mark overrides the ability wave
                 u.Strength = GetUnitStrength(u.Card, wave);
                 u.Atk = Math.Max(0, AtkOf(u.Card) + u.Strength + u.TempStrength - u.Enervate); // + Strength Buff, - Enervate
                 u.Armor = GetUnitArmor(u.Card, wave);
@@ -914,6 +914,53 @@ namespace PtoServer
             Log("  LEADER (Lukas): first play this turn -> bonus-summoned card " + card + " at (" + gx + "," + gy + ")");
         }
 
+        // Batrov: move ALL accumulated damage from one friendly hero to another.
+        static void MoveAllDamage(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState ps, int fx, int fy, int tx, int ty)
+        {
+            BUnit from, to;
+            if (!ps.Units.TryGetValue(Key(fx, fy), out from) || from == null || from.IsCorpse) { Log("  BATROV: no from-hero at (" + fx + "," + fy + ")"); return; }
+            if (!ps.Units.TryGetValue(Key(tx, ty), out to) || to == null || to.IsCorpse) { Log("  BATROV: no to-hero at (" + tx + "," + ty + ")"); return; }
+            int moved = from.Damage;
+            from.Damage = 0;
+            to.Damage = Math.Min(to.Max, to.Damage + moved);
+            Log("  BATROV: moved " + moved + " damage from (" + fx + "," + fy + ") to (" + tx + "," + ty + ")");
+            BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
+            if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b);
+            ProcessImmediateDeaths(ps, mine, theirs, b); // the to-hero could be pushed to lethal
+        }
+
+        // Batrov (#108) / Pendros (#100) leader specials. Their extra targeting (Batrov's from-cell, Pendros's
+        // V/F/R choice) is NOT carried by the standard op22 fields, so it must be APPENDED to the payload by a
+        // patched client. Reads those trailing bytes if present; returns true if handled (does its own action
+        // accounting). If absent (current unpatched client), returns false -> caller falls through to no-op.
+        static bool HandleLeaderSpecial(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState ps, ushort casterCard, byte tx, byte ty, byte[] payload, PacketReader r)
+        {
+            int real = casterCard / 2;
+            if (real == 108) // Batrov: move all damage from hero A (appended) to hero B (the standard target)
+            {
+                if (payload.Length < 8) { Log("  BATROV: from-cell not in packet (len " + payload.Length + ") -> needs client patch; no-op"); return false; }
+                int fx = r.ReadU8(), fy = r.ReadU8();
+                MoveAllDamage(mine, theirs, b, ps, fx, fy, tx, ty);
+                ConsumeAction(mine, theirs, b); // Batrov is a normal action
+                return true;
+            }
+            if (real == 100) // Pendros: mark the target hero as V/F/R (appended position byte); free action
+            {
+                if (payload.Length < 7) { Log("  PENDROS: position not in packet (len " + payload.Length + ") -> needs client patch; no-op"); return false; }
+                int pos = r.ReadU8();                          // 0=Vanguard, 1=Flank, 2=Rear (hypothesis)
+                int markWave = pos == 0 ? 2 : (pos == 1 ? 1 : 0);
+                BUnit u;
+                if (ps.Units.TryGetValue(Key(tx, ty), out u) && u != null && !u.IsCorpse)
+                { u.MarkedWave = markWave; Log("  PENDROS: marked (" + tx + "," + ty + ") as wave " + markWave + " (pos " + pos + ")"); }
+                else Log("  PENDROS: no hero at (" + tx + "," + ty + ")");
+                GrantAction(mine);                             // Pendros is a FREE action
+                BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
+                if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b);
+                return true;
+            }
+            return false;
+        }
+
         // Recipient keys for an aura target relative to a source at (sx,sy). -1 means "the leader".
         static IEnumerable<int> AuraRecipients(AuraTarget t, int sx, int sy, PlayerState ps)
         {
@@ -1101,6 +1148,7 @@ namespace PtoServer
             public bool RecruitedThisWave;  // cannot attack on the turn recruited
             public bool HasAttackedThisWave; // can only attack once per wave
             public bool GrantedRanged;      // Lizaveta leader active: persistently granted Ranged Attack
+            public int MarkedWave = -1;     // Pendros: overrides the wave used for this unit's abilities (-1 = use its cell)
         }
 
         // What a Cover:X unit protects. It takes damage that would land on the covered position.
@@ -3373,6 +3421,17 @@ namespace PtoServer
                 ushort casterCard = 0;
                 if (ax == 1 && ay == 1) casterCard = ps.LeaderCard;
                 else { BUnit cu; if (ps.Units.TryGetValue(Key(ax, ay), out cu) && cu != null && !cu.IsCorpse) casterCard = cu.Card; }
+
+                // Batrov (#108) / Pendros (#100): leader specials that need extra targeting data (from-cell /
+                // V/F/R) the standard fields don't carry. DIAGNOSTIC: dump the raw payload so a single in-game
+                // cast reveals exactly what the current client sends. Dispatch if the extra bytes are present.
+                if (casterCard / 2 == 108 || casterCard / 2 == 100)
+                {
+                    Log("  LEADER-SPECIAL DIAG: card " + casterCard + " ax=" + ax + " ay=" + ay + " tx=" + tx + " ty=" + ty
+                        + " selectGrid=" + selectGrid + " payloadLen=" + payload.Length + " hex=" + BitConverter.ToString(payload));
+                    if (HandleLeaderSpecial(mine, theirs, b, ps, casterCard, tx, ty, payload, r)) return;
+                    // else: extra data not sent by this (unpatched) client -> fall through to the no-op below.
+                }
 
                 OrderEffect seff = (casterCard != 0) ? SpellOf(casterCard, ax) : new OrderEffect { Kind = OrderKind.None };
                 Log("SPELL " + mine.Me.User + ": card " + casterCard + " wave " + ax + " kind=" + seff.Kind + " target(" + tx + "," + ty + ")");
