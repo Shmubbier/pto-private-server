@@ -2125,6 +2125,14 @@ namespace PtoServer
             int enemyGy = y;       // opponent slot grid_y already equals the server lane (no mirror)
             int selfGy = y;
 
+            // Reflect Damage vs effect/order/spell damage (user ruling): a hit unit that HAS Reflect sends
+            // the damage that lands on IT back to the CASTER; other units still take their damage normally.
+            // Snapshot each Reflect enemy unit's damage now, diff it after the switch, reflect the delta.
+            Dictionary<int, int> reflectPre = null;
+            foreach (var kv in opPs.Units)
+                if (kv.Value != null && !kv.Value.IsCorpse && (kv.Value.Abilities & UnitAbility.Reflect) != 0)
+                    (reflectPre ?? (reflectPre = new Dictionary<int, int>()))[kv.Key] = kv.Value.Damage;
+
             switch (eff.Kind)
             {
                 case OrderKind.DamageSingle:
@@ -2679,6 +2687,22 @@ namespace PtoServer
                     break;
             }
 
+            // Reflect: sum the effect damage that landed on Reflect enemy units and apply it to the caster
+            // (the casting hero, or the leader for an order). Caster death is swept by ProcessImmediateDeaths
+            // below (hero) / the ps.LeaderLife check in the tail (leader).
+            if (reflectPre != null)
+            {
+                int reflected = 0;
+                foreach (var kvp in reflectPre)
+                { BUnit ru; if (opPs.Units.TryGetValue(kvp.Key, out ru) && ru != null) { int d = ru.Damage - kvp.Value; if (d > 0) reflected += d; } }
+                if (reflected > 0)
+                {
+                    Log("  -> REFLECT (effect): " + reflected + " reflected to caster (" + casterX + "," + casterY + ")");
+                    if (casterX == 1 && casterY == 1) ps.LeaderLife -= reflected;
+                    else { BUnit c; if (ps.Units.TryGetValue(Key(casterX, casterY), out c) && c != null && !c.IsCorpse) c.Damage += reflected; }
+                }
+            }
+
             // EFFECT PROJECTILE (op41): fire the confirmed queue-safe arrow (eid 0) from the caster along
             // the real trajectory to the target, for single-target enemy-damage effects. The cast-pose
             // bracket (op44/op45 in HandleOrder) gates next_que_effect around it. PTO_EFXID (>=0) overrides
@@ -2723,6 +2747,15 @@ namespace PtoServer
                 Log("BATTLE END: " + mine.Me.User + " wins (order/spell lethal)");
                 Send(mine.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
                 if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                return;
+            }
+            // The caster's own leader can die from reflected effect damage — the caster then LOSES.
+            if (ps.LeaderLife <= 0)
+            {
+                b.Over = true;
+                Log("BATTLE END: " + mine.Me.User + " loses (own leader killed by reflected effect damage)");
+                if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
+                Send(mine.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
                 return;
             }
 
@@ -4109,9 +4142,14 @@ namespace PtoServer
         {
             if (attackerIsLeader || attacker == null || dealt <= 0) return;
             if ((attacker.Abilities & UnitAbility.Vamp) == 0 || attacker.Damage <= 0) return;
-            attacker.Damage = Math.Max(0, attacker.Damage - dealt);
-            Log("  -> VAMP: heal self -" + dealt + " (damage now " + attacker.Damage + ")");
+            int before = attacker.Damage;
+            attacker.Damage = Math.Max(0, before - dealt);
+            int healed = before - attacker.Damage;
+            Log("  -> VAMP: heal self -" + healed + " (damage now " + attacker.Damage + ")");
             SendUnitUpdateToBoth(mine, theirs, ax, ay, attacker, b);
+            // Visual: obj_single_vamp (eid 16, spr_hit_vamp) plays on the vamp hero showing the life drained.
+            // Queue-safe (calls can_unque_damage). Fires on the attacker's own cell (from==to, targetIsMine).
+            SendEffect(mine, theirs, ax, ay, ax, ay, true, 16, true, healed);
         }
 
         // Regen N: heal N damage from each of the player's Regen heroes (end of their turn).
