@@ -924,6 +924,9 @@ namespace PtoServer
             from.Damage = 0;
             to.Damage = Math.Min(to.Max, to.Damage + moved);
             Log("  BATROV: moved " + moved + " damage from (" + fx + "," + fy + ") to (" + tx + "," + ty + ")");
+            // Visual: heal glow on the drained hero, impact on the receiving hero (both own board).
+            SendEffect(mine, theirs, fx, fy, fx, fy, true, 7, true, moved);
+            SendEffect(mine, theirs, tx, ty, tx, ty, true, 1, false, moved);
             BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
             if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b);
             ProcessImmediateDeaths(ps, mine, theirs, b); // the to-hero could be pushed to lethal
@@ -952,7 +955,10 @@ namespace PtoServer
                 int markWave = pos == 0 ? 2 : (pos == 1 ? 1 : 0);
                 BUnit u;
                 if (ps.Units.TryGetValue(Key(tx, ty), out u) && u != null && !u.IsCorpse)
-                { u.MarkedWave = markWave; Log("  PENDROS: marked (" + tx + "," + ty + ") as wave " + markWave + " (pos " + pos + ")"); }
+                {
+                    u.MarkedWave = markWave; Log("  PENDROS: marked (" + tx + "," + ty + ") as wave " + markWave + " (pos " + pos + ")");
+                    SendEffect(mine, theirs, tx, ty, tx, ty, true, 24, false, 0); // obj_single_arrow_target reticle = the "mark"
+                }
                 else Log("  PENDROS: no hero at (" + tx + "," + ty + ")");
                 GrantAction(mine);                             // Pendros is a FREE action
                 BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
