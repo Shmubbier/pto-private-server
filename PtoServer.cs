@@ -915,11 +915,11 @@ namespace PtoServer
         }
 
         // Batrov: move ALL accumulated damage from one friendly hero to another.
-        static void MoveAllDamage(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState ps, int fx, int fy, int tx, int ty)
+        static bool MoveAllDamage(BattleSlot mine, BattleSlot theirs, Battle b, PlayerState ps, int fx, int fy, int tx, int ty)
         {
             BUnit from, to;
-            if (!ps.Units.TryGetValue(Key(fx, fy), out from) || from == null || from.IsCorpse) { Log("  BATROV: no from-hero at (" + fx + "," + fy + ")"); return; }
-            if (!ps.Units.TryGetValue(Key(tx, ty), out to) || to == null || to.IsCorpse) { Log("  BATROV: no to-hero at (" + tx + "," + ty + ")"); return; }
+            if (!ps.Units.TryGetValue(Key(fx, fy), out from) || from == null || from.IsCorpse) { Log("  BATROV: no from-hero at (" + fx + "," + fy + ")"); return false; }
+            if (!ps.Units.TryGetValue(Key(tx, ty), out to) || to == null || to.IsCorpse) { Log("  BATROV: no to-hero at (" + tx + "," + ty + ")"); return false; }
             int moved = from.Damage;
             from.Damage = 0;
             to.Damage = Math.Min(to.Max, to.Damage + moved);
@@ -927,6 +927,7 @@ namespace PtoServer
             BattleSlot q0 = mine.P == 0 ? mine : theirs, q1 = mine.P == 0 ? theirs : mine;
             if (q0 != null && q1 != null) SyncUnitStates(q0, q1, b);
             ProcessImmediateDeaths(ps, mine, theirs, b); // the to-hero could be pushed to lethal
+            return true;
         }
 
         // Batrov (#108) / Pendros (#100) leader specials. Their extra targeting (Batrov's from-cell, Pendros's
@@ -940,8 +941,8 @@ namespace PtoServer
             {
                 if (payload.Length < 8) { Log("  BATROV: from-cell not in packet (len " + payload.Length + ") -> needs client patch; no-op"); return false; }
                 int fx = r.ReadU8(), fy = r.ReadU8();
-                MoveAllDamage(mine, theirs, b, ps, fx, fy, tx, ty);
-                ConsumeAction(mine, theirs, b); // Batrov is a normal action
+                if (MoveAllDamage(mine, theirs, b, ps, fx, fy, tx, ty)) ConsumeAction(mine, theirs, b); // Batrov is a normal action
+                else GrantAction(mine); // nothing moved (e.g. a stray/premature cast) -> refund, don't waste an action
                 return true;
             }
             if (real == 100) // Pendros: mark the target hero as V/F/R (appended position byte); free action
