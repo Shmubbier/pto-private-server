@@ -1666,9 +1666,11 @@ namespace PtoServer
                          TrapCancelAttack, TrapCancelSpell, TrapCancelOrder,
                          Immortality, Restructure, DamageSpread,
                          Reload, MindControl, Duplicate, Transfusion, Enervate, Entomb, ForceCube,
-                         ResurrectAll, Phantom, Scry, LucHaste, GrantRanged }
+                         ResurrectAll, Phantom, Scry, LucHaste, GrantRanged, ShieldRear }
 
-        struct OrderEffect { public OrderKind Kind; public int Amount; public bool Free; } // Free = no action cost
+        // Kind2/Amount2 = an optional RIDER: a second effect the same order/spell fires on the same target
+        // right after the primary (e.g. Warrior "Cure 4, Strength Buff 2"). The rider never costs its own action.
+        struct OrderEffect { public OrderKind Kind; public int Amount; public bool Free; public OrderKind Kind2; public int Amount2; } // Free = no action cost
 
         // Effects for the tester Arena deck (card id = REAL*2). Damage orders hit the enemy grid,
         // heals hit the caster's grid. Unimplemented cards return None (graceful no-op).
@@ -1727,8 +1729,8 @@ namespace PtoServer
                 case 37: return new OrderEffect { Kind = OrderKind.DrawCards,   Amount = 3 };    // Mystic: Draw 3
                 case 40: return new OrderEffect { Kind = OrderKind.Revive, Free = true };        // Paladin: Quick Order: Revive
                 case 59: return new OrderEffect { Kind = OrderKind.Resurrect };                  // Ghost (59): Resurrect
-                case 80: return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 4 };    // Warrior: Cure 4 (Strength Buff 2 rider omitted)
-                case 81: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2 };   // Twinblade: Strength Buff 2 (Inspire rider omitted)
+                case 80: return new OrderEffect { Kind = OrderKind.HealSingle,  Amount = 4, Kind2 = OrderKind.StrengthBuff, Amount2 = 2 }; // Warrior: Cure 4 + Strength Buff 2 (same hero)
+                case 81: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2, Kind2 = OrderKind.Inspire };                // Twinblade: Strength Buff 2 + Inspire (same hero)
                 case 89: return new OrderEffect { Kind = OrderKind.Inspire };                    // Legionnaire: Inspire
                 case 90: return new OrderEffect { Kind = OrderKind.HealLeader,  Amount = 5 };    // Nurse: Cure Leader 5
                 case 91: return new OrderEffect { Kind = OrderKind.GainActions, Amount = 1, Free = true }; // Commando: Quick Order: Haste 1
@@ -2261,6 +2263,9 @@ namespace PtoServer
                 case OrderKind.ShieldVanguard: // give all your Vanguard heroes Shield
                     { int n = 0; for (int lane = 0; lane < 3; lane++) { BUnit u; if (ps.Units.TryGetValue(Key(2, lane), out u) && u != null && !u.IsCorpse) { u.Shield = true; n++; } } Log("  SHIELD VANGUARD (" + n + " heroes)"); }
                     break;
+                case OrderKind.ShieldRear: // give all your Rear heroes Shield (Scholar: Rear: Shield)
+                    { int n = 0; for (int lane = 0; lane < 3; lane++) { BUnit u; if (ps.Units.TryGetValue(Key(0, lane), out u) && u != null && !u.IsCorpse) { u.Shield = true; n++; } } Log("  SHIELD REAR (" + n + " heroes)"); }
+                    break;
                 case OrderKind.StrengthBuff: // +N attack (until end of turn) to a friendly hero
                     {
                         BUnit u;
@@ -2727,6 +2732,11 @@ namespace PtoServer
             BattleSlot p1slot = mine.P == 0 ? theirs : mine;
             if (p0slot != null && p1slot != null) SyncUnitStates(p0slot, p1slot, b);
             if (eff.Free) GrantAction(mine); else ConsumeAction(mine, theirs, b);
+
+            // RIDER: fire the order/spell's second effect on the SAME target. Marked Free so it re-grants
+            // instead of spending a second action (the order already paid one above).
+            if (eff.Kind2 != OrderKind.None && !b.Over)
+                ResolveEffect(new OrderEffect { Kind = eff.Kind2, Amount = eff.Amount2, Free = true }, mine, theirs, b, x, y, casterX, casterY, targetSelf);
         }
 
         // Pick a sensible (gx,gy) for an effect that has no player-chosen target — used when Wild Summon
@@ -2846,7 +2856,8 @@ namespace PtoServer
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.Silence };                        // Wizard F: Silence (an enemy hero)
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.Phantom, Amount = 1 }; break;      // Wizard R: Phantom
                 case 94: if (wave == 1) return new OrderEffect { Kind = OrderKind.ShieldLeader }; break;            // Magus F: Shield Leader
-                case 105:if (wave == 2) return new OrderEffect { Kind = OrderKind.ShieldHero }; break;              // Scholar V: Shield Hero
+                case 105:if (wave == 2) return new OrderEffect { Kind = OrderKind.ShieldHero };                     // Scholar V: Shield Hero
+                         if (wave == 0) return new OrderEffect { Kind = OrderKind.ShieldRear }; break;             // Scholar R: Rear: Shield (shield all your rear heroes)
                 case 54: if (wave == 0) return new OrderEffect { Kind = OrderKind.Swap, Free = true }; break;       // Air Elemental R: Quick Swap
                 case 64: if (wave == 0) return new OrderEffect { Kind = OrderKind.Swap, Free = true };              // Doppelganger R: Quick Swap
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.Replicate };                       // Doppelganger F: Replicate
@@ -2878,7 +2889,7 @@ namespace PtoServer
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.Restructure };                     // Bannerman F: Restructure
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DrawCards, Amount = 1, Free = true }; break; // Bannerman R: Quick Draw 1
                 case 40: if (wave == 0) return new OrderEffect { Kind = OrderKind.HealAll,     Amount = 2 }; break;   // Paladin R: Cure All 2
-                case 49: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 2 }; break;  // Vampire R: Backstab 2 (Cure Leader 2 omitted)
+                case 49: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 2, Kind2 = OrderKind.HealLeader, Amount2 = 2 }; break; // Vampire R: Backstab 2 (enemy leader) + Cure Leader 2 (own leader)
                 case 55: if (wave == 0) return new OrderEffect { Kind = OrderKind.Banish,      Amount = 1 }; break;   // Dark Elemental R: Banish 1
                 case 59: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 3 };         // Ghost(59) V: Backstab 3
                          if (wave == 1) return new OrderEffect { Kind = OrderKind.DamageAll,   Amount = 2 };          // Ghost(59) F: Poison 2
@@ -3331,7 +3342,8 @@ namespace PtoServer
                                   || seff.Kind == OrderKind.ShieldHero || seff.Kind == OrderKind.StrengthBuff
                                   || seff.Kind == OrderKind.Decoy || seff.Kind == OrderKind.Swap
                                   || seff.Kind == OrderKind.Seance || seff.Kind == OrderKind.Transfusion
-                                  || seff.Kind == OrderKind.ForceCube || seff.Kind == OrderKind.GrantRanged);
+                                  || seff.Kind == OrderKind.ForceCube || seff.Kind == OrderKind.GrantRanged
+                                  || seff.Kind == OrderKind.ShieldRear);
                 if (IsEnemyTargeting(seff.Kind) && selectGrid)
                 {
                     Log("  -> SPELL rejected: " + seff.Kind + " must target an ENEMY hero (own board clicked)");
