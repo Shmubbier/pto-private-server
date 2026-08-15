@@ -1938,6 +1938,8 @@ namespace PtoServer
                 case OrderKind.HealAll:              return 8;   // heal (many)
                 case OrderKind.Revive:               return 11;  // revive
                 case OrderKind.Resurrect:            return 9;   // resurrect (single)
+                case OrderKind.Phantom:
+                case OrderKind.OrbBoost:             return 9;   // ress flourish on the caster (Luca / Malandrax)
                 case OrderKind.ResurrectAll:         return 10;  // resurrect (many)
                 case OrderKind.StrengthBuff:         return 18;  // strength up (single)
                 case OrderKind.StrengthBuffVanguard: return 19;  // strength up (mass)
@@ -2016,6 +2018,9 @@ namespace PtoServer
                 case OrderKind.HealLeader: case OrderKind.Infusion: case OrderKind.GainActions:
                 case OrderKind.LucHaste:
                     cells.Add(Key(1, 1)); targetIsMine = true; break;
+                // on the CASTER (Phantom / Orb Boost flourish — Luca/Malandrax leaders, and hero casters)
+                case OrderKind.Phantom: case OrderKind.OrbBoost:
+                    cells.Add(Key(casterX, casterY)); targetIsMine = true; break;
                 // own all units
                 case OrderKind.HealAll: case OrderKind.ResurrectAll:
                     foreach (var kv in ps.Units) if (kv.Value != null) cells.Add(kv.Key); targetIsMine = true; break;
@@ -2026,6 +2031,8 @@ namespace PtoServer
             }
             if (cells.Count == 0) return;
             bool isheal = (eid == 7 || eid == 8); // heal-number style only for actual heals
+            // Phantom / Orb Boost use the ress flourish purely as a cast visual — no floating number.
+            if (eff.Kind == OrderKind.Phantom || eff.Kind == OrderKind.OrbBoost) a = 0;
             // Telegraph: obj_single_arrow_target (eid 24, at-target reticle) marks every unit that will be hit
             // by an AoE damage effect. Queue-safe: consecutive 24s chain via can_unque_same_effect and the last
             // releases into the damage splash. Enemy board (targetIsMine=false), no damage number.
