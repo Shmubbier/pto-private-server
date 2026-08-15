@@ -187,23 +187,6 @@ namespace PtoServer
         const int OrbGainPerWave = 1;   // order resource gained at the start of each wave (3 waves/round)
         const int OrbMax = 3;           // ...capped at this
 
-        // Calibration: PTO_EFXID=<0..25> makes every resolved order also fire container_effect (op41)
-        // with that effect id from the leader at the enemy leader (center lane, no Y-mirror ambiguity),
-        // so we can identify which eid is a real projectile that RELEASES the client queue (only
-        // obj_arrow_effect does). Default -1 = off (normal play, cast-pose only). See [[spell-order-protocol]].
-        static readonly int EfxProbeId = ParseIntEnv("PTO_EFXID", -1);
-        // Confirmed (user-tested 2026-08-12): eid 0 = obj_single_arrow_target, a queue-safe single-target
-        // projectile (plays a projectile AND releases the queue). Used in production for single-target
-        // enemy-damage orders/spells. PTO_EFXID overrides it for further calibration.
-        const int EfxArrow = 0;
-        // Auto-cycle sweep: PTO_EFXCYCLE=1 steps the effect id on EVERY cast (starting from PTO_EFXID),
-        // skipping the already-identified projectile eids, so one launch sweeps the at-target splashes.
-        static readonly bool EfxCycle = Environment.GetEnvironmentVariable("PTO_EFXCYCLE") == "1";
-        static int _efxNext = int.MinValue;
-        // eid (0..25) -> client object index (from the client's effects_init/add_effect), for sweep logging.
-        static readonly int[] EfxObjIndex = { 76,44,43,45,46,47,48,49,50,52,51,53,54,55,56,57,71,58,60,62,61,54,63,79,79,59 };
-        static int ParseIntEnv(string name, int dflt)
-        { int v; return int.TryParse(Environment.GetEnvironmentVariable(name), out v) ? v : dflt; }
         const int TurnSeconds = 60;     // a turn auto-advances after this many seconds of inactivity
 
         static readonly object _logLock = new object();
@@ -1127,7 +1110,6 @@ namespace PtoServer
             public int LeaderPermStr;    // Star Knight Iri: +1 leader attack per own hero defeated (persistent)
             public int RoundStrBonus;    // Magdelina: +1 to all your heroes + leader each round (persistent, stacks)
             public bool IsFirstPlayer;   // holds the first-player token this round (for Kallistar's conditional aura)
-            public int BatrovSource = -1; // Batrov two-step: cell of the "from" hero picked on the first cast (-1 = none)
         }
 
         internal class BUnit
@@ -1737,7 +1719,7 @@ namespace PtoServer
                          TrapCancelAttack, TrapCancelSpell, TrapCancelOrder,
                          Immortality, Restructure, DamageSpread,
                          Reload, MindControl, Duplicate, Transfusion, Enervate, Entomb, ForceCube,
-                         ResurrectAll, Phantom, Scry, LucHaste, GrantRanged, ShieldRear, MoveDamage, MarkPosition }
+                         ResurrectAll, Phantom, Scry, LucHaste, GrantRanged, ShieldRear }
 
         // Kind2/Amount2 = an optional RIDER: a second effect the same order/spell fires on the same target
         // right after the primary (e.g. Warrior "Cure 4, Strength Buff 2"). The rider never costs its own action.
@@ -2345,45 +2327,6 @@ namespace PtoServer
                         else Log("  grant ranged: no friendly hero at (" + gx + "," + selfGy + ")");
                     }
                     break;
-                case OrderKind.MoveDamage: // Batrov (two-step): 1st cast picks the "from" hero, 2nd moves its damage to the "to" hero
-                    {
-                        int key = Key(gx, selfGy);
-                        if (gx == 1 && selfGy == 1) { Log("  move damage: pick a hero, not the leader"); break; }
-                        if (ps.BatrovSource < 0)
-                        {
-                            BUnit src;
-                            if (ps.Units.TryGetValue(key, out src) && src != null && !src.IsCorpse)
-                            { ps.BatrovSource = key; Log("  MOVE DAMAGE: source (" + gx + "," + selfGy + ") selected; cast Batrov again on the DESTINATION hero"); }
-                            else Log("  move damage: no friendly hero at (" + gx + "," + selfGy + ")");
-                        }
-                        else
-                        {
-                            int sk = ps.BatrovSource; ps.BatrovSource = -1;
-                            BUnit src, dst;
-                            if (sk == key) { Log("  move damage: source == destination; cancelled"); break; }
-                            if (ps.Units.TryGetValue(sk, out src) && src != null && !src.IsCorpse
-                                && ps.Units.TryGetValue(key, out dst) && dst != null && !dst.IsCorpse)
-                            {
-                                int moved = src.Damage;
-                                dst.Damage = Math.Min(dst.Max, dst.Damage + moved);
-                                src.Damage = 0;
-                                ps.ActionsRemaining = Math.Max(0, ps.ActionsRemaining - 1); // the completed ability costs 1 action (cast is Free-bracketed)
-                                Log("  MOVE DAMAGE: moved " + moved + " from (" + (sk / 10) + "," + (sk % 10) + ") to (" + gx + "," + selfGy + ")");
-                            }
-                            else Log("  move damage: source or destination hero missing");
-                        }
-                    }
-                    break;
-                case OrderKind.MarkPosition: // Pendros: mark a hero to its CURRENT position; its passives follow the mark when it moves
-                    {
-                        int key = Key(gx, selfGy);
-                        if (gx == 1 && selfGy == 1) { Log("  mark: pick a hero, not the leader"); break; }
-                        BUnit u;
-                        if (ps.Units.TryGetValue(key, out u) && u != null && !u.IsCorpse)
-                        { u.MarkedWave = gx; Log("  MARK POSITION: (" + gx + "," + selfGy + ") card " + u.Card + " marked as " + WaveName(gx) + " (wave " + gx + ")"); }
-                        else Log("  mark: no friendly hero at (" + gx + "," + selfGy + ")");
-                    }
-                    break;
                 case OrderKind.ShieldLeader: // give your leader Shield
                     ps.LeaderShield = true; Log("  SHIELD LEADER");
                     break;
@@ -2822,38 +2765,10 @@ namespace PtoServer
                 }
             }
 
-            // EFFECT PROJECTILE (op41): fire the confirmed queue-safe arrow (eid 0) from the caster along
-            // the real trajectory to the target, for single-target enemy-damage effects. The cast-pose
-            // bracket (op44/op45 in HandleOrder) gates next_que_effect around it. PTO_EFXID (>=0) overrides
-            // the eid AND fires for every effect (calibration mode).
+            // Fire the themed op41 effect(s) for this effect kind (see EfxOf/FireEffect). The cast-pose
+            // bracket (op44/op45 in HandleOrder) gates next_que_effect around it.
             if (theirs != null)
-            {
-                if (EfxProbeId >= 0)
-                {
-                    int eid = EfxProbeId;
-                    if (EfxCycle)
-                    {
-                        if (_efxNext == int.MinValue) _efxNext = Math.Max(0, EfxProbeId);
-                        // skip the already-identified projectile eids
-                        while (_efxNext == 0 || _efxNext == 12 || _efxNext == 16 || _efxNext == 21 || _efxNext == 23) _efxNext++;
-                        eid = _efxNext;
-                        _efxNext++;
-                    }
-                    if (eid >= 0 && eid <= 25)
-                    {
-                        int oi = EfxObjIndex[eid];
-                        Log("  EFX " + (EfxCycle ? "CYCLE" : "PROBE") + ": eid=" + eid + " (objIndex " + oi + ") "
-                            + "(" + casterX + "," + casterY + ") -> enemy (" + gx + "," + enemyGy + ")  [cast this at an enemy; note the visual + whether play continues]");
-                        SendEffect(mine, theirs, casterX, casterY, gx, enemyGy, false, eid, false, eff.Amount);
-                    }
-                    else Log("  EFX CYCLE: swept past eid 25 (done)");
-                }
-                else
-                {
-                    // Production: fire the themed effect(s) per effect kind (see EfxOf/FireEffect).
-                    FireEffect(eff, mine, theirs, b, casterX, casterY, gx, enemyGy, selfGy);
-                }
-            }
+                FireEffect(eff, mine, theirs, b, casterX, casterY, gx, enemyGy, selfGy);
 
             // Turn any enemy units the effect just killed into corpses immediately (kept in sync).
             if (theirs != null) ProcessImmediateDeaths(opPs, theirs, mine, b);
@@ -2958,8 +2873,6 @@ namespace PtoServer
                 case 79: return new OrderEffect { Kind = OrderKind.Polymorph };                  // Riflam: transform target hero into a random hero (new hero enters full-life)
                 case 99: return new OrderEffect { Kind = OrderKind.Silence };                    // Baenvier: Silence an enemy hero (rider: +1 leader Strength TODO)
                 case 111:return new OrderEffect { Kind = OrderKind.OrbBoost, Amount = 1 };        // Malandrax: gain an orb (rider: discard a random card + 6-orb cap TODO)
-                case 108:return new OrderEffect { Kind = OrderKind.MoveDamage, Free = true };     // Batrov: move all damage A->B (two-step: 1st cast picks A, 2nd picks B)
-                case 100:return new OrderEffect { Kind = OrderKind.MarkPosition };                // Pendros: mark a hero to its current position (abilities follow the mark when it moves)
                 case 28: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 5 }; break; // Berserker R: Bombard 5 (random)
                 case 29: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 4 };        // Assassin V: Backstab 4 (leader)
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 2 }; break; // Assassin R: Backstab 2 (leader)
@@ -3478,15 +3391,12 @@ namespace PtoServer
                 if (ax == 1 && ay == 1) casterCard = ps.LeaderCard;
                 else { BUnit cu; if (ps.Units.TryGetValue(Key(ax, ay), out cu) && cu != null && !cu.IsCorpse) casterCard = cu.Card; }
 
-                // Batrov (#108) / Pendros (#100): leader specials that need extra targeting data (from-cell /
-                // V/F/R) the standard fields don't carry. DIAGNOSTIC: dump the raw payload so a single in-game
-                // cast reveals exactly what the current client sends. Dispatch if the extra bytes are present.
+                // Batrov (#108) / Pendros (#100): leader specials whose extra targeting (from-cell / V/F/R)
+                // the patched client appends to the op22 payload; HandleLeaderSpecial parses those bytes.
                 if (casterCard / 2 == 108 || casterCard / 2 == 100)
                 {
-                    Log("  LEADER-SPECIAL DIAG: card " + casterCard + " ax=" + ax + " ay=" + ay + " tx=" + tx + " ty=" + ty
-                        + " selectGrid=" + selectGrid + " payloadLen=" + payload.Length + " hex=" + BitConverter.ToString(payload));
                     if (HandleLeaderSpecial(mine, theirs, b, ps, casterCard, tx, ty, payload, r)) return;
-                    // else: extra data not sent by this (unpatched) client -> fall through to the no-op below.
+                    // unpatched client (no extra bytes) -> falls through to the no-op below.
                 }
 
                 OrderEffect seff = (casterCard != 0) ? SpellOf(casterCard, ax) : new OrderEffect { Kind = OrderKind.None };
@@ -3510,8 +3420,7 @@ namespace PtoServer
                                   || seff.Kind == OrderKind.Decoy || seff.Kind == OrderKind.Swap
                                   || seff.Kind == OrderKind.Seance || seff.Kind == OrderKind.Transfusion
                                   || seff.Kind == OrderKind.ForceCube || seff.Kind == OrderKind.GrantRanged
-                                  || seff.Kind == OrderKind.ShieldRear || seff.Kind == OrderKind.MoveDamage
-                                  || seff.Kind == OrderKind.MarkPosition);
+                                  || seff.Kind == OrderKind.ShieldRear);
                 if (IsEnemyTargeting(seff.Kind) && selectGrid)
                 {
                     Log("  -> SPELL rejected: " + seff.Kind + " must target an ENEMY hero (own board clicked)");
@@ -4410,7 +4319,6 @@ namespace PtoServer
             // Restructure ("free move/clear-corpse until end of turn") expires at end of turn.
             // (Strength Buff lasts until end of WAVE — cleared in ResetWaveFlags, not here.)
             b.P[mine.P].RestructureFree = false;
-            b.P[mine.P].BatrovSource = -1; // a dangling Batrov "from" selection doesn't carry to the next turn
             // Phantom cards vanish from the ending player's hand at end of their turn.
             {
                 PlayerState eps = b.P[mine.P];
