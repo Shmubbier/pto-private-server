@@ -363,7 +363,7 @@ namespace PtoServer
             string user = r.ReadString();
             string pass = r.ReadString();
             ushort version = r.ReadU16();
-            Log((register ? "REGISTER" : "LOGIN") + " user='" + user + "' pass='" + pass + "' version=" + version);
+            Log((register ? "REGISTER" : "LOGIN") + " user='" + user + "' version=" + version);
 
             if (ClientVersion != 0 && version != ClientVersion)
             {
@@ -372,7 +372,42 @@ namespace PtoServer
                 return;
             }
 
-            username = string.IsNullOrEmpty(user) ? "Player" : user;
+            user = (user ?? "").Trim();
+            if (user.Length == 0 || string.IsNullOrEmpty(pass))
+            {
+                Send(ns, new PacketWriter().WriteU8(LoginResult.NotRegistered).Frame(Op.Login));
+                Log("-> rejected: empty username or password");
+                return;
+            }
+
+            if (register)
+            {
+                if (!Accounts.Register(user, pass))
+                {
+                    Send(ns, new PacketWriter().WriteU8(LoginResult.UsernameExists).Frame(Op.Login));
+                    Log("-> register rejected: username taken");
+                    return;
+                }
+                Log("-> registered new account '" + user + "'");
+            }
+            else
+            {
+                int v = Accounts.Verify(user, pass);
+                if (v < 0)
+                {
+                    Send(ns, new PacketWriter().WriteU8(LoginResult.NotRegistered).Frame(Op.Login));
+                    Log("-> login rejected: not registered");
+                    return;
+                }
+                if (v == 0)
+                {
+                    Send(ns, new PacketWriter().WriteU8(LoginResult.BadPassword).Frame(Op.Login));
+                    Log("-> login rejected: bad password");
+                    return;
+                }
+            }
+
+            username = user;
 
             Send(ns, new PacketWriter().WriteU8(LoginResult.Success).WriteString(username).Frame(Op.Login));
             Log("-> login success as '" + username + "'");
@@ -4786,6 +4821,81 @@ namespace PtoServer
         public string Name = "";
         public ushort Back, Land;
         public ushort[] Cards = new ushort[31];
+    }
+
+    // Persistent accounts: username -> "salt:sha256hex". Flat file data/accounts.txt, one line per account.
+    // Passwords are never stored or logged in plaintext.
+    static class Accounts
+    {
+        static readonly object _lock = new object();
+        static Dictionary<string, string> _acct; // normalized user -> "salt:hash"
+        static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data"); } }
+        static string FilePath { get { return Path.Combine(Dir, "accounts.txt"); } }
+
+        static string Norm(string u) { return (u ?? "").Trim().ToLowerInvariant(); }
+
+        static string Hash(string salt, string pass)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(salt + ":" + pass))).Replace("-", "");
+        }
+
+        static void EnsureLoaded()
+        {
+            if (_acct != null) return;
+            _acct = new Dictionary<string, string>();
+            try
+            {
+                if (File.Exists(FilePath))
+                    foreach (string line in File.ReadAllLines(FilePath))
+                    {
+                        int i = line.IndexOf('|');
+                        if (i > 0) _acct[line.Substring(0, i)] = line.Substring(i + 1);
+                    }
+            }
+            catch (Exception e) { Console.WriteLine("Accounts load error: " + e.Message); }
+        }
+
+        static void Persist()
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                var sb = new StringBuilder();
+                foreach (var kv in _acct) sb.Append(kv.Key).Append('|').Append(kv.Value).Append('\n');
+                File.WriteAllText(FilePath, sb.ToString());
+            }
+            catch (Exception e) { Console.WriteLine("Accounts save error: " + e.Message); }
+        }
+
+        // true = created; false = username already taken.
+        public static bool Register(string user, string pass)
+        {
+            string u = Norm(user);
+            lock (_lock)
+            {
+                EnsureLoaded();
+                if (_acct.ContainsKey(u)) return false;
+                string salt = Guid.NewGuid().ToString("N");
+                _acct[u] = salt + ":" + Hash(salt, pass);
+                Persist();
+                return true;
+            }
+        }
+
+        // -1 = not registered, 0 = wrong password, 1 = ok.
+        public static int Verify(string user, string pass)
+        {
+            string u = Norm(user);
+            lock (_lock)
+            {
+                EnsureLoaded();
+                string rec;
+                if (!_acct.TryGetValue(u, out rec)) return -1;
+                int c = rec.IndexOf(':');
+                return Hash(rec.Substring(0, c), pass) == rec.Substring(c + 1) ? 1 : 0;
+            }
+        }
     }
 
     static class DeckStore
