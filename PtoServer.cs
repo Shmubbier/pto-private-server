@@ -866,7 +866,8 @@ namespace PtoServer
                     foreach (int k in keys) DamageEnemyAt(opPs, k / 10, k % 10, 3);
                     opPs.LeaderLife -= 1;
                     Log("  LEADER (Lixis): 3 to all rival heroes + 1 to rival leader (rival leader life " + opPs.LeaderLife + ")");
-                    ProcessImmediateDeaths(opPs, opp, own, b);
+                    if (ps.LeaderCard / 2 == 5 || opPs.LeaderCard / 2 == 5)
+                        ProcessImmediateDeaths(opPs, opp, own, b);
                 }
                 else if (lr == 18) // Magdelina: each hero + leader in your unit gains Strength 1 (persistent)
                 {
@@ -2462,7 +2463,16 @@ namespace PtoServer
                             SendEffect(mine, theirs, casterX, casterY, gx, y, targetSelf, 22, false, 0); // obj_single_polymorph
                             SendDestroyUnit(tOwner, tOpp, gx, y);
                             PlaceUnit(tOwner, tOpp, b, nc, gx, y, 0, false);
-                            Log("  POLYMORPH: " + (targetSelf ? "own" : "enemy") + " (" + gx + "," + y + ") -> card " + nc);
+                            if (eff.Amount > 0)
+                            {
+                                BUnit nu;
+                                if (tb.Units.TryGetValue(pk, out nu) && nu != null && nu.Damage > 0)
+                                {
+                                    nu.Damage = Math.Max(0, nu.Damage - eff.Amount);
+                                    SendEffect(mine, theirs, casterX, casterY, gx, y, targetSelf, 7, false, eff.Amount);
+                                }
+                            }
+                            Log("  POLYMORPH: " + (targetSelf ? "own" : "enemy") + " (" + gx + "," + y + ") -> card " + nc + (eff.Amount > 0 ? " (healed " + eff.Amount + ")" : ""));
                         }
                         else Log("  polymorph: no hero at (" + gx + "," + y + ") on " + (targetSelf ? "own" : "enemy") + " board");
                     }
@@ -2905,7 +2915,7 @@ namespace PtoServer
                 case 74: return new OrderEffect { Kind = OrderKind.FinisherKill, Free = true };  // Rayne: Quick: defeat a DAMAGED enemy hero (rider: discard a random card TODO)
                 case 77: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2 };   // Ivo: give a hero Strength 2 (+ passive +Str/hero aura, done in ApplyLeaderUnitGrants)
                 case 78: return new OrderEffect { Kind = OrderKind.GrantRanged };                // Lizaveta: give a friendly hero Ranged Attack (persistent)
-                case 79: return new OrderEffect { Kind = OrderKind.Polymorph };                  // Riflam: transform target hero into a random hero (new hero enters full-life)
+                case 79: return new OrderEffect { Kind = OrderKind.Polymorph, Amount = 2 };                // Riflam: transform target hero into a random hero, then heal 2 damage from it
                 case 99: return new OrderEffect { Kind = OrderKind.Silence };                    // Baenvier: Silence an enemy hero (rider: +1 leader Strength TODO)
                 case 111:return new OrderEffect { Kind = OrderKind.OrbBoost, Amount = 1 };        // Malandrax: gain an orb (rider: discard a random card + 6-orb cap TODO)
                 case 28: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 5 }; break; // Berserker R: Bombard 5 (random)
@@ -3632,7 +3642,16 @@ namespace PtoServer
             // two never disagree. Leaders melee. ax is the attacker's wave (grid_x).
             // Ranged if the attacker has the RangedAttack ability (own OR aura-granted; auras were
             // recomputed above), not just the card's own wave table.
-            bool isRanged = !attackerIsLeader && (attacker.Abilities & UnitAbility.RangedAttack) != 0;
+            bool isRanged;
+            if (attackerIsLeader)
+            {
+                int lc = ps.LeaderCard / 2;
+                isRanged = (lc == 7 || lc == 9 || lc == 78);
+            }
+            else
+            {
+                isRanged = (attacker.Abilities & UnitAbility.RangedAttack) != 0;
+            }
 
             // A MELEE unit can only attack if no ally is in front of it in its column (client rule
             // return_noone_infront; an ally at a higher wave in the same lane blocks it). The client
@@ -3942,6 +3961,7 @@ namespace PtoServer
         {
             for (int wave = 2; wave >= 0; wave--)
             {
+                if (wave == 1 && col == 1 && opPs.LeaderCard / 2 == 71) return 1;
                 int k = Key(wave, col);
                 BUnit u;
                 if (opPs.Units.TryGetValue(k, out u) && !u.IsCorpse && (u.Abilities & UnitAbility.Intercept) != 0)
@@ -4219,8 +4239,22 @@ namespace PtoServer
         // Vamp: whenever this hero deals attack damage, remove that much damage from ITSELF (self-heal).
         static void ApplyVamp(BattleSlot mine, BattleSlot theirs, Battle b, BUnit attacker, bool attackerIsLeader, int dealt, int ax, int ay)
         {
-            if (attackerIsLeader || attacker == null || dealt <= 0) return;
-            if ((attacker.Abilities & UnitAbility.Vamp) == 0 || attacker.Damage <= 0) return;
+            if (dealt <= 0) return;
+            PlayerState ps = b.P[mine.P];
+            if (attackerIsLeader)
+            {
+                if (ps.LeaderCard / 2 == 22 && ps.LeaderLife < ps.LeaderMax)
+                {
+                    int oldLife = ps.LeaderLife;
+                    ps.LeaderLife = Math.Min(ps.LeaderMax, ps.LeaderLife + dealt);
+                    int leaderHealed = ps.LeaderLife - oldLife;
+                    SendLeaderHp(mine, theirs, ps);
+                    Log("  -> LEADER VAMP (Demitras): +" + leaderHealed + " leader life (now " + ps.LeaderLife + ")");
+                    SendEffect(mine, theirs, 1, 1, 1, 1, true, 16, true, leaderHealed);
+                }
+                return;
+            }
+            if (attacker == null || (attacker.Abilities & UnitAbility.Vamp) == 0 || attacker.Damage <= 0) return;
             int before = attacker.Damage;
             attacker.Damage = Math.Max(0, before - dealt);
             int healed = before - attacker.Damage;
@@ -4348,6 +4382,8 @@ namespace PtoServer
 
             // Regen N: at the end of each of your turns, heal N damage from each of your Regen heroes.
             ApplyRegen(b.P[mine.P]);
+            if (b.P[1 - mine.P].LeaderCard / 2 == 5)
+                ProcessImmediateDeaths(b.P[mine.P], mine, theirs, b);
             // Leader end-of-turn passives (Kavri heal / Marmelee draw) for the player whose turn is ending.
             ApplyLeaderEndOfTurn(mine, theirs, b);
 

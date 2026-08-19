@@ -4,10 +4,11 @@ A clean-room compatibility server for the abandoned **Pixel Tactics Online: PreA
 client (`PTO_C.exe` / `data.win`). The original server (`ptotemserv.ddns.net`) is gone; this
 project reimplements the protocol so the client can connect again.
 
-**Status:** ✅ Login, lobby, **collection, and deckbuilder** working. The stock client connects,
-authenticates, reaches the main menu, shows a full card collection, and can build/save decks that
-persist across sessions. Actual gameplay (matchmaking + battle rules) is **not** implemented yet —
-see *Roadmap*.
+**Status:** ✅ **v1.0.0 — playable.** Login/register with real accounts, lobby, collection,
+deckbuilder, matchmaking, and a full server-authoritative **battle engine** are working. The stock
+client connects, players register a username + password, build decks, queue, and play complete
+matches. Every hero card's orders/spells, passives, positional and ongoing auras, traps, scry,
+discard, and all 25 leaders (passives + actives) are implemented, with themed cast effects.
 
 ---
 
@@ -61,60 +62,39 @@ The full opcode table and every `container_*` handler live in the client; see
 
 Requires only the in-box .NET Framework compiler (already on Windows) — no SDK, no internet.
 
-```powershell
-# build
-./build.ps1            # -> PtoServer.exe
+**One press:** double-click **`PTO Server.bat`**. It kills any stale server, builds fresh, and opens
+the server on `0.0.0.0:51338`. Close the window to stop it.
 
-# run
+Or by script:
+
+```powershell
+./build.ps1            # -> PtoServer.exe
 ./PtoServer.exe        # listens on 0.0.0.0:51338, verbose logging
 ./PtoServer.exe --quiet
+./start-lan.ps1        # LAN host: opens the firewall (if admin) and prints the LAN IP
 ```
 
-Then launch `PTO_C.exe`. With `settings.ini` pointing at the server's IP, log in with **any**
-username/password — this milestone accepts everyone.
+Then launch `PTO_C.exe` with `settings.ini` pointing at the server's IP, and click **Register** in
+the client to create an account (username + password, stored under `data/`).
 
 - Same machine: `IP=127.0.0.1`.
 - LAN / friends: set `IP=` to the server host's LAN or public IP and forward TCP **51338**.
 
 ---
 
-## Roadmap
+## What works (v1.0.0)
 
-1. **[done]** Framing, login/register, lobby entry, ping keepalive.
-2. **[done]** Post-login data load: full collection (cards/backs/lands) + stages, so the
-   Collection and Deckbuilder screens populate (opcodes 49/60).
-3. **[done]** Deck saving: parse client deck saves (op 47 C→S), persist per-user under `data/`,
-   and send saved decks back on login (op 47 S→C).
-4. **[done]** Matchmaking (Arena queue): pair two clients (op 0 join / op 1 cancel), send the
-   `battle_start` handshake so both fade into `rm_battle`, then deliver both players' `battle_details`
-   and each player's opening hand via `battle_data` in response to the client's `op 20` ready signal.
-5. Account persistence (real user database, password checks, "already logged in").
-6. The hard part: the authoritative **battle engine**. The client is fully server-driven —
-   every draw/summon/attack/turn is a `container_*` message. Each must be reimplemented
-   server-side per the game's rules (Pixel Tactics ruleset).
-   - **[done, first cut]** Board reveal: sending both `battle_details` on the client's `op 20`
-     makes `display_UI` reach 2 (the HUD/board only draw at 2), fixing the earlier black screen.
-   - **[done, first cut]** Mulligan → turn 1: on `op 37` from both players, the server keeps the
-     hand (no redraws yet) and sends `turn_get` (`op 14`) twice per client to end the mulligan and
-     begin turn 1. Verified via scripted clients; real-client visual confirmation pending.
-   - **[done, first cut]** Summon (`op 10`): server resolves the hand index to a card and relays
-     the placement — `summon_unit` (`op 5`) to the actor, `summon_unit_get` (`op 6`, mirrored) to
-     the opponent. End turn (`op 14` empty): server flips the active player with `turn_get`.
-   - **[todo — the big one]** Server-authoritative **combat**: the attack request (`op 22`) gives
-     the server attacker+target coords; the server must compute the damage, deaths, and winner and
-     dictate them via `attack` (`op 35`, carries a server-computed `dmg`), `casualties` (`op 23`),
-     unit HP updates, and `battle_end` (`op 3`). This is the Pixel Tactics rules engine (waves,
-     melee/ranged, intercept, armor, counter, orders, spells, leader HP, win). It computes exact
-     values the client only animates, so it needs real-client iteration to get right — it will
-     desync if wrong. This is the remaining bulk of "a completable match".
-
-## Verified so far
-
-- Login/lobby/collection/deckbuilder: confirmed against the real client (screenshots).
-- Matchmaking: two clients queue → server pairs them → both receive `battle_start` and transition
-  into the battle room; each then gets both players' details and its own 5-card opening hand.
-  Verified via protocol tests (two scripted clients) and a real client entering `rm_battle`.
-  Fully rendering/playing the board is battle-engine work (item 6).
+- **Accounts** — register/login with username + password, salted-SHA-256, persisted under `data/`.
+- **Lobby, collection, deckbuilder** — full card collection; decks build and persist per user.
+- **Matchmaking** — Arena queue pairs two clients (op 0 join / op 1 cancel); a lone queuer can play a
+  server-side **bot** (`PTO_BOT=1`) for solo testing.
+- **Server-authoritative battle engine** — every draw/summon/move/attack/turn is a server-computed
+  `container_*` message. Implemented: waves, melee/ranged, intercept, counter, armor, cover,
+  leader HP and win/loss; all hero card orders/spells; passives and positional + ongoing auras;
+  traps; scry and discard; and all 25 leaders' passives and active abilities — each with its themed
+  op41 cast effect.
+- **Two client patches** ship separately (`data.win` via UndertaleModTool): a required crash fix and
+  the Batrov/Pendros targeting patch. See the project notes.
 
 ## Notes / provenance
 
