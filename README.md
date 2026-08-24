@@ -1,10 +1,10 @@
-# Pixel Tactics Online (PTO_C151) — private server
+# Pixel Tactics Online (PTO_C151), private server
 
 A clean-room compatibility server for the abandoned **Pixel Tactics Online: PreAlpha v0.1.72**
 client (`PTO_C.exe` / `data.win`). The original server (`ptotemserv.ddns.net`) is gone; this
 project reimplements the protocol so the client can connect again.
 
-**Status:** ✅ **v1.0.0 — playable.** Login/register with real accounts, lobby, collection,
+**Status:** ✅ **v1.0.0, playable.** Login/register with real accounts, lobby, collection,
 deckbuilder, matchmaking, and a full server-authoritative **battle engine** are working. The stock
 client connects, players register a username + password, build decks, queue, and play complete
 matches. Every hero card's orders/spells, passives, positional and ongoing auras, traps, scry,
@@ -60,7 +60,7 @@ The full opcode table and every `container_*` handler live in the client; see
 
 ## Build & run
 
-Requires only the in-box .NET Framework compiler (already on Windows) — no SDK, no internet.
+Requires only the in-box .NET Framework compiler (already on Windows), no SDK, no internet.
 
 **One press:** double-click **`PTO Server.bat`**. It kills any stale server, builds fresh, and opens
 the server on `0.0.0.0:51338`. Close the window to stop it.
@@ -84,14 +84,14 @@ the client to create an account (username + password, stored under `data/`).
 
 ## What works (v1.0.0)
 
-- **Accounts** — register/login with username + password, salted-SHA-256, persisted under `data/`.
-- **Lobby, collection, deckbuilder** — full card collection; decks build and persist per user.
-- **Matchmaking** — Arena queue pairs two clients (op 0 join / op 1 cancel); a lone queuer can play a
+- **Accounts**, register/login with username + password, salted-SHA-256, persisted under `data/`.
+- **Lobby, collection, deckbuilder**, full card collection; decks build and persist per user.
+- **Matchmaking**, Arena queue pairs two clients (op 0 join / op 1 cancel); a lone queuer can play a
   server-side **bot** (`PTO_BOT=1`) for solo testing.
-- **Server-authoritative battle engine** — every draw/summon/move/attack/turn is a server-computed
+- **Server-authoritative battle engine**, every draw/summon/move/attack/turn is a server-computed
   `container_*` message. Implemented: waves, melee/ranged, intercept, counter, armor, cover,
   leader HP and win/loss; all hero card orders/spells; passives and positional + ongoing auras;
-  traps; scry and discard; and all 25 leaders' passives and active abilities — each with its themed
+  traps; scry and discard; and all 25 leaders' passives and active abilities, each with its themed
   op41 cast effect.
 - **Two client patches** ship separately (`data.win` via UndertaleModTool): a required crash fix and
   the Batrov/Pendros targeting patch. See the project notes.

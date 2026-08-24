@@ -1,4 +1,4 @@
-# PTO_C protocol — full opcode map
+# PTO_C protocol, full opcode map
 
 Extracted from the client's `packet_init` (opcode → script index) and the script index table.
 Direction is from the server's point of view where a handler exists on the client (S→C), i.e.
@@ -69,11 +69,11 @@ these are the client's receive handlers. Opcodes the client *sends* reuse the sa
 
 Sent by the server after a successful login (op 46 status 3), before `loaded` (op 48):
 
-- **op 49 add_card_to_collection** — `bool back, bool land, u16 cardId, u8 amount`.
+- **op 49 add_card_to_collection**, `bool back, bool land, u16 cardId, u8 amount`.
   cardId is a card-DB index 0..231 (116 cards × {normal even id, holographic odd id}), or a
   back id 0..10 when `back=1`, or a land id 0..4 when `land=1`. The client filters what is
   displayable by card `_special`/`_collection`, so granting every id is safe.
-- **op 60 stages** — `StageCount × (bool completed, bool unlocked)`; StageCount = 49 (stages 0..48).
+- **op 60 stages**, `StageCount × (bool completed, bool unlocked)`; StageCount = 49 (stages 0..48).
 
 ### Deck saving (op 47 is bidirectional)
 
@@ -86,18 +86,18 @@ Sent by the server after a successful login (op 46 status 3), before `loaded` (o
 ## Matchmaking + battle bootstrap (implemented)
 
 Client → Server:
-- **op 0 queue** — `u8 deckId`. Sent by the Arena READY button (deck must have exactly 31 cards).
-- **op 1 cancel** — `u8 deckId`. Leaves the queue.
-- **op 20 battle-ready** — empty. Sent by `rm_battle`'s creation code the moment the client enters
+- **op 0 queue**, `u8 deckId`. Sent by the Arena READY button (deck must have exactly 31 cards).
+- **op 1 cancel**, `u8 deckId`. Leaves the queue.
+- **op 20 battle-ready**, empty. Sent by `rm_battle`'s creation code the moment the client enters
   the battle room. Use this as the trigger to send that client its board data.
 
 Server → Client (after pairing two queued players):
-- **op 2 battle_start** — `u16 otherPlayer (=1), u16 battleId`. Creates `obj_fade`; the client fades
+- **op 2 battle_start**, `u16 otherPlayer (=1), u16 battleId`. Creates `obj_fade`; the client fades
   and `room_goto(rm_battle)`. Must be processed while the client is still in the deck-select menu.
-- **op 50 battle_details** — `bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool cpuOpponent,
+- **op 50 battle_details**, `bool me, u16 back, u16 land, str user, bool legend, u16 rank, bool cpuOpponent,
   bool unlocked`. Sent twice per client: `me=1` (self) and `me=0` (opponent). Requires
   `obj_battle_control` to exist, i.e. send only after the client's op 20.
-- **op 4 battle_data** — `u16 wavePlayer (0 = this client goes first), u8 handSize, handSize x u16
+- **op 4 battle_data**, `u16 wavePlayer (0 = this client goes first), u8 handSize, handSize x u16
   cardIds`. Delivers the opening hand and kicks off the mulligan.
 
 Note: opcode 4 = battle_data and opcode 45 = spell_remove (do not confuse the two).

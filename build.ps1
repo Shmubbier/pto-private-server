@@ -2,7 +2,7 @@
 # No .NET SDK or internet required.
 $csc = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 
-# Build each into single, quoted args. NOTE: /out:(Join-Path ...) does NOT work — PowerShell splits
+# Build each into single, quoted args. NOTE: /out:(Join-Path ...) does NOT work, PowerShell splits
 # it into a bare "/out:" plus a separate path token, so csc gets an empty /out: and no source file.
 # Interpolate the resolved path into one quoted string instead.
 $srvExe = Join-Path $PSScriptRoot "PtoServer.exe"
