@@ -412,8 +412,8 @@ namespace PtoServer
             Send(ns, new PacketWriter().WriteU8(LoginResult.Success).WriteString(username).Frame(Op.Login));
             Log("-> login success as '" + username + "'");
             SendAccountData(ns, username);
-            Send(ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.Loaded));
-            Log("-> loaded (door open -> lobby)");
+            Send(ns, new PacketWriter().WriteBool(RankStore.IsLegend(username)).WriteU16(RankStore.RankOf(username)).Frame(Op.Loaded));
+            Log("-> loaded (door open -> lobby), rank " + RankStore.RankOf(username));
         }
 
         const int CardDbCount = 232;
@@ -1117,6 +1117,7 @@ namespace PtoServer
             public int Active = 0; // absolute player index whose turn it is
             public int BotP = -1;  // player index controlled by the AI bot, or -1 if none
             public bool BotActing; // guard so only one bot-turn thread runs at a time
+            public bool RankRecorded; // guard so a battle updates the ranked ladder at most once
         }
 
         internal class PlayerState
@@ -1242,7 +1243,7 @@ namespace PtoServer
             if (slot.Opp != null && slot.Battle != null && !slot.Battle.Over)
             {
                 slot.Battle.Over = true;
-                try { Send(slot.Opp.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd)); } catch { }
+                SendBattleEnd(slot.Battle, slot.Opp, slot.Me);
                 Log("BATTLE END: " + slot.Me.User + " disconnected -> " + slot.Opp.User + " wins");
             }
         }
@@ -1390,6 +1391,22 @@ namespace PtoServer
 
         // ---- battle setup + mulligan ------------------------------------------
 
+        // Ranked battle end (op3). Records the ladder result exactly once (human-vs-human only; bot
+        // matches are skipped), persists it, then sends each present player their result + NEW rank.
+        // The client (container_battle_end) reads bool won + u16 rank and shows the rank on the end screen.
+        static void SendBattleEnd(Battle b, Waiting winner, Waiting loser)
+        {
+            if (b != null && !b.RankRecorded && b.BotP < 0 && winner != null && loser != null)
+            {
+                b.RankRecorded = true;
+                RankStore.RecordResult(winner.User, loser.User);
+            }
+            if (winner != null)
+                try { Send(winner.Ns, new PacketWriter().WriteBool(true).WriteU16(RankStore.RankOf(winner.User)).Frame(Op.BattleEnd)); } catch { }
+            if (loser != null)
+                try { Send(loser.Ns, new PacketWriter().WriteBool(false).WriteU16(RankStore.RankOf(loser.User)).Frame(Op.BattleEnd)); } catch { }
+        }
+
         static void SendBattleSetup(NetworkStream ns)
         {
             BattleSlot slot;
@@ -1414,10 +1431,10 @@ namespace PtoServer
             var ms = new MemoryStream();
 
             byte[] d1 = new PacketWriter().WriteBool(true).WriteU16(myBack).WriteU16(myLand)
-                .WriteString(me.User).WriteBool(false).WriteU16(0).WriteBool(false).WriteBool(true)
+                .WriteString(me.User).WriteBool(RankStore.IsLegend(me.User)).WriteU16(RankStore.RankOf(me.User)).WriteBool(false).WriteBool(true)
                 .Frame(Op.BattleDetails);
             byte[] d2 = new PacketWriter().WriteBool(false).WriteU16(opBack).WriteU16(opLand)
-                .WriteString(opp.User).WriteBool(false).WriteU16(0).WriteBool(false).WriteBool(true)
+                .WriteString(opp.User).WriteBool(RankStore.IsLegend(opp.User)).WriteU16(RankStore.RankOf(opp.User)).WriteBool(false).WriteBool(true)
                 .Frame(Op.BattleDetails);
             ms.Write(d1, 0, d1.Length);
             ms.Write(d2, 0, d2.Length);
@@ -2836,8 +2853,7 @@ namespace PtoServer
             {
                 b.Over = true;
                 Log("BATTLE END: " + mine.Me.User + " wins (order/spell lethal)");
-                Send(mine.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
-                if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                SendBattleEnd(b, mine.Me, theirs != null ? theirs.Me : null);
                 return;
             }
             // The caster's own leader can die from reflected effect damage, the caster then LOSES.
@@ -2845,8 +2861,7 @@ namespace PtoServer
             {
                 b.Over = true;
                 Log("BATTLE END: " + mine.Me.User + " loses (own leader killed by reflected effect damage)");
-                if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
-                Send(mine.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                SendBattleEnd(b, theirs != null ? theirs.Me : null, mine.Me);
                 return;
             }
 
@@ -3622,8 +3637,7 @@ namespace PtoServer
                     {
                         b.Over = true;
                         Log("BATTLE END: " + (theirs != null ? theirs.Me.User : "defender") + " wins (attacking leader Backlashed to death by trap)");
-                        if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
-                        Send(mine.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                        SendBattleEnd(b, theirs != null ? theirs.Me : null, mine.Me);
                         return;
                     }
                     if (freeAtk) GrantAction(mine); else ConsumeAction(mine, theirs, b);
@@ -3890,8 +3904,7 @@ namespace PtoServer
             {
                 b.Over = true;
                 Log("BATTLE END: " + mine.Me.User + " wins");
-                Send(mine.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
-                if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                SendBattleEnd(b, mine.Me, theirs != null ? theirs.Me : null);
                 return;
             }
 
@@ -4451,8 +4464,7 @@ namespace PtoServer
                         b.Over = true;
                         BattleSlot win = pi == 0 ? p1 : p0, lose = pi == 0 ? p0 : p1;
                         Log("BATTLE END: player " + pi + " leader routed by an end-of-round leader passive");
-                        Send(win.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
-                        Send(lose.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                        SendBattleEnd(b, win.Me, lose.Me);
                     }
                 if (b.Over) return;
                 b.Round++;
@@ -4554,8 +4566,7 @@ namespace PtoServer
                     BattleSlot winnerSlot = pi == 0 ? p1 : p0;
                     BattleSlot loserSlot = pi == 0 ? p0 : p1;
                     Log("BATTLE END: player " + pi + " leader routed -> player " + winner + " wins");
-                    Send(winnerSlot.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(0).Frame(Op.BattleEnd));
-                    Send(loserSlot.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(0).Frame(Op.BattleEnd));
+                    SendBattleEnd(b, winnerSlot.Me, loserSlot.Me);
                     return;
                 }
             }
@@ -5033,6 +5044,97 @@ namespace PtoServer
                     File.WriteAllText(FileFor(user), sb.ToString());
                 }
                 catch (Exception e) { Console.WriteLine("DeckStore save error: " + e.Message); }
+            }
+        }
+    }
+
+    // Persistent ranked ladder: normalized user -> [rank, wins, losses], flat file data/ranks.txt
+    // ("user|rank|wins|losses"). Rank is a personal climb-ladder position: the client draws
+    // floor(5/rank) for its icon, so LOWER is better and rank must be >= 1. New players start at
+    // StartRank; each win climbs toward 1, each loss falls toward MaxRank. Tune the constants below.
+    static class RankStore
+    {
+        const int StartRank = 25;  // where new players enter (outside the top icon tiers)
+        const int MinRank   = 1;   // the champion; also the "legend" threshold
+        const int MaxRank   = 99;  // worst possible position
+        const int WinStep   = 1;   // ranks gained (number decreases) per win
+        const int LossStep  = 1;   // ranks lost (number increases) per loss
+
+        static readonly object _lock = new object();
+        static Dictionary<string, int[]> _rank; // norm user -> [rank, wins, losses]
+        static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data"); } }
+        static string FilePath { get { return Path.Combine(Dir, "ranks.txt"); } }
+        static string Norm(string u) { return (u ?? "").Trim().ToLowerInvariant(); }
+
+        static void EnsureLoaded()
+        {
+            if (_rank != null) return;
+            _rank = new Dictionary<string, int[]>();
+            try
+            {
+                if (File.Exists(FilePath))
+                    foreach (string line in File.ReadAllLines(FilePath))
+                    {
+                        string[] f = line.Split('|');
+                        int r, w, l;
+                        if (f.Length >= 4 && f[0].Length > 0 && int.TryParse(f[1], out r)
+                            && int.TryParse(f[2], out w) && int.TryParse(f[3], out l))
+                            _rank[f[0]] = new[] { r, w, l };
+                    }
+            }
+            catch (Exception e) { Console.WriteLine("RankStore load error: " + e.Message); }
+        }
+
+        static void Persist()
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                var sb = new StringBuilder();
+                foreach (var kv in _rank)
+                    sb.Append(kv.Key).Append('|').Append(kv.Value[0]).Append('|')
+                      .Append(kv.Value[1]).Append('|').Append(kv.Value[2]).Append('\n');
+                File.WriteAllText(FilePath, sb.ToString());
+            }
+            catch (Exception e) { Console.WriteLine("RankStore save error: " + e.Message); }
+        }
+
+        static int[] Ensure(string norm) // caller holds _lock
+        {
+            int[] e;
+            if (!_rank.TryGetValue(norm, out e)) { e = new[] { StartRank, 0, 0 }; _rank[norm] = e; }
+            return e;
+        }
+
+        // Current ladder position (>= 1). The bot / empty users are unranked and never persisted.
+        public static ushort RankOf(string user)
+        {
+            string n = Norm(user);
+            if (n.Length == 0 || n == "bot") return StartRank;
+            lock (_lock)
+            {
+                EnsureLoaded();
+                bool isNew = !_rank.ContainsKey(n);
+                int r = Ensure(n)[0];
+                if (isNew) Persist();
+                return (ushort)Math.Max(MinRank, Math.Min((int)ushort.MaxValue, r));
+            }
+        }
+
+        public static bool IsLegend(string user) { return RankOf(user) == MinRank; }
+
+        // Human-vs-human only: winner climbs toward 1, loser falls toward MaxRank; both persisted.
+        public static void RecordResult(string winner, string loser)
+        {
+            string w = Norm(winner), l = Norm(loser);
+            if (w.Length == 0 || l.Length == 0 || w == l || w == "bot" || l == "bot") return;
+            lock (_lock)
+            {
+                EnsureLoaded();
+                int[] we = Ensure(w), le = Ensure(l);
+                we[0] = Math.Max(MinRank, we[0] - WinStep); we[1]++;
+                le[0] = Math.Min(MaxRank, le[0] + LossStep); le[2]++;
+                Persist();
             }
         }
     }
