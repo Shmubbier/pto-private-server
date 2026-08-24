@@ -2917,6 +2917,7 @@ namespace PtoServer
             {
                 // ---- LEADER active abilities (leader casts its Flank f_spell via the isSpell path at grid_x=1).
                 //      Leader REALs (0-25) never collide with hero REALs (26+). ----
+                case 12: return new OrderEffect { Kind = OrderKind.Inspire };                    // Borneo: Spell: Inspire (f_spell=1, castable in the Flank wave)
                 case 19: return new OrderEffect { Kind = OrderKind.LucHaste, Free = true };      // Luc Von Gott: apply 1 dmg to leader, gain 2 actions
                 case 21: return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 };         // Khadath: Banish 1 (once/turn, client-gated)
                 case 23: return new OrderEffect { Kind = OrderKind.RaiseDead, Amount = 3 };      // Hepzibah: cast Raise Dead
