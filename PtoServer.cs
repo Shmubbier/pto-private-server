@@ -499,7 +499,9 @@ namespace PtoServer
         // ---- ability lookup (position-dependent per PT rules) -----------------
         // Returns the abilities a card has when placed in the given wave.
         // Wave: 2=Vanguard, 1=Flank, 0=Rear.
-        // TODO: populate from data.win reverse-engineering for full accuracy.
+        // Self-passives + ranged are transcribed from the client card_init V/F/R text and
+        // cross-checked against it (see BuildPassives / BuildRangedWaves). Positional auras
+        // (Forerunner:/Supporter:/Unit:/Leader:) are a separate tier handled in the aura system.
         static UnitAbility GetUnitAbilities(ushort card, int wave)
         {
             SelfPassive p = PassiveOf(card, wave);
@@ -1019,6 +1021,16 @@ namespace PtoServer
             a[52] = 0x2; // Fire Elem    - Flank R.Attack
             a[54] = 0x2; // Air Elem     - Flank R.Attack
             a[55] = 0x2; // Dark Elem    - Flank R.Attack
+            a[56] = 0x1; // Lightning Elem - Rear R.Attack
+            a[63] = 0x1; // Divinity     - Rear R.Attack
+            a[68] = 0x3; // Sniper       - Flank + Rear R.Attack (Rear also via its Ongoing aura)
+            a[69] = 0x2; // Warmage      - Flank R.Attack
+            a[81] = 0x1; // Twinblade    - Rear R.Attack
+            a[82] = 0x7; // Ranger       - all waves R.Attack
+            a[89] = 0x1; // Legionnaire  - Rear R.Attack
+            a[91] = 0x1; // Commando     - Rear R.Attack
+            a[93] = 0x7; // Pistolier    - all waves R.Attack
+            a[94] = 0x4; // Magus        - Vanguard R.Attack
             return a;
         }
         static bool IsRangedAtWave(ushort card, int wave)
@@ -2909,15 +2921,15 @@ namespace PtoServer
                 case 21: return new OrderEffect { Kind = OrderKind.Banish, Amount = 1 };         // Khadath: Banish 1 (once/turn — client-gated)
                 case 23: return new OrderEffect { Kind = OrderKind.RaiseDead, Amount = 3 };      // Hepzibah: cast Raise Dead
                 // ---- gen-2 leader actives (same isSpell path; f_spell=4/5 makes the client always offer the
-                //      cast). Mapped to existing effects; minor riders noted (leader life/str cost, discard) TODO.
-                case 70: return new OrderEffect { Kind = OrderKind.ShieldHero, Free = true };    // Merjoram: Quick: give a hero Shield (rider: -2 leader life TODO)
+                //      cast). Mapped to existing effects; extra rider costs/bonuses applied in the ax==1&&ay==1 block below.
+                case 70: return new OrderEffect { Kind = OrderKind.ShieldHero, Free = true };    // Merjoram: Quick: give a hero Shield (rider: -2 leader life)
                 case 73: return new OrderEffect { Kind = OrderKind.Phantom, Amount = 1 };        // Luca: cast Phantom (return a random discard to hand)
-                case 74: return new OrderEffect { Kind = OrderKind.FinisherKill, Free = true };  // Rayne: Quick: defeat a DAMAGED enemy hero (rider: discard a random card TODO)
+                case 74: return new OrderEffect { Kind = OrderKind.FinisherKill, Free = true };  // Rayne: Quick: defeat a DAMAGED enemy hero (rider: discard a random card)
                 case 77: return new OrderEffect { Kind = OrderKind.StrengthBuff, Amount = 2 };   // Ivo: give a hero Strength 2 (+ passive +Str/hero aura, done in ApplyLeaderUnitGrants)
                 case 78: return new OrderEffect { Kind = OrderKind.GrantRanged };                // Lizaveta: give a friendly hero Ranged Attack (persistent)
-                case 79: return new OrderEffect { Kind = OrderKind.Polymorph, Amount = 2 };                // Riflam: transform target hero into a random hero, then heal 2 damage from it
-                case 99: return new OrderEffect { Kind = OrderKind.Silence };                    // Baenvier: Silence an enemy hero (rider: +1 leader Strength TODO)
-                case 111:return new OrderEffect { Kind = OrderKind.OrbBoost, Amount = 1 };        // Malandrax: gain an orb (rider: discard a random card + 6-orb cap TODO)
+                case 79: return new OrderEffect { Kind = OrderKind.Polymorph, Amount = 2 };      // Riflam: transform target hero into a random hero, then heal 2 damage from it
+                case 99: return new OrderEffect { Kind = OrderKind.Silence };                    // Baenvier: Silence an enemy hero (rider: +1 leader Strength)
+                case 111:return new OrderEffect { Kind = OrderKind.OrbBoost, Amount = 1 };        // Malandrax: gain an orb (rider: discard a random card; 6-orb cap via OrbCap)
                 case 28: if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageRandom, Amount = 5 }; break; // Berserker R: Bombard 5 (random)
                 case 29: if (wave == 2) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 4 };        // Assassin V: Backstab 4 (leader)
                          if (wave == 0) return new OrderEffect { Kind = OrderKind.DamageLeader, Amount = 2 }; break; // Assassin R: Backstab 2 (leader)
