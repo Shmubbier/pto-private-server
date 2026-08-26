@@ -22,10 +22,12 @@ PtoServer, the other connects to it over the relay. Same on both machines.
 2. **Steam relay** - DONE (built; `check` confirmed a live `SteamAPI.Init` +
    relay-access init against a real Steam client). `SteamPeer.cs` wraps a
    SteamNetworkingSockets relay connection as a `Stream`, so it drops into the same
-   `PumpAsync`. AppID 480 via `steam_appid.txt`; built x86, so it needs the MODERN
-   32-bit `steam_api.dll` matching Steamworks.NET 2024.8.0 (Windows-x86 dll from
-   `Steamworks.NET-Standalone_2024.8.0.zip` or SDK 1.60). The game's own 2018-era
-   `steam_api.dll` has no networking API and will NOT work for the launcher.
+   `PumpAsync`. AppID 480 via `steam_appid.txt`; built x64 (so it shares one .NET 10
+   runtime with the server), so it needs the MODERN 64-bit `steam_api64.dll` matching
+   Steamworks.NET 2024.8.0 (Windows-x64 dll from `Steamworks.NET-Standalone_2024.8.0.zip`
+   or SDK 1.60). The game's own 2018-era `steam_api.dll` has no networking API and will
+   NOT work for the launcher. Both launcher and server target **net10** and run on a
+   single .NET 10 x64 runtime.
 3. **Firebase meta client** - DONE. Data model is local-first + a thin cloud
    metaservice (see NETWORKING.md): accounts/decks/campaign stay on each machine;
    only genuinely-shared state lives in Firebase RTDB, reached by REST (no SDK). Set

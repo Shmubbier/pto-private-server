@@ -5,25 +5,26 @@
     <AssemblyName>ptolaunch</AssemblyName>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <!-- x86 to match the 32-bit steam_api.dll shipped in the repo (Steamworks.NET
-         win-x86 P/Invokes steam_api.dll; win-x64 would need steam_api64.dll). -->
-    <RuntimeIdentifier>win-x86</RuntimeIdentifier>
-    <PlatformTarget>x86</PlatformTarget>
+    <!-- x64 so it shares one .NET 10 runtime with the server. Uses steam_api64.dll
+         (Steamworks.NET win-x64). The game is a separate 32-bit process with its own
+         steam_api.dll, so the launcher's arch is independent of it. -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PlatformTarget>x64</PlatformTarget>
     <SelfContained>false</SelfContained>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Steamworks.NET" Version="2024.8.0" />
   </ItemGroup>
   <ItemGroup>
-    <!-- steam_api.dll must sit beside the exe; steam_appid.txt=480 lets Init run
-         without launching via Steam. Use the MODERN 32-bit dll that matches
+    <!-- steam_api64.dll must sit beside the exe; steam_appid.txt=480 lets Init run
+         without launching via Steam. Use the MODERN 64-bit dll that matches
          Steamworks.NET 2024.8.0 (has SteamNetworkingSockets012 for the relay): the
-         Windows-x86 steam_api.dll from Steamworks.NET-Standalone_2024.8.0.zip
+         Windows-x64 steam_api64.dll from Steamworks.NET-Standalone_2024.8.0.zip
          (github.com/rlabrecque/Steamworks.NET releases) or Steamworks SDK 1.60. Do
          NOT use the game's Clients/ dll - that one is ~2018 and has no networking API.
          Git-ignored like the other native bins; guarded so a clone without it still
          builds (Steam path just won't run until it's present). -->
-    <None Include="steam_api.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('steam_api.dll')" />
+    <None Include="steam_api64.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('steam_api64.dll')" />
     <None Include="steam_appid.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

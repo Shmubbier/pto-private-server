@@ -188,11 +188,22 @@ static class Program
     {
         if (await TryConnectServerAsync()) return true;
         string exe = Environment.GetEnvironmentVariable("PTO_SERVER_EXE") ?? "PtoServer.exe";
-        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false }); }
-        catch (Exception ex) { Console.WriteLine($"could not start server '{exe}': {ex.Message}"); return false; }
+        if (TrySpawnServer(exe) == null) return false;
         for (int i = 0; i < 20; i++) { if (await TryConnectServerAsync()) return true; await Task.Delay(500); }
         Console.WriteLine("server did not come up on 127.0.0.1:51338");
         return false;
+    }
+
+    static System.Diagnostics.Process? TrySpawnServer(string exe)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false };
+            var dir = Path.GetDirectoryName(Path.GetFullPath(exe));
+            if (!string.IsNullOrEmpty(dir)) psi.WorkingDirectory = dir;
+            return System.Diagnostics.Process.Start(psi);
+        }
+        catch (Exception ex) { Console.WriteLine($"could not start server '{exe}': {ex.Message}"); return null; }
     }
 
     static async Task<bool> TryConnectServerAsync()
@@ -263,8 +274,24 @@ static class Program
 
         string exe = Environment.GetEnvironmentVariable("PTO_SERVER_EXE") ?? "PtoServer.exe";
         if (await TryConnectServerAsync()) Console.WriteLine("[ ok ] Server: already listening on 127.0.0.1:51338");
-        else if (File.Exists(exe)) Console.WriteLine($"[ ok ] Server: {exe} present (auto-starts when you are the authority)");
-        else { Console.WriteLine($"[FAIL] Server: '{exe}' not found (set PTO_SERVER_EXE)"); ok = false; }
+        else if (!File.Exists(exe)) { Console.WriteLine($"[FAIL] Server: '{exe}' not found (set PTO_SERVER_EXE)"); ok = false; }
+        else
+        {
+            // Actually launch it: a present-but-unrunnable server (e.g. missing .NET
+            // runtime) must fail here, not silently mid-match.
+            var proc = TrySpawnServer(exe);
+            if (proc == null) { Console.WriteLine("[FAIL] Server: could not start (see error above)"); ok = false; }
+            else
+            {
+                bool up = false;
+                for (int i = 0; i < 16 && !up; i++) { if (await TryConnectServerAsync()) up = true; else await Task.Delay(250); }
+                Console.WriteLine(up
+                    ? "[ ok ] Server: starts and binds 127.0.0.1:51338"
+                    : "[FAIL] Server: present but did not bind (is the .NET 10 runtime installed?)");
+                ok &= up;
+                try { proc.Kill(true); } catch { }
+            }
+        }
 
         Console.WriteLine(ok ? "\nAll good. Run play.bat to matchmake." : "\nSome checks failed (see above).");
         return ok ? 0 : 1;
