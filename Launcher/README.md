@@ -17,10 +17,12 @@ patches 05/07/08 are untouched.
    plain-TCP peer link (`ptolaunch host` / `ptolaunch join <ip>` for two boxes).
    A bridge is "accept here, connect there, pump bytes", so host and join are the
    same `ServeAsync`.
-2. Steam relay (step 1b): replace the ONE peer hop. JOIN's outbound `TcpClient`
-   becomes a SteamNetworkingSockets relay-connect by SteamID; HOST's inbound
-   accept becomes a relay-accept. Both still yield a `Stream` to `PumpAsync`, so
-   nothing else changes. AppID 480 (Spacewar) via `steam_appid.txt`, Steamworks.NET.
+2. **Steam relay (step 1b)** - DONE (built; runtime needs a Steam client + two
+   boxes to exercise). `SteamPeer.cs` wraps a SteamNetworkingSockets relay
+   connection as a `Stream`, so it drops into the same `PumpAsync`. `ptolaunch
+   steamhost` prints your SteamID64; `ptolaunch steamjoin <id>` tunnels the local
+   game to it. AppID 480 via `steam_appid.txt`; built x86 to match the repo's
+   32-bit `steam_api.dll` (x64 would need `steam_api64.dll`).
 3. Lobby create / list / join + friend invites (ISteamMatchmaking).
 4. Session-scoped roster (each player owns local accounts/decks; peer info kept
    for the session only unless friended).

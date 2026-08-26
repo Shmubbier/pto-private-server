@@ -28,10 +28,18 @@ static class Program
                 await ServeAsync(IPAddress.Loopback, GamePort,
                                  args.Length > 1 ? args[1] : "127.0.0.1", PeerPort, CancellationToken.None);
                 return 0;
+            case "steamhost": // accept relay peers, bridge each to the local server
+                await SteamHostAsync();
+                return 0;
+            case "steamjoin": // tunnel the local game to a host's SteamID over the relay
+                if (args.Length < 2 || !ulong.TryParse(args[1], out var hostId))
+                { Console.WriteLine("usage: ptolaunch steamjoin <hostSteamId64>"); return 1; }
+                await SteamJoinAsync(hostId);
+                return 0;
             case "demo":
                 return await DemoAsync();
             default:
-                Console.WriteLine("usage: ptolaunch host | join <hostip> | demo");
+                Console.WriteLine("usage: ptolaunch host | join <hostip> | steamhost | steamjoin <id> | demo");
                 return 1;
         }
     }
@@ -68,6 +76,55 @@ static class Program
             }
         }
         catch (Exception ex) { Console.WriteLine($"bridge closed: {ex.Message}"); }
+    }
+
+    // HOST over Steam: same shape as `host`, but the inbound hop is the relay.
+    static async Task SteamHostAsync()
+    {
+        using var relay = new SteamRelay();
+        relay.Init();
+        Console.WriteLine($"steam host ready. Share your SteamID64: {relay.MySteamId}");
+        relay.Listen(async peer =>
+        {
+            try
+            {
+                using (peer)
+                using (var server = new TcpClient())
+                {
+                    await server.ConnectAsync(IPAddress.Loopback, GamePort);
+                    server.NoDelay = true;
+                    await PumpAsync(peer, server.GetStream());
+                }
+            }
+            catch (Exception ex) { Console.WriteLine($"peer bridge closed: {ex.Message}"); }
+        });
+        await Task.Delay(Timeout.Infinite); // run until killed
+    }
+
+    // JOIN over Steam: same shape as `join`, but the outbound hop is the relay. One
+    // fresh relay connection per game TCP connection, mirroring the host side.
+    static async Task SteamJoinAsync(ulong hostSteamId)
+    {
+        using var relay = new SteamRelay();
+        relay.Init();
+        var l = new TcpListener(IPAddress.Loopback, GamePort);
+        l.Start();
+        Console.WriteLine($"joined host {hostSteamId}. Launch the game (settings.ini IP=127.0.0.1).");
+        while (true)
+        {
+            var game = await l.AcceptTcpClientAsync();
+            game.NoDelay = true;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using (game)
+                    using (var peer = await relay.ConnectAsync(hostSteamId))
+                        await PumpAsync(game.GetStream(), peer);
+                }
+                catch (Exception ex) { Console.WriteLine($"game bridge closed: {ex.Message}"); }
+            });
+        }
     }
 
     // Byte-for-byte tunnel between two streams. Never parses the protocol, so the

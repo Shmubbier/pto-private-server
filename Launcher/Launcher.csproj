@@ -5,5 +5,22 @@
     <AssemblyName>ptolaunch</AssemblyName>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- x86 to match the 32-bit steam_api.dll shipped in the repo (Steamworks.NET
+         win-x86 P/Invokes steam_api.dll; win-x64 would need steam_api64.dll). -->
+    <RuntimeIdentifier>win-x86</RuntimeIdentifier>
+    <PlatformTarget>x86</PlatformTarget>
+    <SelfContained>false</SelfContained>
   </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Steamworks.NET" Version="2024.8.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- steam_api.dll must sit beside the exe; steam_appid.txt=480 lets Init run
+         without launching via Steam. The dll is a Valve redistributable (git-ignored
+         like the other native bins); drop it in from Clients/Steam_Ver-PTO-C/ or the
+         Steamworks SDK. Guarded so a clone without it still builds (Steam path just
+         won't run until it's present). -->
+    <None Include="steam_api.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('steam_api.dll')" />
+    <None Include="steam_appid.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>
