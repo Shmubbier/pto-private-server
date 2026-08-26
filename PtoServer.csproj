@@ -11,4 +11,9 @@
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
+  <!-- Launcher/ is its own project (net10 + Steamworks); keep its sources out of the
+       server build, which otherwise globs every .cs under the repo root. -->
+  <ItemGroup>
+    <Compile Remove="Launcher/**/*.cs" />
+  </ItemGroup>
 </Project>
