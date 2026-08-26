@@ -24,6 +24,7 @@ sealed class SteamRelay : IDisposable
     volatile bool _run = true;
 
     public ulong MySteamId { get; private set; }
+    public string MyName { get; private set; } = "host";
 
     public void Init()
     {
@@ -31,6 +32,7 @@ sealed class SteamRelay : IDisposable
             throw new InvalidOperationException(
                 "SteamAPI.Init failed. Is Steam running, and steam_appid.txt (480) beside the exe?");
         MySteamId = SteamUser.GetSteamID().m_SteamID;
+        MyName = SteamFriends.GetPersonaName();
         SteamNetworkingUtils.InitRelayNetworkAccess(); // start warming a relay route
         _cb = Callback<SteamNetConnectionStatusChangedCallback_t>.Create(OnStatusChanged);
         _pump = new Thread(PumpLoop) { IsBackground = true, Name = "steam-pump" };
