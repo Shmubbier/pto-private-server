@@ -69,6 +69,60 @@ sealed class MetaClient
     }
 
     static long Now() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+    // --- Ranked ladder ---------------------------------------------------------
+    // The server's rank (RankStore) is a PERSONAL climb ladder: rank is a pure
+    // function of a player's own cumulative wins/losses, so it is host-independent
+    // and Firebase only needs to accumulate the counts. Each match is recorded on
+    // exactly one host, whose launcher bumps the counts once, so no double-count.
+    // Keep these constants in sync with RankStore in PtoServer.cs.
+    const int StartRank = 25, MinRank = 1, MaxRank = 99, WinStep = 1, LossStep = 1;
+
+    public static int RankFromCounts(int wins, int losses)
+        => Math.Max(MinRank, Math.Min(MaxRank, StartRank - wins * WinStep + losses * LossStep));
+
+    public async Task AddResultAsync(ulong winner, ulong loser)
+    {
+        await BumpAsync(winner, won: true);
+        await BumpAsync(loser, won: false);
+    }
+
+    // ponytail: read-modify-write, no transaction. A player is only ever in one
+    // battle at a time, so concurrent writes to the same row can't happen; use an
+    // ETag if-match or a Cloud Function only if that ever stops holding.
+    async Task BumpAsync(ulong id, bool won)
+    {
+        var row = await GetRowAsync(id);
+        if (won) row.wins++; else row.losses++;
+        using var c = new StringContent(JsonSerializer.Serialize(row), Encoding.UTF8, "application/json");
+        (await _http.PutAsync(Url($"ranked/{id}"), c)).EnsureSuccessStatusCode();
+    }
+
+    async Task<RankRow> GetRowAsync(ulong id)
+    {
+        var json = await _http.GetStringAsync(Url($"ranked/{id}"));
+        if (string.IsNullOrWhiteSpace(json) || json == "null") return new RankRow();
+        return JsonSerializer.Deserialize<RankRow>(json) ?? new RankRow();
+    }
+
+    // Whole ladder, best rank (lowest number) first.
+    public async Task<List<(string id, RankRow row)>> LadderAsync()
+    {
+        var json = await _http.GetStringAsync(Url("ranked"));
+        if (string.IsNullOrWhiteSpace(json) || json == "null") return new();
+        var map = JsonSerializer.Deserialize<Dictionary<string, RankRow>>(json) ?? new();
+        var outp = new List<(string, RankRow)>();
+        foreach (var kv in map) if (kv.Value != null) outp.Add((kv.Key, kv.Value));
+        outp.Sort((a, b) => RankFromCounts(a.Item2.wins, a.Item2.losses)
+                            .CompareTo(RankFromCounts(b.Item2.wins, b.Item2.losses)));
+        return outp;
+    }
+}
+
+sealed class RankRow
+{
+    public int wins { get; set; }
+    public int losses { get; set; }
 }
 
 sealed class HostEntry

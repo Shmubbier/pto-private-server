@@ -31,9 +31,14 @@ patches 05/07/08 are untouched.
    manual SteamID paste). Set `PTO_FIREBASE_URL` (+ optional `PTO_FIREBASE_AUTH`) or
    drop the RTDB URL in `firebase.txt`; unset = directory disabled, join by SteamID.
    `ptolaunch metademo` self-checks the presence logic against a local fake RTDB.
-   - Ranked ladder (next sub-step): Firebase, keyed by SteamID. Needs a server ->
-     launcher result signal (the launcher watches for battle-end, then writes the
-     result); spoofable until a Steam-auth-ticket Cloud Function validates matches.
+   - Ranked ladder - DONE. The server's rank is a personal climb ladder
+     (`rank = clamp(25 - wins + losses, 1, 99)`), a pure function of a player's own
+     counts, so it is host-independent: Firebase just accumulates wins/losses. On
+     `steamhost` the launcher tails the server's `data/matches.txt` (a line cursor
+     makes restarts count each match once) and bumps `/ranked/<steamid>`; `ptolaunch
+     ladder` prints it. `PTO_SERVER_DATA` points at the server data dir (default
+     `data`). `rankeddemo` self-checks it. Spoofable until a Steam-auth-ticket Cloud
+     Function validates matches (deferred ceiling).
    - Friends: use the Steam friends list (real identity, free on AppID 480).
 4. Session-scoped roster: the joiner's local account/decks reach the host's server
    for the session only, not persisted, unless the two friend each other.
@@ -41,5 +46,6 @@ patches 05/07/08 are untouched.
 
 ## Run the self-checks
 
-    dotnet run -c Release demo       # transport tunnel (4-hop byte round-trip)
-    dotnet run -c Release metademo   # presence directory against a local fake RTDB
+    dotnet run -c Release demo        # transport tunnel (4-hop byte round-trip)
+    dotnet run -c Release metademo    # presence directory against a local fake RTDB
+    dotnet run -c Release rankeddemo  # ranked count accumulation + rank derivation

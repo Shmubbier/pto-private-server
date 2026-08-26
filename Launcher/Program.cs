@@ -39,14 +39,18 @@ static class Program
                 return 0;
             case "hosts": // list live hosts from the directory (no Steam needed)
                 return await HostsAsync();
+            case "ladder": // print the shared ranked ladder (no Steam needed)
+                return await PrintLadderAsync();
             case "play": // pick a host from the directory, then join over the relay
                 return await PlayAsync();
             case "demo":
                 return await DemoAsync();
             case "metademo":
                 return await MetaDemoAsync();
+            case "rankeddemo":
+                return await RankedDemoAsync();
             default:
-                Console.WriteLine("usage: ptolaunch steamhost | play | hosts | steamjoin <id> | host | join <ip> | demo");
+                Console.WriteLine("usage: ptolaunch steamhost | play | hosts | ladder | steamjoin <id> | host | join <ip> | demo");
                 return 1;
         }
     }
@@ -107,6 +111,8 @@ static class Program
                 }
             });
             Console.WriteLine("presence: published to host directory (heartbeat 10s)");
+            _ = WatchMatchesAsync(meta); // push finished matches to the shared ladder
+            Console.WriteLine("ladder: watching server matches.txt");
         }
         else Console.WriteLine("presence: PTO_FIREBASE_URL not set, directory disabled (join by SteamID64)");
 
@@ -190,36 +196,90 @@ static class Program
         return 0;
     }
 
-    // Self-check: a local HttpListener stands in for Firebase RTDB (same as the TCP
-    // demo stands in for the Steam relay). Proves the REST round-trip and that a stale
-    // host ages out while a fresh one lists and unpublish clears it.
-    static async Task<int> MetaDemoAsync()
+    // HOST only: tail the server's matches.txt ("ts|winner|loser", one per finished
+    // human match; winner/loser are SteamID64s in the Steam build) and push each new
+    // result to the shared ladder. A local line cursor makes restarts skip processed
+    // lines, so each match counts exactly once. No server change needed.
+    static async Task WatchMatchesAsync(MetaClient meta)
     {
-        int port = 52050;
+        string dataDir = Environment.GetEnvironmentVariable("PTO_SERVER_DATA") ?? "data";
+        string matchesFile = Path.Combine(dataDir, "matches.txt");
+        string cursorFile = Path.Combine(dataDir, "ranked_cursor.txt");
+        int done = 0;
+        try { if (File.Exists(cursorFile) && int.TryParse(File.ReadAllText(cursorFile).Trim(), out int c)) done = c; }
+        catch { /* start from 0 */ }
+
+        while (true)
+        {
+            try
+            {
+                if (File.Exists(matchesFile))
+                {
+                    var lines = File.ReadAllLines(matchesFile);
+                    if (done > lines.Length) done = 0; // file was reset
+                    for (; done < lines.Length; done++)
+                    {
+                        var f = lines[done].Split('|');
+                        if (f.Length >= 3 && ulong.TryParse(f[1], out var w) && ulong.TryParse(f[2], out var l))
+                        {
+                            await meta.AddResultAsync(w, l);
+                            Console.WriteLine($"ladder: {w} beat {l}");
+                        }
+                    }
+                    try { File.WriteAllText(cursorFile, done.ToString()); } catch { /* retry next tick */ }
+                }
+            }
+            catch (Exception ex) { Console.WriteLine($"ladder watch error: {ex.Message}"); }
+            await Task.Delay(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    static async Task<int> PrintLadderAsync()
+    {
+        var meta = new MetaClient();
+        if (!meta.Enabled) { Console.WriteLine("ladder disabled: set PTO_FIREBASE_URL"); return 1; }
+        var ladder = await meta.LadderAsync();
+        if (ladder.Count == 0) { Console.WriteLine("ladder empty"); return 0; }
+        foreach (var (id, row) in ladder)
+            Console.WriteLine($"  rank {MetaClient.RankFromCounts(row.wins, row.losses),2}  {id}  ({row.wins}W {row.losses}L)");
+        return 0;
+    }
+
+    // A local HttpListener standing in for Firebase RTDB (as the TCP demo stands in
+    // for the Steam relay). Handles /coll.json (children object) and /coll/id.json
+    // (one child) for GET/PUT/DELETE, keyed "coll/id".
+    static (HttpListener http, CancellationTokenSource cts, string baseUrl) StartFakeRtdb(int port)
+    {
         var store = new System.Collections.Concurrent.ConcurrentDictionary<string, string>();
-        using var http = new HttpListener();
+        var http = new HttpListener();
         http.Prefixes.Add($"http://127.0.0.1:{port}/");
         http.Start();
-        using var cts = new CancellationTokenSource();
+        var cts = new CancellationTokenSource();
         _ = Task.Run(async () =>
         {
             while (!cts.IsCancellationRequested)
             {
                 HttpListenerContext ctx;
                 try { ctx = await http.GetContextAsync(); } catch { break; }
-                string path = ctx.Request.Url!.AbsolutePath; // /hosts.json or /hosts/<id>.json
+                string path = ctx.Request.Url!.AbsolutePath.TrimStart('/'); // coll.json or coll/id.json
+                if (path.EndsWith(".json")) path = path[..^5];
                 string body; using (var r = new StreamReader(ctx.Request.InputStream)) body = await r.ReadToEndAsync();
                 string outp = "null";
-                if (path == "/hosts.json" && ctx.Request.HttpMethod == "GET")
+                if (!path.Contains('/')) // collection
                 {
-                    if (!store.IsEmpty)
-                        outp = "{" + string.Join(",", store.Select(kv => $"\"{kv.Key}\":{kv.Value}")) + "}";
+                    if (ctx.Request.HttpMethod == "GET")
+                    {
+                        var kids = store.Where(kv => kv.Key.StartsWith(path + "/"))
+                                        .Select(kv => $"\"{kv.Key[(path.Length + 1)..]}\":{kv.Value}").ToList();
+                        if (kids.Count > 0) outp = "{" + string.Join(",", kids) + "}";
+                    }
                 }
-                else if (path.StartsWith("/hosts/") && path.EndsWith(".json"))
+                else // single child
                 {
-                    string id = path[7..^5];
-                    if (ctx.Request.HttpMethod == "PUT") { store[id] = body; outp = body; }
-                    else if (ctx.Request.HttpMethod == "DELETE") store.TryRemove(id, out _);
+                    if (ctx.Request.HttpMethod == "PUT") { store[path] = body; outp = body; }
+                    else if (ctx.Request.HttpMethod == "DELETE") store.TryRemove(path, out _);
+                    else if (ctx.Request.HttpMethod == "GET") store.TryGetValue(path, out outp!);
+                    outp ??= "null";
                 }
                 var buf = Encoding.UTF8.GetBytes(outp);
                 ctx.Response.ContentType = "application/json";
@@ -227,25 +287,51 @@ static class Program
                 ctx.Response.Close();
             }
         });
+        return (http, cts, $"http://127.0.0.1:{port}");
+    }
 
-        var meta = new MetaClient($"http://127.0.0.1:{port}");
+    // Self-check: presence round-trip, stale filtering, and unpublish, via fake RTDB.
+    static async Task<int> MetaDemoAsync()
+    {
+        var (http, cts, baseUrl) = StartFakeRtdb(52050);
+        var meta = new MetaClient(baseUrl);
         await meta.PublishHostAsync(111, "Alice"); // fresh (ts = now)
         long staleTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 100;
         using (var c = new StringContent($"{{\"steamId\":\"222\",\"name\":\"Bob\",\"ts\":{staleTs}}}",
                                          Encoding.UTF8, "application/json"))
-            await new HttpClient().PutAsync($"http://127.0.0.1:{port}/hosts/222.json", c);
+            await new HttpClient().PutAsync($"{baseUrl}/hosts/222.json", c);
 
         var live = await meta.ListHostsAsync(20);
         bool ok1 = live.Count == 1 && live[0].steamId == "111";
         await meta.UnpublishHostAsync(111);
-        var live2 = await meta.ListHostsAsync(20);
-        bool ok2 = live2.Count == 0;
+        bool ok2 = (await meta.ListHostsAsync(20)).Count == 0;
         cts.Cancel(); http.Stop();
 
         bool ok = ok1 && ok2;
         Console.WriteLine(ok
             ? "metademo OK: stale host filtered, fresh host listed, unpublish clears it"
-            : $"metademo FAIL: afterPublish={live.Count} (want 1x111), afterUnpublish={live2.Count} (want 0)");
+            : $"metademo FAIL: afterPublish={live.Count} (want 1x111)");
+        return ok ? 0 : 1;
+    }
+
+    // Self-check: ranked counts accumulate host-independently and rank derives right.
+    static async Task<int> RankedDemoAsync()
+    {
+        var (http, cts, baseUrl) = StartFakeRtdb(52051);
+        var meta = new MetaClient(baseUrl);
+        await meta.AddResultAsync(111, 222); // 111 wins
+        await meta.AddResultAsync(111, 333); // 111 wins again (a different host would do this too)
+
+        var ladder = await meta.LadderAsync();
+        cts.Cancel(); http.Stop();
+
+        var top = ladder.Count > 0 ? ladder[0] : ("", new RankRow());
+        // 111: 2W 0L -> rank 23 and top of the ladder; 222/333: 1L -> rank 26.
+        bool ok = top.Item1 == "111" && top.Item2.wins == 2 && top.Item2.losses == 0
+                  && MetaClient.RankFromCounts(2, 0) == 23 && ladder.Count == 3;
+        Console.WriteLine(ok
+            ? "rankeddemo OK: winner 2W0L at rank 23 tops a 3-player ladder"
+            : $"rankeddemo FAIL: top={top.Item1} {top.Item2.wins}W{top.Item2.losses}L, count={ladder.Count}");
         return ok ? 0 : 1;
     }
 
