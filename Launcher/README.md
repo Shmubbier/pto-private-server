@@ -1,51 +1,58 @@
 # ptolaunch (Steam P2P build)
 
-Launcher that tunnels the game's raw-TCP link over a peer relay, so the game
+Launcher that tunnels the game's raw-TCP link over the Steam relay, so the game
 never learns Steam exists. It points the game at `127.0.0.1` (settings.ini
 `[NETWORK] IP=127.0.0.1`) and pumps the bytes to the peer. Framing and client
 patches 05/07/08 are untouched.
 
-    HOST:  game -> 127.0.0.1:51338 -> PtoServer (local)
-                                      ^
-           peer == relay ==> ptolaunch --+ (bridges each peer to a local server conn)
+`ptolaunch play` is symmetric: no host/joiner roles. Both peers queue up; when
+paired, the LOWER SteamID is silently elected the authority and runs its local
+PtoServer, the other connects to it over the relay. Same on both machines.
 
-    JOIN:  game -> 127.0.0.1:51338 -> ptolaunch == relay ==> host's ptolaunch -> host's PtoServer
+    authority (lower SteamID):  game -> 127.0.0.1:51338 -> PtoServer (local)
+                                                            ^
+                       guest's peer == relay ==> ptolaunch -+ (bridges to local server)
+
+    guest:  game -> 127.0.0.1:51338 -> ptolaunch == relay ==> authority's ptolaunch -> its PtoServer
 
 ## Build order status
 
-1. **Transport tunnel** - DONE. `ptolaunch demo` proves the 4-hop path with a
-   plain-TCP peer link (`ptolaunch host` / `ptolaunch join <ip>` for two boxes).
-   A bridge is "accept here, connect there, pump bytes", so host and join are the
-   same `ServeAsync`.
-2. **Steam relay (step 1b)** - DONE (built; runtime needs a Steam client + two
-   boxes to exercise). `SteamPeer.cs` wraps a SteamNetworkingSockets relay
-   connection as a `Stream`, so it drops into the same `PumpAsync`. `ptolaunch
-   steamhost` prints your SteamID64; `ptolaunch steamjoin <id>` tunnels the local
-   game to it. AppID 480 via `steam_appid.txt`; built x86 to match the repo's
-   32-bit `steam_api.dll` (x64 would need `steam_api64.dll`).
-3. **Firebase meta client** - presence DONE, ranked NEXT. Data model is local-first
-   + a thin cloud metaservice (see NETWORKING.md): accounts/decks/campaign stay on
-   each machine; only genuinely-shared state lives in Firebase RTDB, reached by REST
-   (no SDK). `ptolaunch steamhost` publishes presence on a 10s heartbeat; `hosts`
-   lists live hosts; `play` picks one from the directory and joins (replaces the
-   manual SteamID paste). Set `PTO_FIREBASE_URL` (+ optional `PTO_FIREBASE_AUTH`) or
-   drop the RTDB URL in `firebase.txt`; unset = directory disabled, join by SteamID.
-   `ptolaunch metademo` self-checks the presence logic against a local fake RTDB.
-   - Ranked ladder - DONE. The server's rank is a personal climb ladder
+1. **Transport tunnel** - DONE. `ptolaunch demo` proves the byte path in-process.
+   A bridge is "accept here, connect there, pump bytes" (`ServeAsync` / `PumpAsync`).
+2. **Steam relay** - DONE (built; runtime needs a Steam client + two boxes to
+   exercise). `SteamPeer.cs` wraps a SteamNetworkingSockets relay connection as a
+   `Stream`, so it drops into the same `PumpAsync`. AppID 480 via `steam_appid.txt`;
+   built x86 to match the repo's 32-bit `steam_api.dll` (x64 would need `steam_api64.dll`).
+3. **Firebase meta client** - DONE. Data model is local-first + a thin cloud
+   metaservice (see NETWORKING.md): accounts/decks/campaign stay on each machine;
+   only genuinely-shared state lives in Firebase RTDB, reached by REST (no SDK). Set
+   `PTO_FIREBASE_URL` (+ optional `PTO_FIREBASE_AUTH`) or drop the RTDB URL in
+   `firebase.txt`.
+   - **Symmetric matchmaking**: `ptolaunch play` enqueues "looking for match"; both
+     peers compute the same pairing from the queue (`ElectPartner`: sort ids, pair
+     adjacent) and the lower SteamID is elected authority. The authority writes a
+     match record so the other confirms reciprocity before connecting (closes the
+     snapshot-skew race). No host/join wording anywhere. `matchdemo` / `queuedemo`
+     self-check the election and queue.
+   - **Ranked ladder**: rank is a personal climb ladder
      (`rank = clamp(25 - wins + losses, 1, 99)`), a pure function of a player's own
-     counts, so it is host-independent: Firebase just accumulates wins/losses. On
-     `steamhost` the launcher tails the server's `data/matches.txt` (a line cursor
-     makes restarts count each match once) and bumps `/ranked/<steamid>`; `ptolaunch
+     counts, so it is authority-independent: Firebase just accumulates wins/losses.
+     The authority tails the server's `data/matches.txt` (a line cursor makes
+     restarts count each match once) and bumps `/ranked/<steamid>`; `ptolaunch
      ladder` prints it. `PTO_SERVER_DATA` points at the server data dir (default
      `data`). `rankeddemo` self-checks it. Spoofable until a Steam-auth-ticket Cloud
      Function validates matches (deferred ceiling).
    - Friends: use the Steam friends list (real identity, free on AppID 480).
-4. Session-scoped roster: the joiner's local account/decks reach the host's server
-   for the session only, not persisted, unless the two friend each other.
+4. Session-scoped roster: the guest's local account/decks reach the authority's
+   server for the session only, not persisted, unless the two friend each other.
 5. Offline / campaign launch mode (server already does bot battles; op55 landed).
+
+The authority auto-spawns `PtoServer.exe` if 51338 isn't already up
+(`PTO_SERVER_EXE`, default `PtoServer.exe`).
 
 ## Run the self-checks
 
     dotnet run -c Release demo        # transport tunnel (4-hop byte round-trip)
-    dotnet run -c Release metademo    # presence directory against a local fake RTDB
+    dotnet run -c Release matchdemo   # deterministic pairing / authority election
+    dotnet run -c Release queuedemo   # match queue against a local fake RTDB
     dotnet run -c Release rankeddemo  # ranked count accumulation + rank derivation

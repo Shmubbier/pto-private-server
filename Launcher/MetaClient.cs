@@ -43,29 +43,55 @@ sealed class MetaClient
 
     string Url(string path) => $"{_base}/{path}.json{_auth}";
 
-    public async Task PublishHostAsync(ulong steamId, string name)
+    // --- Symmetric match queue -------------------------------------------------
+    // Both peers write themselves here ("looking for match") on a heartbeat; there
+    // is no host or joiner, just a queue. Pairing is computed identically by both
+    // peers from the same snapshot (see Program.ElectPartner), so no negotiation.
+    public async Task EnqueueAsync(ulong steamId, string name)
     {
-        var body = JsonSerializer.Serialize(new HostEntry { steamId = steamId.ToString(), name = name, ts = Now() });
+        var body = JsonSerializer.Serialize(new QueueEntry { steamId = steamId.ToString(), name = name, ts = Now() });
         using var c = new StringContent(body, Encoding.UTF8, "application/json");
-        (await _http.PutAsync(Url($"hosts/{steamId}"), c)).EnsureSuccessStatusCode();
+        (await _http.PutAsync(Url($"queue/{steamId}"), c)).EnsureSuccessStatusCode();
     }
 
-    public async Task UnpublishHostAsync(ulong steamId)
+    public async Task DequeueAsync(ulong steamId)
     {
-        try { await _http.DeleteAsync(Url($"hosts/{steamId}")); } catch { /* best effort on shutdown */ }
+        try { await _http.DeleteAsync(Url($"queue/{steamId}")); } catch { /* best effort */ }
     }
 
-    // Live hosts, freshest filter applied so a host that died without unpublishing ages out.
-    public async Task<List<HostEntry>> ListHostsAsync(int staleSeconds = 20)
+    // Fresh queue entries; a peer that died without dequeuing ages out.
+    public async Task<List<QueueEntry>> ListQueueAsync(int staleSeconds = 20)
     {
-        var json = await _http.GetStringAsync(Url("hosts"));
+        var json = await _http.GetStringAsync(Url("queue"));
         if (string.IsNullOrWhiteSpace(json) || json == "null") return new();
-        var map = JsonSerializer.Deserialize<Dictionary<string, HostEntry>>(json) ?? new();
+        var map = JsonSerializer.Deserialize<Dictionary<string, QueueEntry>>(json) ?? new();
         long cutoff = Now() - staleSeconds;
-        var live = new List<HostEntry>();
-        foreach (var h in map.Values) if (h != null && h.ts >= cutoff) live.Add(h);
-        live.Sort((a, b) => string.Compare(a.name, b.name, StringComparison.OrdinalIgnoreCase));
+        var live = new List<QueueEntry>();
+        foreach (var q in map.Values) if (q != null && q.ts >= cutoff) live.Add(q);
         return live;
+    }
+
+    // Match confirmation: the elected authority (lower SteamID) writes its id under
+    // the pair key so the other peer can confirm reciprocity before it commits and
+    // connects. This closes the snapshot-skew race in the deterministic pairing.
+    public async Task SetMatchAsync(string pairKey, ulong authority)
+    {
+        var body = JsonSerializer.Serialize(new MatchRecord { authority = authority.ToString(), ts = Now() });
+        using var c = new StringContent(body, Encoding.UTF8, "application/json");
+        (await _http.PutAsync(Url($"matches/{pairKey}"), c)).EnsureSuccessStatusCode();
+    }
+
+    public async Task<ulong> GetMatchAuthorityAsync(string pairKey)
+    {
+        var json = await _http.GetStringAsync(Url($"matches/{pairKey}"));
+        if (string.IsNullOrWhiteSpace(json) || json == "null") return 0;
+        var rec = JsonSerializer.Deserialize<MatchRecord>(json);
+        return rec != null && ulong.TryParse(rec.authority, out var a) ? a : 0;
+    }
+
+    public async Task ClearMatchAsync(string pairKey)
+    {
+        try { await _http.DeleteAsync(Url($"matches/{pairKey}")); } catch { /* best effort */ }
     }
 
     static long Now() => DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -125,9 +151,15 @@ sealed class RankRow
     public int losses { get; set; }
 }
 
-sealed class HostEntry
+sealed class QueueEntry
 {
     public string steamId { get; set; } = "";
     public string name { get; set; } = "";
+    public long ts { get; set; }
+}
+
+sealed class MatchRecord
+{
+    public string authority { get; set; } = "";
     public long ts { get; set; }
 }

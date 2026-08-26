@@ -4,53 +4,38 @@ using System.Text;
 
 namespace PtoLauncher;
 
-// Step 1 of the Steam P2P build order (see NETWORKING.md): the TCP-over-relay
-// tunnel, proven with a plain-TCP peer link so it is testable on one box today.
+// PTO Steam P2P launcher (see NETWORKING.md). The game speaks raw TCP framed
+// [id u8][key u16][size u32][payload] and never learns Steam exists: the launcher
+// points it at 127.0.0.1 and tunnels the bytes over Steam's relay.
 //
-// The game speaks raw TCP framed [id u8][key u16][size u32][payload] and never
-// learns Steam exists: the launcher points it at 127.0.0.1 and tunnels the bytes.
-// A bridge is just "accept here, connect there, pump bytes", so HOST and JOIN are
-// the same ServeAsync with different endpoints. When Steam lands (step 1b), only
-// ONE hop changes: JOIN's outbound TcpClient becomes a relay-connect and HOST's
-// inbound accept becomes a relay-accept, both still yielding a Stream to Pump.
+// `play` is symmetric: there are no host/joiner roles. Both peers register in the
+// match queue; when two are paired, the LOWER SteamID is silently elected the
+// authority and runs its local PtoServer, and the other connects to it over the
+// relay. Both peers compute the same pairing and election from the same queue
+// snapshot, so no negotiation. Bridging itself is still "accept here, connect
+// there, pump bytes" (ServeAsync / PumpAsync), unchanged.
 static class Program
 {
     const int GamePort = 51338; // loopback port the game dials (settings.ini IP=127.0.0.1)
-    const int PeerPort = 51339; // spike-only plain-TCP stand-in for the Steam relay link
 
     static async Task<int> Main(string[] args)
     {
         switch (args.Length > 0 ? args[0] : "")
         {
-            case "host": // accept peers, bridge each to the local server
-                await ServeAsync(IPAddress.Any, PeerPort, "127.0.0.1", GamePort, CancellationToken.None);
-                return 0;
-            case "join": // accept the local game, bridge to the host peer
-                await ServeAsync(IPAddress.Loopback, GamePort,
-                                 args.Length > 1 ? args[1] : "127.0.0.1", PeerPort, CancellationToken.None);
-                return 0;
-            case "steamhost": // accept relay peers, bridge each to the local server
-                await SteamHostAsync();
-                return 0;
-            case "steamjoin": // tunnel the local game to a host's SteamID over the relay
-                if (args.Length < 2 || !ulong.TryParse(args[1], out var hostId))
-                { Console.WriteLine("usage: ptolaunch steamjoin <hostSteamId64>"); return 1; }
-                await SteamJoinAsync(hostId);
-                return 0;
-            case "hosts": // list live hosts from the directory (no Steam needed)
-                return await HostsAsync();
+            case "play": // symmetric matchmaking: queue, pair, auto-elect authority
+                return await PlayAsync();
             case "ladder": // print the shared ranked ladder (no Steam needed)
                 return await PrintLadderAsync();
-            case "play": // pick a host from the directory, then join over the relay
-                return await PlayAsync();
-            case "demo":
+            case "demo": // transport self-check (in-process, no Steam)
                 return await DemoAsync();
-            case "metademo":
-                return await MetaDemoAsync();
-            case "rankeddemo":
+            case "queuedemo": // queue enqueue/list/dequeue self-check (fake RTDB)
+                return await QueueDemoAsync();
+            case "matchdemo": // deterministic pairing/election self-check (pure)
+                return MatchDemo();
+            case "rankeddemo": // ranked accumulation self-check (fake RTDB)
                 return await RankedDemoAsync();
             default:
-                Console.WriteLine("usage: ptolaunch steamhost | play | hosts | ladder | steamjoin <id> | host | join <ip> | demo");
+                Console.WriteLine("usage: ptolaunch play | ladder | demo | queuedemo | matchdemo | rankeddemo");
                 return 1;
         }
     }
@@ -89,33 +74,71 @@ static class Program
         catch (Exception ex) { Console.WriteLine($"bridge closed: {ex.Message}"); }
     }
 
-    // HOST over Steam: same shape as `host`, but the inbound hop is the relay.
-    static async Task SteamHostAsync()
+    // Deterministic symmetric pairing: sort fresh queue ids ascending and pair
+    // adjacent (0-1, 2-3, ...). Returns my partner, or 0 if I'm alone or the odd one
+    // out. Both peers of a pair compute the same partner from the same snapshot.
+    internal static ulong ElectPartner(IEnumerable<ulong> queueIds, ulong me)
     {
+        var ids = queueIds.Where(x => x != 0).Distinct().ToList();
+        if (!ids.Contains(me)) return 0;
+        ids.Sort();
+        int i = ids.IndexOf(me);
+        int j = (i % 2 == 0) ? i + 1 : i - 1;
+        return (j >= 0 && j < ids.Count) ? ids[j] : 0;
+    }
+
+    static string PairKey(ulong a, ulong b) => $"{Math.Min(a, b)}_{Math.Max(a, b)}";
+
+    // Symmetric matchmaking. No host/joiner: register in the queue, pair, and the
+    // lower SteamID is silently elected the authority (runs its local PtoServer);
+    // the other connects to it over the relay. Same UX on both machines.
+    static async Task<int> PlayAsync()
+    {
+        var meta = new MetaClient();
+        if (!meta.Enabled) { Console.WriteLine("matchmaking needs PTO_FIREBASE_URL (or firebase.txt)"); return 1; }
         using var relay = new SteamRelay();
         relay.Init();
-        Console.WriteLine($"steam host ready. Share your SteamID64: {relay.MySteamId}");
+        ulong me = relay.MySteamId;
+        Console.WriteLine($"looking for a match as {relay.MyName} ({me})...");
+        Console.CancelKeyPress += (_, _) => meta.DequeueAsync(me).Wait(2000);
 
-        // Publish presence to the directory on a heartbeat; clear it on exit.
-        var meta = new MetaClient();
-        if (meta.Enabled)
+        while (true)
         {
-            Console.CancelKeyPress += (_, _) => { meta.UnpublishHostAsync(relay.MySteamId).Wait(2000); };
-            _ = Task.Run(async () =>
-            {
-                while (true)
-                {
-                    try { await meta.PublishHostAsync(relay.MySteamId, relay.MyName); }
-                    catch (Exception ex) { Console.WriteLine($"presence publish failed: {ex.Message}"); }
-                    await Task.Delay(TimeSpan.FromSeconds(10));
-                }
-            });
-            Console.WriteLine("presence: published to host directory (heartbeat 10s)");
-            _ = WatchMatchesAsync(meta); // push finished matches to the shared ladder
-            Console.WriteLine("ladder: watching server matches.txt");
-        }
-        else Console.WriteLine("presence: PTO_FIREBASE_URL not set, directory disabled (join by SteamID64)");
+            await meta.EnqueueAsync(me, relay.MyName); // heartbeat "looking for match"
+            var queue = await meta.ListQueueAsync();
+            ulong partner = ElectPartner(queue.Select(q => ulong.TryParse(q.steamId, out var v) ? v : 0), me);
+            if (partner == 0) { await Task.Delay(2000); continue; }
 
+            string key = PairKey(me, partner);
+            if (me < partner)
+            {
+                // Elected authority. Announce it so the partner can confirm reciprocity.
+                await meta.SetMatchAsync(key, me);
+                await meta.DequeueAsync(me);
+                Console.WriteLine($"matched with {partner}; elected authority, running local server");
+                if (!await EnsureServerAsync()) { await meta.ClearMatchAsync(key); return 1; }
+                await RunAuthorityAsync(relay, meta);
+                return 0;
+            }
+            else
+            {
+                // Wait for the authority to confirm THIS pair before committing (closes
+                // the snapshot-skew race: if it chose someone else, re-poll).
+                ulong confirmed = await meta.GetMatchAuthorityAsync(key);
+                if (confirmed != partner) { await Task.Delay(1500); continue; }
+                await meta.DequeueAsync(me);
+                Console.WriteLine($"matched with {partner}; connecting to authority over relay");
+                await RunGuestAsync(relay, partner);
+                return 0;
+            }
+        }
+    }
+
+    // Authority: accept relay peers, bridge each to the local server, feed the ladder.
+    // The authority's own game connects to 127.0.0.1:51338 directly (not proxied).
+    static async Task RunAuthorityAsync(SteamRelay relay, MetaClient meta)
+    {
+        _ = WatchMatchesAsync(meta); // push finished matches to the shared ladder
         relay.Listen(async peer =>
         {
             try
@@ -130,18 +153,16 @@ static class Program
             }
             catch (Exception ex) { Console.WriteLine($"peer bridge closed: {ex.Message}"); }
         });
-        await Task.Delay(Timeout.Infinite); // run until killed
+        Console.WriteLine("ready. point the game at 127.0.0.1 and play.");
+        await Task.Delay(Timeout.Infinite); // ponytail: no idle timeout; Ctrl+C to stop
     }
 
-    // JOIN over Steam: same shape as `join`, but the outbound hop is the relay. One
-    // fresh relay connection per game TCP connection, mirroring the host side.
-    static async Task SteamJoinAsync(ulong hostSteamId)
+    // Guest: local game -> relay -> authority. One relay connection per game TCP conn.
+    static async Task RunGuestAsync(SteamRelay relay, ulong authority)
     {
-        using var relay = new SteamRelay();
-        relay.Init();
         var l = new TcpListener(IPAddress.Loopback, GamePort);
         l.Start();
-        Console.WriteLine($"joined host {hostSteamId}. Launch the game (settings.ini IP=127.0.0.1).");
+        Console.WriteLine("ready. point the game at 127.0.0.1 and play.");
         while (true)
         {
             var game = await l.AcceptTcpClientAsync();
@@ -151,7 +172,7 @@ static class Program
                 try
                 {
                     using (game)
-                    using (var peer = await relay.ConnectAsync(hostSteamId))
+                    using (var peer = await relay.ConnectAsync(authority))
                         await PumpAsync(game.GetStream(), peer);
                 }
                 catch (Exception ex) { Console.WriteLine($"game bridge closed: {ex.Message}"); }
@@ -159,41 +180,23 @@ static class Program
         }
     }
 
-    // List live hosts from the directory. Pure Firebase, no Steam needed.
-    static async Task<int> HostsAsync()
+    // Ensure a local PtoServer is accepting on 51338: connect if it's up, else spawn
+    // PtoServer.exe (PTO_SERVER_EXE, default "PtoServer.exe") and wait for the port.
+    static async Task<bool> EnsureServerAsync()
     {
-        var meta = new MetaClient();
-        if (!meta.Enabled) { Console.WriteLine("directory disabled: set PTO_FIREBASE_URL"); return 1; }
-        var hosts = await meta.ListHostsAsync();
-        if (hosts.Count == 0) { Console.WriteLine("no live hosts"); return 0; }
-        for (int i = 0; i < hosts.Count; i++)
-            Console.WriteLine($"  [{i + 1}] {hosts[i].name}  ({hosts[i].steamId})");
-        return 0;
+        if (await TryConnectServerAsync()) return true;
+        string exe = Environment.GetEnvironmentVariable("PTO_SERVER_EXE") ?? "PtoServer.exe";
+        try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false }); }
+        catch (Exception ex) { Console.WriteLine($"could not start server '{exe}': {ex.Message}"); return false; }
+        for (int i = 0; i < 20; i++) { if (await TryConnectServerAsync()) return true; await Task.Delay(500); }
+        Console.WriteLine("server did not come up on 127.0.0.1:51338");
+        return false;
     }
 
-    // Pick a host from the directory (replacing the manual SteamID paste), then join.
-    static async Task<int> PlayAsync()
+    static async Task<bool> TryConnectServerAsync()
     {
-        var meta = new MetaClient();
-        ulong id;
-        if (meta.Enabled)
-        {
-            var hosts = await meta.ListHostsAsync();
-            if (hosts.Count == 0) { Console.WriteLine("no live hosts in the directory"); return 1; }
-            for (int i = 0; i < hosts.Count; i++)
-                Console.WriteLine($"  [{i + 1}] {hosts[i].name}  ({hosts[i].steamId})");
-            Console.Write("pick a host #: ");
-            if (!int.TryParse(Console.ReadLine(), out int pick) || pick < 1 || pick > hosts.Count)
-            { Console.WriteLine("invalid pick"); return 1; }
-            id = ulong.Parse(hosts[pick - 1].steamId);
-        }
-        else
-        {
-            Console.Write("directory disabled. enter host SteamID64: ");
-            if (!ulong.TryParse(Console.ReadLine(), out id)) { Console.WriteLine("invalid id"); return 1; }
-        }
-        await SteamJoinAsync(id);
-        return 0;
+        try { using var c = new TcpClient(); await c.ConnectAsync(IPAddress.Loopback, GamePort); return true; }
+        catch { return false; }
     }
 
     // HOST only: tail the server's matches.txt ("ts|winner|loser", one per finished
@@ -290,27 +293,47 @@ static class Program
         return (http, cts, $"http://127.0.0.1:{port}");
     }
 
-    // Self-check: presence round-trip, stale filtering, and unpublish, via fake RTDB.
-    static async Task<int> MetaDemoAsync()
+    // Self-check: queue round-trip, stale filtering, and dequeue, via fake RTDB.
+    static async Task<int> QueueDemoAsync()
     {
         var (http, cts, baseUrl) = StartFakeRtdb(52050);
         var meta = new MetaClient(baseUrl);
-        await meta.PublishHostAsync(111, "Alice"); // fresh (ts = now)
+        await meta.EnqueueAsync(111, "Alice"); // fresh (ts = now)
         long staleTs = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 100;
         using (var c = new StringContent($"{{\"steamId\":\"222\",\"name\":\"Bob\",\"ts\":{staleTs}}}",
                                          Encoding.UTF8, "application/json"))
-            await new HttpClient().PutAsync($"{baseUrl}/hosts/222.json", c);
+            await new HttpClient().PutAsync($"{baseUrl}/queue/222.json", c);
 
-        var live = await meta.ListHostsAsync(20);
+        var live = await meta.ListQueueAsync(20);
         bool ok1 = live.Count == 1 && live[0].steamId == "111";
-        await meta.UnpublishHostAsync(111);
-        bool ok2 = (await meta.ListHostsAsync(20)).Count == 0;
+        await meta.DequeueAsync(111);
+        bool ok2 = (await meta.ListQueueAsync(20)).Count == 0;
         cts.Cancel(); http.Stop();
 
         bool ok = ok1 && ok2;
         Console.WriteLine(ok
-            ? "metademo OK: stale host filtered, fresh host listed, unpublish clears it"
-            : $"metademo FAIL: afterPublish={live.Count} (want 1x111)");
+            ? "queuedemo OK: stale entry filtered, fresh entry listed, dequeue clears it"
+            : $"queuedemo FAIL: afterEnqueue={live.Count} (want 1x111)");
+        return ok ? 0 : 1;
+    }
+
+    // Self-check (pure): from one consistent queue snapshot, paired peers agree on
+    // each other and on the authority (lower id); the odd one out is unpaired.
+    static int MatchDemo()
+    {
+        var q4 = new ulong[] { 400, 100, 300, 200 }; // unsorted on purpose
+        bool pairA = ElectPartner(q4, 100) == 200 && ElectPartner(q4, 200) == 100; // reciprocal
+        bool pairB = ElectPartner(q4, 300) == 400 && ElectPartner(q4, 400) == 300;
+        bool authA = Math.Min(100ul, 200ul) == 100 && Math.Min(300ul, 400ul) == 300;
+
+        var q3 = new ulong[] { 100, 200, 300 };
+        bool odd = ElectPartner(q3, 300) == 0 && ElectPartner(q3, 100) == 200;
+        bool alone = ElectPartner(new ulong[] { 100 }, 100) == 0;
+
+        bool ok = pairA && pairB && authA && odd && alone;
+        Console.WriteLine(ok
+            ? "matchdemo OK: pairs reciprocal, authority = lower id, odd one out waits"
+            : $"matchdemo FAIL: pairA={pairA} pairB={pairB} authA={authA} odd={odd} alone={alone}");
         return ok ? 0 : 1;
     }
 
