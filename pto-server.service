@@ -1,0 +1,17 @@
+[Unit]
+Description=Pixel Tactics Online private server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pto-server
+ExecStart=/opt/pto-server/PtoServer --quiet
+Restart=always
+RestartSec=5
+# Website API port (default 8080):
+Environment=PTO_HTTP_PORT=8080
+# Uncomment to let a lone queuer play the AI bot:
+# Environment=PTO_BOT=1
+
+[Install]
+WantedBy=multi-user.target

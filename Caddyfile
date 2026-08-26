@@ -1,0 +1,6 @@
+# Auto-HTTPS reverse proxy so the website can call the API over https with a real cert.
+# Point an A record (api.yourdomain.com -> the VM's public IP) first, then replace the name below.
+# Caddy fetches and renews a Let's Encrypt cert automatically.
+api.yourdomain.com {
+    reverse_proxy localhost:8080
+}
