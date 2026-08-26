@@ -16,10 +16,13 @@
   </ItemGroup>
   <ItemGroup>
     <!-- steam_api.dll must sit beside the exe; steam_appid.txt=480 lets Init run
-         without launching via Steam. The dll is a Valve redistributable (git-ignored
-         like the other native bins); drop it in from Clients/Steam_Ver-PTO-C/ or the
-         Steamworks SDK. Guarded so a clone without it still builds (Steam path just
-         won't run until it's present). -->
+         without launching via Steam. Use the MODERN 32-bit dll that matches
+         Steamworks.NET 2024.8.0 (has SteamNetworkingSockets012 for the relay): the
+         Windows-x86 steam_api.dll from Steamworks.NET-Standalone_2024.8.0.zip
+         (github.com/rlabrecque/Steamworks.NET releases) or Steamworks SDK 1.60. Do
+         NOT use the game's Clients/ dll - that one is ~2018 and has no networking API.
+         Git-ignored like the other native bins; guarded so a clone without it still
+         builds (Steam path just won't run until it's present). -->
     <None Include="steam_api.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('steam_api.dll')" />
     <None Include="steam_appid.txt" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

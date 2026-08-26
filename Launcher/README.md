@@ -19,10 +19,13 @@ PtoServer, the other connects to it over the relay. Same on both machines.
 
 1. **Transport tunnel** - DONE. `ptolaunch demo` proves the byte path in-process.
    A bridge is "accept here, connect there, pump bytes" (`ServeAsync` / `PumpAsync`).
-2. **Steam relay** - DONE (built; runtime needs a Steam client + two boxes to
-   exercise). `SteamPeer.cs` wraps a SteamNetworkingSockets relay connection as a
-   `Stream`, so it drops into the same `PumpAsync`. AppID 480 via `steam_appid.txt`;
-   built x86 to match the repo's 32-bit `steam_api.dll` (x64 would need `steam_api64.dll`).
+2. **Steam relay** - DONE (built; `check` confirmed a live `SteamAPI.Init` +
+   relay-access init against a real Steam client). `SteamPeer.cs` wraps a
+   SteamNetworkingSockets relay connection as a `Stream`, so it drops into the same
+   `PumpAsync`. AppID 480 via `steam_appid.txt`; built x86, so it needs the MODERN
+   32-bit `steam_api.dll` matching Steamworks.NET 2024.8.0 (Windows-x86 dll from
+   `Steamworks.NET-Standalone_2024.8.0.zip` or SDK 1.60). The game's own 2018-era
+   `steam_api.dll` has no networking API and will NOT work for the launcher.
 3. **Firebase meta client** - DONE. Data model is local-first + a thin cloud
    metaservice (see NETWORKING.md): accounts/decks/campaign stay on each machine;
    only genuinely-shared state lives in Firebase RTDB, reached by REST (no SDK). Set
@@ -56,3 +59,6 @@ The authority auto-spawns `PtoServer.exe` if 51338 isn't already up
     dotnet run -c Release matchdemo   # deterministic pairing / authority election
     dotnet run -c Release queuedemo   # match queue against a local fake RTDB
     dotnet run -c Release rankeddemo  # ranked count accumulation + rank derivation
+
+Live preflight (needs Steam running + PTO_FIREBASE_URL): `ptolaunch check` prints
+one line each for Steam, Firebase, and the server binary.

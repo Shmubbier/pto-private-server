@@ -24,6 +24,8 @@ static class Program
         {
             case "play": // symmetric matchmaking: queue, pair, auto-elect authority
                 return await PlayAsync();
+            case "check": // preflight: Steam + Firebase + server, one line each
+                return await CheckAsync();
             case "ladder": // print the shared ranked ladder (no Steam needed)
                 return await PrintLadderAsync();
             case "demo": // transport self-check (in-process, no Steam)
@@ -35,7 +37,7 @@ static class Program
             case "rankeddemo": // ranked accumulation self-check (fake RTDB)
                 return await RankedDemoAsync();
             default:
-                Console.WriteLine("usage: ptolaunch play | ladder | demo | queuedemo | matchdemo | rankeddemo");
+                Console.WriteLine("usage: ptolaunch play | check | ladder | demo | queuedemo | matchdemo | rankeddemo");
                 return 1;
         }
     }
@@ -236,6 +238,39 @@ static class Program
             await Task.Delay(TimeSpan.FromSeconds(3));
         }
     }
+
+    // Preflight so a tester sees "Steam ok / Firebase ok / server ok" up front
+    // instead of a silent failure mid-match. Each line is independent.
+    static async Task<int> CheckAsync()
+    {
+        bool ok = true;
+
+        var meta = new MetaClient();
+        if (!meta.Enabled) { Console.WriteLine("[FAIL] Firebase: no URL (put it in firebase.txt or set PTO_FIREBASE_URL)"); ok = false; }
+        else
+        {
+            try { var q = await meta.ListQueueAsync(); Console.WriteLine($"[ ok ] Firebase: reachable ({q.Count} in queue)"); }
+            catch (Exception ex) { Console.WriteLine($"[FAIL] Firebase: {FirstLine(ex)}"); ok = false; }
+        }
+
+        try
+        {
+            using var relay = new SteamRelay();
+            relay.Init();
+            Console.WriteLine($"[ ok ] Steam: signed in as {relay.MyName} ({relay.MySteamId})");
+        }
+        catch (Exception ex) { Console.WriteLine($"[FAIL] Steam: {FirstLine(ex)}"); ok = false; }
+
+        string exe = Environment.GetEnvironmentVariable("PTO_SERVER_EXE") ?? "PtoServer.exe";
+        if (await TryConnectServerAsync()) Console.WriteLine("[ ok ] Server: already listening on 127.0.0.1:51338");
+        else if (File.Exists(exe)) Console.WriteLine($"[ ok ] Server: {exe} present (auto-starts when you are the authority)");
+        else { Console.WriteLine($"[FAIL] Server: '{exe}' not found (set PTO_SERVER_EXE)"); ok = false; }
+
+        Console.WriteLine(ok ? "\nAll good. Run play.bat to matchmake." : "\nSome checks failed (see above).");
+        return ok ? 0 : 1;
+    }
+
+    static string FirstLine(Exception ex) => ex.Message.Split('\n')[0].Trim();
 
     static async Task<int> PrintLadderAsync()
     {
