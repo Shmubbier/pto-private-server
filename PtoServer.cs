@@ -89,6 +89,7 @@ namespace PtoServer
         public const byte SpellRemove  = 45;  // battle: end the cast window; releases queue (next_que_effect=1) [no payload]
         public const byte ScryResult   = 51;  // client->server: scry pick result [u8 handSize][handSize bools: 0=draw this, 1=shuffle back]
         public const byte DeckUpdate   = 54;
+        public const byte Concede      = 57;  // client -> server: sender concedes (empty payload); opponent wins
         public const byte CardHover    = 7;   // client->server: card hover (cosmetic)
         public const byte ArrowPos     = 34;  // client->server: arrow position (cosmetic)
         public const byte SlotHover    = 64;  // client->server: slot hover (cosmetic)
@@ -228,6 +229,10 @@ namespace PtoServer
             // Turn-timeout watchdog: force-advance a turn when the active player exceeds TurnSeconds.
             new Thread(TurnTimeoutLoop) { IsBackground = true }.Start();
 
+            // Companion-website HTTP+JSON API (live players, profiles). Port via PTO_HTTP_PORT (default 8080).
+            int httpPort; if (!int.TryParse(Environment.GetEnvironmentVariable("PTO_HTTP_PORT"), out httpPort)) httpPort = 8080;
+            HttpApi.Start(httpPort);
+
             while (true)
             {
                 TcpClient c = listener.AcceptTcpClient();
@@ -324,6 +329,7 @@ namespace PtoServer
                         case Op.AddDeck:    HandleDeckSave(payload, username); break;
                         case Op.Queue:      Matchmaker.Join(ns, username, payload.Length > 0 ? payload[0] : (byte)0); break;
                         case Op.CancelQueue:Matchmaker.Cancel(ns); break;
+                        case Op.Concede:    HandleConcede(ns); break;
                         case Op.BattleReady:SendBattleSetup(ns); MaybeSetupBotOpponent(ns); break;
                         case Op.Mulligan:   HandleMulligan(ns, payload); break;
                         case Op.Summon:     HandleSummon(ns, payload); break;
@@ -349,6 +355,7 @@ namespace PtoServer
             {
                 Matchmaker.Cancel(ns);
                 ForgetBattle(ns);
+                OnlineRemove(username);
                 Log("Client disconnected: " + who + (username != null ? " (" + username + ")" : ""));
                 try { client.Close(); } catch { }
             }
@@ -359,11 +366,13 @@ namespace PtoServer
         static void HandleLogin(NetworkStream ns, byte[] payload, ref string username)
         {
             var r = new PacketReader(payload, 0);
-            bool register = r.ReadBool();
-            string user = r.ReadString();
+            byte mode = r.ReadU8();          // 0 = login, 1 = register, 2 = Steam get-or-create
+            bool register = (mode == 1);
+            string user = r.ReadString();    // account key (Steam id for mode 2, typed name otherwise)
             string pass = r.ReadString();
+            string persona = (mode == 2) ? r.ReadString() : null;  // Steam display name, keyed to the id
             ushort version = r.ReadU16();
-            Log((register ? "REGISTER" : "LOGIN") + " user='" + user + "' version=" + version);
+            Log((mode == 2 ? "STEAM '" + persona + "' id=" : register ? "REGISTER " : "LOGIN ") + "user='" + user + "' version=" + version);
 
             if (ClientVersion != 0 && version != ClientVersion)
             {
@@ -380,7 +389,28 @@ namespace PtoServer
                 return;
             }
 
-            if (register)
+            if (mode == 2)
+            {
+                // Steam identity: Steam already authenticated the user, so log in or create on
+                // first sight. pass = the Steam account id (stable+unique), which doubles as the
+                // account secret. A second Steam user with the SAME persona has a different id, so
+                // Verify returns bad-password and they're kept out of the first player's account.
+                // ponytail: persona-keyed; key by steam id in the username if collisions ever bite.
+                int v = Accounts.Verify(user, pass);
+                if (v == 0)
+                {
+                    Send(ns, new PacketWriter().WriteU8(LoginResult.BadPassword).Frame(Op.Login));
+                    Log("-> steam login rejected: persona taken by another Steam account");
+                    return;
+                }
+                if (v < 0)
+                {
+                    Accounts.Register(user, pass);
+                    Log("-> registered new Steam account '" + user + "'");
+                }
+                DisplayNames.Set(user, persona);   // key stays the Steam id; show the (current) persona
+            }
+            else if (register)
             {
                 if (!Accounts.Register(user, pass))
                 {
@@ -408,8 +438,9 @@ namespace PtoServer
             }
 
             username = user;
+            OnlineAdd(user);
 
-            Send(ns, new PacketWriter().WriteU8(LoginResult.Success).WriteString(username).Frame(Op.Login));
+            Send(ns, new PacketWriter().WriteU8(LoginResult.Success).WriteString(Display(username)).Frame(Op.Login));
             Log("-> login success as '" + username + "'");
             SendAccountData(ns, username);
             Send(ns, new PacketWriter().WriteBool(RankStore.IsLegend(username)).WriteU16(RankStore.RankOf(username)).Frame(Op.Loaded));
@@ -1040,6 +1071,15 @@ namespace PtoServer
             return (RangedWaves[c] & (1 << wave)) != 0;
         }
 
+        // Leaders with innate Ranged Attack in their card text (Rukyuk, Arec, Lizaveta). Used both to
+        // resolve their attacks as ranged AND to send the leader a ranged atktype buff so the client
+        // (which never gets a leader buff otherwise) lets the player ranged-target with the leader.
+        static bool IsRangedLeader(ushort leaderCard)
+        {
+            int lc = leaderCard / 2;
+            return lc == 7 || lc == 9 || lc == 78;
+        }
+
         // Build a 20-byte update_buff payload for a unit at (x, y). All fields are 1 byte. s8 fields
         // default to -1 (sent as 255). We only vary atktype (ranged), inter(cept), and adpx (= grid_x,
         // which drives the client's wave-spell selection); everything else is the no-buff default.
@@ -1197,6 +1237,31 @@ namespace PtoServer
         static readonly object _battleLock = new object();
         static readonly Dictionary<NetworkStream, BattleSlot> _battles = new Dictionary<NetworkStream, BattleSlot>();
 
+        // Currently-logged-in usernames, for the website's "live players" view. Simple set: a second
+        // simultaneous login for the same user, then one disconnect, drops them early. ponytail: fine at
+        // hobby scale; use a refcount if multi-session becomes real.
+        static readonly HashSet<string> _online = new HashSet<string>();
+        static void OnlineAdd(string u) { if (!string.IsNullOrEmpty(u)) lock (_online) _online.Add(u); }
+        static void OnlineRemove(string u) { if (!string.IsNullOrEmpty(u)) lock (_online) _online.Remove(u); }
+        internal static string[] OnlineSnapshot() { lock (_online) { var a = new string[_online.Count]; _online.CopyTo(a); return a; } }
+
+        // Account keys are the immutable Steam id for Steam logins; this maps a key to its display
+        // name (persona) for anything shown to a player. Typed-account keys have no entry -> returned as-is.
+        internal static string Display(string user) { return DisplayNames.Of(user); }
+
+        // Active human-vs-human matches as (userA, userB) pairs, de-duplicated across the two slots.
+        internal static List<string[]> ActiveMatches()
+        {
+            var seen = new HashSet<Battle>();
+            var outp = new List<string[]>();
+            lock (_battleLock)
+                foreach (var slot in _battles.Values)
+                    if (slot != null && slot.Battle != null && !slot.Battle.Over && slot.Opp != null
+                        && !slot.Me.IsBot && !slot.Opp.IsBot && seen.Add(slot.Battle))
+                        outp.Add(new[] { slot.Me.User, slot.Opp.User });
+            return outp;
+        }
+
         // The bot needs a NON-NULL NetworkStream to be a dictionary key (Dictionary throws on null keys).
         // Make a real loopback socket pair: the bot's stream is written to normally, and a drain thread
         // reads+discards the far end so those writes never block.
@@ -1246,6 +1311,21 @@ namespace PtoServer
                 SendBattleEnd(slot.Battle, slot.Opp, slot.Me);
                 Log("BATTLE END: " + slot.Me.User + " disconnected -> " + slot.Opp.User + " wins");
             }
+        }
+
+        // op57: the sender concedes. Opponent wins; both stay connected (they return to the lobby),
+        // so we mark the battle over and send the end result to both, but leave _battles cleanup to
+        // the normal disconnect/ForgetBattle path (which no-ops once Battle.Over is set).
+        static void HandleConcede(NetworkStream ns)
+        {
+            BattleSlot slot;
+            lock (_battleLock)
+            {
+                if (!_battles.TryGetValue(ns, out slot) || slot.Battle == null || slot.Battle.Over) return;
+                slot.Battle.Over = true;
+            }
+            Log("CONCEDE: " + slot.Me.User + " conceded -> " + (slot.Opp != null ? slot.Opp.User : "opponent") + " wins");
+            SendBattleEnd(slot.Battle, slot.Opp, slot.Me);
         }
 
         // ---- AI bot (single-player) -------------------------------------------
@@ -1400,6 +1480,7 @@ namespace PtoServer
             {
                 b.RankRecorded = true;
                 RankStore.RecordResult(winner.User, loser.User);
+                MatchStore.Record(winner.User, loser.User);
             }
             if (winner != null)
                 try { Send(winner.Ns, new PacketWriter().WriteBool(true).WriteU16(RankStore.RankOf(winner.User)).Frame(Op.BattleEnd)); } catch { }
@@ -1431,10 +1512,10 @@ namespace PtoServer
             var ms = new MemoryStream();
 
             byte[] d1 = new PacketWriter().WriteBool(true).WriteU16(myBack).WriteU16(myLand)
-                .WriteString(me.User).WriteBool(RankStore.IsLegend(me.User)).WriteU16(RankStore.RankOf(me.User)).WriteBool(false).WriteBool(true)
+                .WriteString(Display(me.User)).WriteBool(RankStore.IsLegend(me.User)).WriteU16(RankStore.RankOf(me.User)).WriteBool(false).WriteBool(true)
                 .Frame(Op.BattleDetails);
             byte[] d2 = new PacketWriter().WriteBool(false).WriteU16(opBack).WriteU16(opLand)
-                .WriteString(opp.User).WriteBool(RankStore.IsLegend(opp.User)).WriteU16(RankStore.RankOf(opp.User)).WriteBool(false).WriteBool(true)
+                .WriteString(Display(opp.User)).WriteBool(RankStore.IsLegend(opp.User)).WriteU16(RankStore.RankOf(opp.User)).WriteBool(false).WriteBool(true)
                 .Frame(Op.BattleDetails);
             ms.Write(d1, 0, d1.Length);
             ms.Write(d2, 0, d2.Length);
@@ -3672,8 +3753,7 @@ namespace PtoServer
             bool isRanged;
             if (attackerIsLeader)
             {
-                int lc = ps.LeaderCard / 2;
-                isRanged = (lc == 7 || lc == 9 || lc == 78);
+                isRanged = IsRangedLeader(ps.LeaderCard);
             }
             else
             {
@@ -4708,6 +4788,15 @@ namespace PtoServer
                 .WriteBool(leaderDead).WriteU8((byte)leaderMax)
                 .Frame(Op.UpdateUnitGet));
 
+            // Ranged leaders: the leader never gets a normal unit buff, so tell the client its atktype
+            // (=1) at (1,1); anim_update_buff sets the leader obj_unit's attack_type, enabling ranged
+            // targeting/animation. (1,1) mirrors to (1,1) so the same coords work for both views.
+            if (IsRangedLeader(ps.LeaderCard))
+            {
+                Send(ownerSlot.Me.Ns, BuildBuff(1, 1, 1, false, false, false, false, false, false, false).Frame(Op.UpdateBuff));
+                Send(oppSlot.Me.Ns, BuildBuff(1, 1, 1, false, false, false, false, false, false, false).Frame(Op.UpdateBuffGet));
+            }
+
             // 2. Recruited units on grid
             foreach (var kvp in ps.Units)
             {
@@ -5123,6 +5212,18 @@ namespace PtoServer
 
         public static bool IsLegend(string user) { return RankOf(user) == MinRank; }
 
+        // Read-only [rank, wins, losses] for a profile view; never creates or persists an entry.
+        public static int[] Stats(string user)
+        {
+            string n = Norm(user);
+            lock (_lock)
+            {
+                EnsureLoaded();
+                int[] e;
+                return (n.Length > 0 && _rank.TryGetValue(n, out e)) ? (int[])e.Clone() : new[] { StartRank, 0, 0 };
+            }
+        }
+
         // Human-vs-human only: winner climbs toward 1, loser falls toward MaxRank; both persisted.
         public static void RecordResult(string winner, string loser)
         {
@@ -5136,6 +5237,285 @@ namespace PtoServer
                 le[0] = Math.Min(MaxRank, le[0] + LossStep); le[2]++;
                 Persist();
             }
+        }
+    }
+
+    // Persistent match history: data/matches.txt, one appended line per finished human match:
+    // "unixSeconds|winner|loser". Read is a linear scan (ponytail: fine for a hobby log; index it if it grows huge).
+    static class MatchStore
+    {
+        static readonly object _lock = new object();
+        static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data"); } }
+        static string FilePath { get { return Path.Combine(Dir, "matches.txt"); } }
+
+        public static void Record(string winner, string loser)
+        {
+            if (string.IsNullOrEmpty(winner) || string.IsNullOrEmpty(loser)) return;
+            long ts = (long)(DateTime.UtcNow - Epoch).TotalSeconds;
+            lock (_lock)
+                try { Directory.CreateDirectory(Dir); File.AppendAllText(FilePath, ts + "|" + winner + "|" + loser + "\n"); }
+                catch (Exception e) { Console.WriteLine("MatchStore save error: " + e.Message); }
+        }
+
+        // Recent matches involving `user`, newest first, up to `max`. Each entry: [ts, winner, loser].
+        public static List<string[]> For(string user, int max)
+        {
+            var outp = new List<string[]>();
+            lock (_lock)
+                try
+                {
+                    if (!File.Exists(FilePath)) return outp;
+                    string[] lines = File.ReadAllLines(FilePath);
+                    for (int i = lines.Length - 1; i >= 0 && outp.Count < max; i--)
+                    {
+                        string[] f = lines[i].Split('|');
+                        if (f.Length < 3) continue;
+                        if (string.Equals(f[1], user, StringComparison.OrdinalIgnoreCase)
+                            || string.Equals(f[2], user, StringComparison.OrdinalIgnoreCase))
+                            outp.Add(f);
+                    }
+                }
+                catch (Exception e) { Console.WriteLine("MatchStore read error: " + e.Message); }
+            return outp;
+        }
+    }
+
+    // Steam display names: account key (the immutable Steam id) -> current persona. Persisted to
+    // data/displaynames.txt ("key|persona" lines). Rewritten whenever a Steam login's persona changes,
+    // so the account (rank, decks, history) stays keyed to the Steam id while the shown name follows
+    // the player's Steam rename. Typed (non-Steam) accounts have no entry and display as their key.
+    static class DisplayNames
+    {
+        static readonly object _lock = new object();
+        static Dictionary<string, string> _map;
+        static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data"); } }
+        static string FilePath { get { return Path.Combine(Dir, "displaynames.txt"); } }
+
+        static void EnsureLoaded()
+        {
+            if (_map != null) return;
+            _map = new Dictionary<string, string>();
+            try
+            {
+                if (File.Exists(FilePath))
+                    foreach (string ln in File.ReadAllLines(FilePath))
+                    { int i = ln.IndexOf('|'); if (i > 0) _map[ln.Substring(0, i)] = ln.Substring(i + 1); }
+            }
+            catch (Exception e) { Console.WriteLine("DisplayNames load error: " + e.Message); }
+        }
+
+        public static void Set(string key, string name)
+        {
+            if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(name)) return;
+            name = name.Replace('|', ' ').Replace('\n', ' ').Replace('\r', ' ');  // keep the "key|name" line format intact
+            lock (_lock)
+            {
+                EnsureLoaded();
+                string cur;
+                if (_map.TryGetValue(key, out cur) && cur == name) return;   // unchanged: no rewrite
+                _map[key] = name;
+                try
+                {
+                    Directory.CreateDirectory(Dir);
+                    var sb = new StringBuilder();
+                    foreach (var kv in _map) sb.Append(kv.Key).Append('|').Append(kv.Value).Append('\n');
+                    File.WriteAllText(FilePath, sb.ToString());
+                }
+                catch (Exception e) { Console.WriteLine("DisplayNames save error: " + e.Message); }
+            }
+        }
+
+        public static string Of(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return key;
+            lock (_lock) { EnsureLoaded(); string v; return _map.TryGetValue(key, out v) ? v : key; }
+        }
+    }
+
+    // Read/login HTTP+JSON API for the companion website. No dependencies: System.Net.HttpListener +
+    // hand-rolled JSON. CORS is open (public read data); tighten Allow-Origin to your site if you like.
+    // Endpoints: POST /login {user,pass -> token}, GET /players, GET /player/{user} (token required).
+    static class HttpApi
+    {
+        static byte[] _secret;
+        static readonly DateTime Epoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        public static void Start(int port)
+        {
+            _secret = LoadOrMakeSecret();
+            var listener = new HttpListener();
+            try { listener.Prefixes.Add("http://+:" + port + "/"); listener.Start(); }
+            catch (HttpListenerException)
+            {
+                listener = new HttpListener();
+                listener.Prefixes.Add("http://localhost:" + port + "/"); listener.Start();
+                Program.Log("HTTP API: no urlacl, bound to localhost only (on Linux it binds all interfaces)");
+            }
+            Program.Log("HTTP API listening on :" + port + " (/login, /players, /player/{user})");
+            new Thread(() => { while (true) { try { Handle(listener.GetContext()); } catch { } } }) { IsBackground = true }.Start();
+        }
+
+        static void Handle(HttpListenerContext ctx)
+        {
+            var req = ctx.Request; var res = ctx.Response;
+            res.AddHeader("Access-Control-Allow-Origin", "*");
+            res.AddHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+            res.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+            try
+            {
+                if (req.HttpMethod == "OPTIONS") { res.StatusCode = 204; res.Close(); return; }
+                string path = req.Url.AbsolutePath.TrimEnd('/');
+                if (req.HttpMethod == "POST" && path == "/login") { Login(req, res); return; }
+                if (req.HttpMethod == "GET" && path == "/players") { Players(res); return; }
+                if (req.HttpMethod == "GET" && path.StartsWith("/player/"))
+                { Player(req, res, Uri.UnescapeDataString(path.Substring("/player/".Length))); return; }
+                Write(res, 404, "{\"error\":\"not found\"}");
+            }
+            catch (Exception e) { try { Write(res, 500, "{\"error\":" + J(e.Message) + "}"); } catch { } }
+        }
+
+        static void Login(HttpListenerRequest req, HttpListenerResponse res)
+        {
+            var form = ParseForm(ReadBody(req));
+            string user, pass; form.TryGetValue("user", out user); form.TryGetValue("pass", out pass);
+            if (Accounts.Verify(user, pass) != 1) { Write(res, 401, "{\"error\":\"invalid credentials\"}"); return; }
+            int[] s = RankStore.Stats(user);
+            Write(res, 200, "{\"token\":" + J(MakeToken(user)) + ",\"user\":" + J(user)
+                + ",\"rank\":" + s[0] + ",\"wins\":" + s[1] + ",\"losses\":" + s[2] + "}");
+        }
+
+        static void Players(HttpListenerResponse res)
+        {
+            var sb = new StringBuilder("{\"online\":[");
+            string[] on = Program.OnlineSnapshot();
+            for (int i = 0; i < on.Length; i++) { if (i > 0) sb.Append(','); sb.Append(J(Program.Display(on[i]))); }
+            sb.Append("],\"matches\":[");
+            var ms = Program.ActiveMatches();
+            for (int i = 0; i < ms.Count; i++)
+            { if (i > 0) sb.Append(','); sb.Append("{\"a\":" + J(Program.Display(ms[i][0])) + ",\"b\":" + J(Program.Display(ms[i][1])) + "}"); }
+            Write(res, 200, sb.Append("]}").ToString());
+        }
+
+        static void Player(HttpListenerRequest req, HttpListenerResponse res, string user)
+        {
+            if (TokenUser(BearerOrQuery(req)) == null) { Write(res, 401, "{\"error\":\"login required\"}"); return; }
+            int[] s = RankStore.Stats(user);
+            var sb = new StringBuilder("{\"user\":" + J(user) + ",\"rank\":" + s[0] + ",\"wins\":" + s[1] + ",\"losses\":" + s[2] + ",\"decks\":[");
+            bool first = true;
+            foreach (Deck d in DeckStore.Load(user))
+            {
+                if (d == null) continue;
+                if (!first) sb.Append(','); first = false;
+                sb.Append("{\"name\":" + J(d.Name) + ",\"cards\":[");
+                bool fc = true;
+                for (int i = 0; i < d.Cards.Length; i++)
+                { if (d.Cards[i] == 0) continue; if (!fc) sb.Append(','); fc = false; sb.Append(d.Cards[i]); }
+                sb.Append("]}");
+            }
+            sb.Append("],\"history\":[");
+            var hist = MatchStore.For(user, 25);
+            for (int i = 0; i < hist.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                bool won = string.Equals(hist[i][1], user, StringComparison.OrdinalIgnoreCase);
+                sb.Append("{\"at\":" + hist[i][0] + ",\"opponent\":" + J(won ? hist[i][2] : hist[i][1]) + ",\"won\":" + (won ? "true" : "false") + "}");
+            }
+            Write(res, 200, sb.Append("]}").ToString());
+        }
+
+        // --- helpers ---
+        static string BearerOrQuery(HttpListenerRequest req)
+        {
+            string a = req.Headers["Authorization"];
+            if (!string.IsNullOrEmpty(a) && a.StartsWith("Bearer ")) return a.Substring(7);
+            return req.QueryString["token"];
+        }
+        static string ReadBody(HttpListenerRequest req)
+        {
+            using (var sr = new StreamReader(req.InputStream, req.ContentEncoding ?? Encoding.UTF8)) return sr.ReadToEnd();
+        }
+        static Dictionary<string, string> ParseForm(string body)
+        {
+            var d = new Dictionary<string, string>();
+            if (string.IsNullOrEmpty(body)) return d;
+            foreach (string part in body.Split('&'))
+            {
+                int eq = part.IndexOf('=');
+                if (eq <= 0) continue;
+                d[Uri.UnescapeDataString(part.Substring(0, eq))] = Uri.UnescapeDataString(part.Substring(eq + 1).Replace('+', ' '));
+            }
+            return d;
+        }
+        static void Write(HttpListenerResponse res, int code, string json)
+        {
+            res.StatusCode = code; res.ContentType = "application/json";
+            byte[] b = Encoding.UTF8.GetBytes(json);
+            res.ContentLength64 = b.Length; res.OutputStream.Write(b, 0, b.Length); res.Close();
+        }
+        static string J(string s)
+        {
+            if (s == null) return "null";
+            var sb = new StringBuilder("\"");
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '"': sb.Append("\\\""); break;
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default: if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4")); else sb.Append(c); break;
+                }
+            }
+            return sb.Append('"').ToString();
+        }
+        // Signed session token: base64url(user) "." unixExpiry "." hmacHex.
+        static string MakeToken(string user)
+        {
+            long exp = (long)(DateTime.UtcNow.AddDays(7) - Epoch).TotalSeconds;
+            string body = B64(user) + "." + exp;
+            return body + "." + Hmac(body);
+        }
+        static string TokenUser(string token)
+        {
+            if (string.IsNullOrEmpty(token)) return null;
+            string[] p = token.Split('.');
+            if (p.Length != 3) return null;
+            string body = p[0] + "." + p[1];
+            if (!SlowEq(Hmac(body), p[2])) return null;
+            long exp;
+            if (!long.TryParse(p[1], out exp) || (long)(DateTime.UtcNow - Epoch).TotalSeconds > exp) return null;
+            try { return UnB64(p[0]); } catch { return null; }
+        }
+        static string Hmac(string s)
+        {
+            using (var h = new System.Security.Cryptography.HMACSHA256(_secret))
+                return BitConverter.ToString(h.ComputeHash(Encoding.UTF8.GetBytes(s))).Replace("-", "");
+        }
+        static bool SlowEq(string a, string b) { if (a.Length != b.Length) return false; int r = 0; for (int i = 0; i < a.Length; i++) r |= a[i] ^ b[i]; return r == 0; }
+        static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s)).Replace('+', '-').Replace('/', '_').TrimEnd('='); }
+        static string UnB64(string s)
+        {
+            s = s.Replace('-', '+').Replace('_', '/');
+            switch (s.Length % 4) { case 2: s += "=="; break; case 3: s += "="; break; }
+            return Encoding.UTF8.GetString(Convert.FromBase64String(s));
+        }
+        static byte[] LoadOrMakeSecret()
+        {
+            string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data");
+            string f = Path.Combine(dir, "apisecret.txt");
+            try
+            {
+                if (File.Exists(f)) { string t = File.ReadAllText(f).Trim(); if (t.Length >= 32) return Convert.FromBase64String(t); }
+                Directory.CreateDirectory(dir);
+                var key = new byte[32];
+                using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create()) rng.GetBytes(key);
+                File.WriteAllText(f, Convert.ToBase64String(key));
+                return key;
+            }
+            catch { var k = new byte[32]; new Random().NextBytes(k); return k; }
         }
     }
 }
