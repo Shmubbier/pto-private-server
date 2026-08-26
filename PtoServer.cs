@@ -89,6 +89,7 @@ namespace PtoServer
         public const byte SpellRemove  = 45;  // battle: end the cast window; releases queue (next_que_effect=1) [no payload]
         public const byte ScryResult   = 51;  // client->server: scry pick result [u8 handSize][handSize bools: 0=draw this, 1=shuffle back]
         public const byte DeckUpdate   = 54;
+        public const byte StartStage   = 55;  // client -> server: start a singleplayer campaign stage [deckId u8][sid u16]
         public const byte Concede      = 57;  // client -> server: sender concedes (empty payload); opponent wins
         public const byte CardHover    = 7;   // client->server: card hover (cosmetic)
         public const byte ArrowPos     = 34;  // client->server: arrow position (cosmetic)
@@ -329,6 +330,7 @@ namespace PtoServer
                         case Op.AddDeck:    HandleDeckSave(payload, username); break;
                         case Op.Queue:      Matchmaker.Join(ns, username, payload.Length > 0 ? payload[0] : (byte)0); break;
                         case Op.CancelQueue:Matchmaker.Cancel(ns); break;
+                        case Op.StartStage: HandleStartStage(ns, username, payload); break;
                         case Op.Concede:    HandleConcede(ns); break;
                         case Op.BattleReady:SendBattleSetup(ns); MaybeSetupBotOpponent(ns); break;
                         case Op.Mulligan:   HandleMulligan(ns, payload); break;
@@ -1156,6 +1158,7 @@ namespace PtoServer
             public int First = 0;  // absolute player index holding first-player token
             public int Active = 0; // absolute player index whose turn it is
             public int BotP = -1;  // player index controlled by the AI bot, or -1 if none
+            public int BotDifficulty = 2; // 0=easy,1=medium,2=hard: the rank window the bot picks moves from
             public bool BotActing; // guard so only one bot-turn thread runs at a time
             public bool RankRecorded; // guard so a battle updates the ranked ladder at most once
         }
@@ -1282,7 +1285,8 @@ namespace PtoServer
         {
             Log("MATCH: " + a.User + " vs " + b.User + " (battle " + battleId + ")");
             var battle = new Battle();
-            if (a.IsBot) battle.BotP = 1; else if (b.IsBot) battle.BotP = 0;
+            if (a.IsBot) { battle.BotP = 1; battle.BotDifficulty = a.BotDifficulty; }
+            else if (b.IsBot) { battle.BotP = 0; battle.BotDifficulty = b.BotDifficulty; }
             lock (_battleLock)
             {
                 _battles[a.Ns] = new BattleSlot { Me = a, Opp = b, FirstPlayer = false, Battle = battle, P = 1 };
@@ -1326,6 +1330,46 @@ namespace PtoServer
             }
             Log("CONCEDE: " + slot.Me.User + " conceded -> " + (slot.Opp != null ? slot.Opp.User : "opponent") + " wins");
             SendBattleEnd(slot.Battle, slot.Opp, slot.Me);
+        }
+
+        // Campaign stage tables, ported from the client's stage_setup (16 nodes, 8 per world). Each node's
+        // three difficulty ids (easy/hard/challenge) share the node's AI leader, so sid -> leader is just
+        // the node index within its world. Values are REAL card ids (LeaderCard = real*2).
+        static readonly int[] World1Leaders = { 78, 72, 75, 77, 73, 71, 74, 76 };
+        static readonly int[] World2Leaders = { 9, 4, 107, 8, 100, 79, 10, 108 };
+        static int StageLeaderReal(int sid)
+        {
+            if (sid >= 1  && sid <= 24) return World1Leaders[(sid - 1)  % 8];
+            if (sid >= 25 && sid <= 48) return World2Leaders[(sid - 25) % 8];
+            return 0; // sid 0 (Deck Test) / unknown -> bot's default leader
+        }
+
+        // sid -> bot difficulty (0=easy,1=medium,2=hard). Each world's 24 stages run easy(1-8)/hard(9-16)/
+        // challenge(17-24); the node's three ids share a leader but scale the AI: easy stage = easy bot,
+        // hard stage = medium bot, challenge = hard bot. Deck Test / unknown = full-strength AI.
+        static int StageDifficulty(int sid)
+        {
+            if (sid < 1 || sid > 48) return 2;
+            return ((sid - 1) % 24) / 8; // 0..7 -> 0 (easy), 8..15 -> 1 (hard), 16..23 -> 2 (challenge)
+        }
+
+        // op55: start a singleplayer campaign stage. Payload: [deckId u8][sid u16]. Starts a battle of the
+        // human (chosen deck) vs the AI bot, forcing the bot's leader to the stage node's leader. The client
+        // then follows the same BattleReady path as a queued bot match. Difficulty scaling + win-persistence
+        // are deferred (roadmap steps 3-4). ponytail: leader-only AI; difficulty-scaled decks when it matters.
+        static void HandleStartStage(NetworkStream ns, string username, byte[] payload)
+        {
+            if (string.IsNullOrEmpty(username) || payload.Length < 3) return;
+            var r = new PacketReader(payload, 0);
+            byte deckId = r.ReadU8();
+            ushort sid = r.ReadU16();
+            int leaderReal = StageLeaderReal(sid);
+            int diff = StageDifficulty(sid);
+            Log("STAGE: " + username + " starts stage " + sid + " (deck " + deckId + ", AI leader " + leaderReal + ", difficulty " + diff + ")");
+            var human = new Waiting { Ns = ns, User = username, DeckId = deckId };
+            var bot = new Waiting { Ns = MakeBotStream(), User = "bot", DeckId = 0, IsBot = true,
+                                    LeaderOverride = (ushort)(leaderReal * 2), BotDifficulty = diff };
+            StartBattle(human, bot, Matchmaker.NextBattleId());
         }
 
         // ---- AI bot (single-player) -------------------------------------------
@@ -1394,79 +1438,167 @@ namespace PtoServer
         // economy (the old free turn-start refill let the bot draw AND summon 3, bypassing the rules).
         const int BotHandTarget = 3;
 
-        // Decide and perform ONE bot action. Returns false when the bot has nothing useful to do.
+        // One candidate move the bot could make this action, with the priority score it scored.
+        class BotMove { public int Kind; public byte[] Payload; public double Score; public string Desc; } // Kind: 1=summon,2=attack,3=draw
+
+        // Difficulty -> the [lo,hi) rank window (into the best-first sorted candidate list) the bot draws its
+        // pick from. Harder = nearer the top = more likely a very good move. Absolute bands per design;
+        // clamped to the actual candidate count in BotChoose.
+        static void BotBand(int diff, out int lo, out int hi)
+        {
+            switch (diff)
+            {
+                case 2:  lo = 0;  hi = 10;  break; // Challenge / hard bot: 1 of the top 10
+                case 1:  lo = 10; hi = 30;  break; // Hard stage / medium bot: ranks 10-30
+                default: lo = 30; hi = 100; break; // Easy stage / easy bot: ranks 30-100
+            }
+        }
+
+        // Decide and perform ONE bot action. Enumerate every LEGAL move (same rules/limit a human has),
+        // score each with the formulas below, sort best-first, then pick one from the difficulty's rank
+        // window. Returns false when the bot has no legal move (ends its turn).
         static bool BotDoOneAction(BattleSlot bot)
         {
             Battle b = bot.Battle;
-            byte[] payload = null; int kind = 0; // 1=summon, 2=attack, 3=draw
+            BotMove move;
             lock (_battleLock)
             {
                 if (b.Over || b.Active != bot.P) return false;
                 PlayerState ps = b.P[bot.P], hp = b.P[1 - bot.P];
                 if (ps.ActionsRemaining <= 0) return false;
-
-                // 0) Draw (costs an action, like a human) if the hand is thin, keeps a buffer so hand-
-                //    effects have targets, without the old free-refill rule break.
-                if (bot.Hand.Count < BotHandTarget && ps.Deck != null && ps.Deck.Count > 0)
-                    kind = 3;
-
-                // 1) Summon a hero into an empty slot of the current wave.
-                if (kind == 0 && bot.Hand.Count > 0)
-                    for (int col = 0; col < 3 && kind == 0; col++)
-                    {
-                        if (b.Wave == 1 && col == 1) continue;           // leader cell
-                        if (ps.Units.ContainsKey(Key(b.Wave, col))) continue;
-                        payload = new byte[] { 0, (byte)b.Wave, (byte)col, 0 }; kind = 1; // summon hand[0]
-                    }
-
-                // 2) Otherwise attack (round 2+) with a ready unit in the current wave.
-                if (kind == 0 && b.Round >= 2)
-                    foreach (var kv in ps.Units)
-                    {
-                        if (kv.Key / 10 != b.Wave) continue;
-                        BUnit u = kv.Value;
-                        if (u == null || u.IsCorpse || u.HasAttackedThisWave || u.RecruitedThisWave) continue;
-                        int ay = kv.Key % 10;
-                        bool ranged = (u.Abilities & UnitAbility.RangedAttack) != 0;
-                        // Melee is blocked by an ally in front (same rule the server now enforces); skip it.
-                        if (!ranged && !IsFrontmostAliveInColumn(kv.Key / 10, ay, ps)) continue;
-                        int tx, ty;
-                        // If the human has a reachable decoy, the attack MUST hit it (else the server rejects).
-                        int decoy = ForcedDecoyCell(hp);
-                        if (decoy >= 0)
-                        {
-                            int dwave = decoy / 10, dlane = decoy % 10;
-                            if (!ranged && dlane != ay) continue; // melee can't reach a decoy in another lane
-                            tx = dwave; ty = dlane;
-                            payload = new byte[] { 0, 0, (byte)b.Wave, (byte)ay, (byte)tx, (byte)ty }; kind = 2; break;
-                        }
-                        if (BotPickTarget(hp, ay, ranged, out tx, out ty))
-                        { payload = new byte[] { 0, 0, (byte)b.Wave, (byte)ay, (byte)tx, (byte)ty }; kind = 2; break; }
-                    }
+                move = BotChoose(BotEnumerateMoves(b, bot, ps, hp), b.BotDifficulty);
             }
-            if (kind == 3) { Log("BOT: draw"); HandleDraw(bot.Me.Ns); return true; } // consumes an action + syncs the human's bot-hand count (op9)
-            if (kind == 1) { Log("BOT: summon -> (" + payload[1] + "," + payload[2] + ")"); HandleSummon(bot.Me.Ns, payload); return true; }
-            if (kind == 2) { Log("BOT: attack (" + payload[2] + "," + payload[3] + ") -> (" + payload[4] + "," + payload[5] + ")"); HandleAttack(bot.Me.Ns, payload); return true; }
+            if (move == null) return false;
+            switch (move.Kind) // handlers spend the action + enforce legality, so a bad pick can't cheat
+            {
+                case 3: Log("BOT: draw (" + move.Desc + ")");   HandleDraw(bot.Me.Ns);            return true;
+                case 1: Log("BOT: summon " + move.Desc);        HandleSummon(bot.Me.Ns, move.Payload); return true;
+                case 2: Log("BOT: attack " + move.Desc);        HandleAttack(bot.Me.Ns, move.Payload); return true;
+            }
             return false;
         }
 
-        // Pick a valid target for a bot attacker in lane `lane`. Ranged: frontmost enemy anywhere, else
-        // leader. Melee: frontmost enemy in the same lane, else the leader from the center lane.
-        static bool BotPickTarget(PlayerState hp, int lane, bool ranged, out int tx, out int ty)
+        // Sort candidates best-first and pick one from the difficulty's rank window (clamped: with only n
+        // candidates, a window past the end collapses onto the worst available move, so weak bots stay weak).
+        static BotMove BotChoose(List<BotMove> moves, int diff)
         {
-            tx = ty = 0; BUnit u;
-            if (ranged)
+            if (moves.Count == 0) return null;
+            moves.Sort((x, y) => y.Score.CompareTo(x.Score));
+            int lo, hi; BotBand(diff, out lo, out hi);
+            int n = moves.Count;
+            if (lo > n - 1) lo = n - 1;
+            if (hi > n) hi = n;
+            if (hi <= lo) hi = lo + 1;
+            int idx; lock (_rng) idx = _rng.Next(lo, hi);
+            return moves[idx];
+        }
+
+        // Enumerate every legal move for the current action and score it. Legality mirrors HandleSummon/
+        // HandleAttack exactly (wave, empty slot, summon-sickness, melee front-blocking + frontmost target,
+        // ranged targeting, forced decoy), so no enumerated move is ever rejected (which would waste the
+        // action). Called under _battleLock.
+        static List<BotMove> BotEnumerateMoves(Battle b, BattleSlot bot, PlayerState ps, PlayerState hp)
+        {
+            var moves = new List<BotMove>();
+            int wave = b.Wave;
+
+            // Draw (costs an action). More attractive the thinner the hand; skipped at/above the target.
+            if (ps.Deck != null && ps.Deck.Count > 0 && bot.Hand.Count < BotHandTarget)
+                moves.Add(new BotMove { Kind = 3, Score = 55 - bot.Hand.Count * 8, Desc = "hand=" + bot.Hand.Count });
+
+            // Summon: every hand card into every empty legal slot of the current wave.
+            for (int h = 0; h < bot.Hand.Count; h++)
             {
+                ushort card = bot.Hand[h];
+                int catk = AtkOf(card), clife = LifeOf(card);
                 for (int col = 0; col < 3; col++)
-                    for (int w = 2; w >= 0; w--)
-                        if (hp.Units.TryGetValue(Key(w, col), out u) && u != null && !u.IsCorpse) { tx = w; ty = col; return true; }
-                tx = 1; ty = 1; return true; // no units left -> shoot the leader
+                {
+                    if (wave == 1 && col == 1) continue;               // leader cell
+                    if (ps.Units.ContainsKey(Key(wave, col))) continue;
+                    double score = 70 + catk * 6 + clife * 2 + (wave == 2 ? 15 : wave == 1 ? 5 : 0);
+                    moves.Add(new BotMove { Kind = 1, Score = score,
+                        Payload = new byte[] { (byte)h, (byte)wave, (byte)col, 0 },
+                        Desc = "card " + card + " -> (" + wave + "," + col + ")" });
+                }
             }
-            for (int w = 2; w >= 0; w--)
-                if (hp.Units.TryGetValue(Key(w, lane), out u) && u != null && !u.IsCorpse) { tx = w; ty = lane; return true; }
-            // melee can only reach the leader down the center lane when its Vanguard is clear
-            if (lane == 1 && !(hp.Units.TryGetValue(Key(2, 1), out u) && u != null && !u.IsCorpse)) { tx = 1; ty = 1; return true; }
-            return false;
+
+            // Attack (round 2+): every ready unit in the current wave x every legal target.
+            if (b.Round >= 2)
+            {
+                int decoy = ForcedDecoyCell(hp);
+                foreach (var kv in ps.Units)
+                {
+                    if (kv.Key / 10 != wave) continue;
+                    BUnit u = kv.Value;
+                    if (u == null || u.IsCorpse || u.HasAttackedThisWave || u.RecruitedThisWave) continue;
+                    int ay = kv.Key % 10;
+                    bool ranged = (u.Abilities & UnitAbility.RangedAttack) != 0;
+                    if (!ranged && !IsFrontmostAliveInColumn(wave, ay, ps)) continue; // blocked by own front ally
+                    int atk = u.Atk + u.Strength + u.TempStrength;
+                    bool heroKiller = (u.Abilities & UnitAbility.HeroKiller) != 0;
+
+                    if (decoy >= 0) // a reachable decoy forces the target
+                    {
+                        int dwave = decoy / 10, dlane = decoy % 10;
+                        if (!ranged && dlane != ay) continue; // melee can't reach a decoy in another lane
+                        BotAddAttack(moves, hp, wave, ay, dwave, dlane, atk, heroKiller, false);
+                        continue;
+                    }
+                    if (ranged)
+                    {
+                        for (int col = 0; col < 3; col++)               // frontmost enemy in each column
+                            for (int w = 2; w >= 0; w--)
+                            {
+                                BUnit t;
+                                if (hp.Units.TryGetValue(Key(w, col), out t) && t != null && !t.IsCorpse)
+                                { BotAddAttack(moves, hp, wave, ay, w, col, atk, heroKiller, false); break; }
+                            }
+                        if ((hp.LeaderAbilities & UnitAbility.RImmunity) == 0)
+                            BotAddAttack(moves, hp, wave, ay, 1, 1, atk, heroKiller, true); // snipe the leader
+                    }
+                    else
+                    {
+                        bool hit = false;
+                        for (int w = 2; w >= 0; w--)                    // frontmost enemy in the same lane
+                        {
+                            BUnit t;
+                            if (hp.Units.TryGetValue(Key(w, ay), out t) && t != null && !t.IsCorpse)
+                            { BotAddAttack(moves, hp, wave, ay, w, ay, atk, heroKiller, false); hit = true; break; }
+                        }
+                        if (!hit && ay == 1) // melee the leader down the center lane when its Vanguard is clear
+                        {
+                            BUnit v;
+                            if (!(hp.Units.TryGetValue(Key(2, 1), out v) && v != null && !v.IsCorpse))
+                                BotAddAttack(moves, hp, wave, ay, 1, 1, atk, heroKiller, true);
+                        }
+                    }
+                }
+            }
+            return moves;
+        }
+
+        // Score one attack candidate and append it. Killing a hero (or damaging/killing the leader, which
+        // wins) scores highest; otherwise damage + the threat removed drive the score.
+        static void BotAddAttack(List<BotMove> moves, PlayerState hp, int aw, int al, int tw, int tl,
+                                 int atk, bool heroKiller, bool targetIsLeader)
+        {
+            int raw = heroKiller ? atk * 2 : atk;
+            int armor, rem, tgtAtk = 0;
+            if (targetIsLeader) { armor = hp.LeaderArmorBonus; rem = Math.Max(1, hp.LeaderLife); }
+            else
+            {
+                BUnit t; hp.Units.TryGetValue(Key(tw, tl), out t);
+                if (t == null) return;
+                armor = t.Armor; rem = Math.Max(1, t.Max - t.Damage); tgtAtk = t.Atk + t.Strength;
+            }
+            int dmg = Math.Max(0, raw - armor);
+            bool kills = dmg >= rem;
+            double score = 90 + dmg * 4;
+            if (targetIsLeader) { score += dmg * 8; if (kills) score += 800; }   // leader damage wins the game
+            else score += kills ? 60 + tgtAtk * 5 : tgtAtk * 2;                  // value removing a threat
+            moves.Add(new BotMove { Kind = 2, Score = score,
+                Payload = new byte[] { 0, 0, (byte)aw, (byte)al, (byte)tw, (byte)tl },
+                Desc = "(" + aw + "," + al + ")->(" + tw + "," + tl + ") dmg" + dmg + (kills ? " KILL" : "") });
         }
 
         // ---- battle setup + mulligan ------------------------------------------
@@ -1501,6 +1633,7 @@ namespace PtoServer
             if (slot.Battle != null && md != null)
             {
                 ushort leader = md.Cards.Length > 0 ? md.Cards[0] : (ushort)0;
+                if (me.LeaderOverride != 0) leader = me.LeaderOverride; // campaign-stage AI leader
                 var ps = slot.Battle.P[slot.P];
                 ps.LeaderCard = leader;
                 ps.LeaderMax = ps.LeaderLife = Math.Max(1, LifeOf(leader));
@@ -4909,6 +5042,8 @@ namespace PtoServer
         public string User;
         public byte DeckId;
         public bool IsBot;
+        public ushort LeaderOverride; // 0 = none; else force this LeaderCard (real*2) for a campaign-stage AI
+        public int BotDifficulty = 2; // 0=easy,1=medium,2=hard; copied to Battle.BotDifficulty when this bot plays
     }
 
     // Simple 1v1 matchmaking: hold at most one waiting player; the next joiner is paired with them.
@@ -4917,6 +5052,8 @@ namespace PtoServer
         static readonly object _lock = new object();
         static Waiting _waiting;
         static int _nextBattleId = 1;
+
+        public static int NextBattleId() { lock (_lock) return _nextBattleId++; }
 
         public static void Join(NetworkStream ns, string user, byte deckId)
         {
