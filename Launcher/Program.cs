@@ -143,6 +143,7 @@ static class Program
                 // game -> server: go online on Op.Queue. server -> game: on Op.BattleEnd,
                 // if we were hosting an online match, re-arm and return to passive offline.
                 var queueSniff = new OpcodeSniffer(OpQueue, () => _ = GoOnlineAsync(meta, online, game));
+                online.QueueSniff = queueSniff;
                 var endSniff = new OpcodeSniffer(OpBattleEnd, () =>
                 {
                     if (online.EndHosting())
@@ -164,6 +165,18 @@ static class Program
     // to the relay.
     static async Task GoOnlineAsync(MetaClient meta, OnlineState online, TcpClient game)
     {
+        // Fire-and-forget from the sniffer: swallow nothing silently. On any error, re-arm
+        // so the player can just try matchmaking again.
+        try { await GoOnlineCoreAsync(meta, online, game); }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"matchmaking stopped: {ex.Message}. Choose matchmaking again to retry.");
+            online.CancelHosting();
+        }
+    }
+
+    static async Task GoOnlineCoreAsync(MetaClient meta, OnlineState online, TcpClient game)
+    {
         if (!online.Begin()) return; // once per match (Reset re-arms it after the match ends)
         if (!meta.Enabled) { Console.WriteLine("online needs Firebase (firebase.txt); staying offline"); return; }
         SteamRelay relay;
@@ -171,18 +184,28 @@ static class Program
         else
         {
             try { relay = new SteamRelay(); relay.Init(); }
-            catch (Exception ex) { Console.WriteLine($"online needs Steam running: {ex.Message}"); return; }
+            catch (Exception ex) { Console.WriteLine($"online needs Steam running: {ex.Message}"); online.Reset(); return; }
             online.Relay = relay;
         }
         ulong me = relay.MySteamId;
         Console.WriteLine($"online: matchmaking as {relay.MyName} ({me})...");
 
+        int polls = 0;
         while (true)
         {
-            await meta.EnqueueAsync(me, relay.MyName);
-            var queue = await meta.ListQueueAsync();
+            List<QueueEntry> queue;
+            try { await meta.EnqueueAsync(me, relay.MyName); queue = await meta.ListQueueAsync(); }
+            catch (Exception ex) { Console.WriteLine($"  Firebase unreachable, retrying ({ex.Message})"); await Task.Delay(3000); continue; }
+
             ulong partner = ElectPartner(queue.Select(q => ulong.TryParse(q.steamId, out var v) ? v : 0), me);
-            if (partner == 0) { await Task.Delay(2000); continue; }
+            if (partner == 0)
+            {
+                int others = queue.Count(q => ulong.TryParse(q.steamId, out var v) && v != me);
+                if (polls++ % 5 == 0) // ~every 10s, not every poll
+                    Console.WriteLine($"  waiting for an opponent... ({others} other player(s) queued)");
+                await Task.Delay(2000);
+                continue;
+            }
             string key = PairKey(me, partner);
 
             if (me < partner)
@@ -191,18 +214,23 @@ static class Program
                 // already queued us there. Advertise and bridge the guest in over the relay.
                 online.MyId = me; online.MatchKey = key; online.Hosting = true;
                 await meta.SetMatchAsync(key, me);
-                Console.WriteLine($"matched with {partner}; you are hosting. Waiting for opponent to join...");
+                Console.WriteLine($"matched with {partner} - you're the host. Waiting for them to join...");
                 EnsureAuthorityListening(relay, meta, online); // once per session
-                StartAdvertise(relay, meta, online);           // per match, until the guest connects
+                StartAdvertise(relay, meta, online);           // per match, with a timeout, until the guest connects
                 return;
             }
 
             ulong confirmed = await meta.GetMatchAuthorityAsync(key);
-            if (confirmed != partner) { await Task.Delay(1500); continue; }
+            if (confirmed != partner)
+            {
+                if (polls++ % 3 == 0) Console.WriteLine($"  matched with {partner}; waiting for host to confirm...");
+                await Task.Delay(1500);
+                continue;
+            }
             await meta.DequeueAsync(me);
             online.GuestAuthority = partner; // route the reconnect to the relay
-            Console.WriteLine($"matched with {partner}; joining their game.");
-            Console.WriteLine(">> Restart the game when it says 'disconnected', then choose online matchmaking again to enter the match.");
+            Console.WriteLine($"matched with {partner} - joining their game.");
+            Console.WriteLine(">> When the game says 'disconnected', restart it and choose online matchmaking again to enter the match.");
             try { game.Close(); } catch { } // drop the local session so the client reconnects via the relay
             return;
         }
@@ -257,17 +285,28 @@ static class Program
     }
 
     // Per match: keep the authority in the queue so the guest can derive the pair, until
-    // the guest connects (the listener cancels this).
+    // the guest connects (the listener cancels this) or a timeout gives up.
+    const int AuthorityWaitSeconds = 120;
     static void StartAdvertise(SteamRelay relay, MetaClient meta, OnlineState online)
     {
         var cts = new CancellationTokenSource();
         online.HeartbeatCts = cts;
         _ = Task.Run(async () =>
         {
+            int elapsed = 0;
             while (!cts.IsCancellationRequested)
             {
                 try { await meta.EnqueueAsync(online.MyId, relay.MyName); } catch { }
-                try { await Task.Delay(3000, cts.Token); } catch { }
+                try { await Task.Delay(3000, cts.Token); } catch { break; } // cancelled = guest connected
+                elapsed += 3;
+                if (elapsed >= AuthorityWaitSeconds && !cts.IsCancellationRequested)
+                {
+                    Console.WriteLine($"no opponent joined in {AuthorityWaitSeconds}s; cancelled. Choose matchmaking again to retry.");
+                    try { await meta.DequeueAsync(online.MyId); } catch { }
+                    if (online.MatchKey != null) { try { await meta.ClearMatchAsync(online.MatchKey); } catch { } }
+                    online.CancelHosting(); // re-arm so a fresh in-game matchmake works
+                    break;
+                }
             }
         });
     }
@@ -726,6 +765,7 @@ sealed class OnlineState
     public volatile CancellationTokenSource? HeartbeatCts;
     public ulong MyId;
     public string? MatchKey;
+    public OpcodeSniffer? QueueSniff; // the game's Op.Queue trigger, re-armed after a match/cancel
 
     public bool Begin() => Interlocked.Exchange(ref _begun, 1) == 0; // go online at most once per match
     public void Reset() { GuestAuthority = 0; Interlocked.Exchange(ref _begun, 0); } // guest match end: offline, re-armed
@@ -738,6 +778,15 @@ sealed class OnlineState
         Hosting = false;
         Interlocked.Exchange(ref _begun, 0);
         return true;
+    }
+
+    // Authority gave up waiting for a guest: stop hosting and re-arm so a fresh
+    // in-game matchmake retriggers.
+    public void CancelHosting()
+    {
+        Hosting = false;
+        Interlocked.Exchange(ref _begun, 0);
+        QueueSniff?.Rearm();
     }
 }
 

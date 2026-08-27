@@ -59,17 +59,28 @@ sealed class MetaClient
         try { await _http.DeleteAsync(Url($"queue/{steamId}")); } catch { /* best effort */ }
     }
 
-    // Fresh queue entries; a peer that died without dequeuing ages out.
+    // Fresh queue entries; a peer that died without dequeuing ages out. Entries far past
+    // stale (a crashed peer) are opportunistically deleted so the DB doesn't accumulate
+    // junk over a long session. DELETE is idempotent, so concurrent readers racing to
+    // prune the same key is harmless.
     public async Task<List<QueueEntry>> ListQueueAsync(int staleSeconds = 20)
     {
         var json = await _http.GetStringAsync(Url("queue"));
         if (string.IsNullOrWhiteSpace(json) || json == "null") return new();
         var map = JsonSerializer.Deserialize<Dictionary<string, QueueEntry>>(json) ?? new();
-        long cutoff = Now() - staleSeconds;
+        long now = Now(), fresh = now - staleSeconds, dead = now - staleSeconds * 4;
         var live = new List<QueueEntry>();
-        foreach (var q in map.Values) if (q != null && q.ts >= cutoff) live.Add(q);
+        foreach (var kv in map)
+        {
+            var q = kv.Value;
+            if (q == null) continue;
+            if (q.ts >= fresh) live.Add(q);
+            else if (q.ts < dead) _ = PruneAsync($"queue/{kv.Key}"); // long-dead: best-effort delete
+        }
         return live;
     }
+
+    async Task PruneAsync(string path) { try { await _http.DeleteAsync(Url(path)); } catch { } }
 
     // Match confirmation: the elected authority (lower SteamID) writes its id under
     // the pair key so the other peer can confirm reciprocity before it commits and
