@@ -17,6 +17,7 @@ sealed class SteamRelay : IDisposable
     const int VirtualPort = 0; // single service; ConnectP2P and the listen socket must agree
 
     readonly ConcurrentDictionary<HSteamNetConnection, SteamConnectionStream> _conns = new();
+    readonly ConcurrentQueue<string> _log = new(); // status logs, drained OFF the callback thread
     Callback<SteamNetConnectionStatusChangedCallback_t>? _cb;
     HSteamListenSocket _listen = HSteamListenSocket.Invalid;
     Func<SteamConnectionStream, Task>? _onAccept;
@@ -25,6 +26,12 @@ sealed class SteamRelay : IDisposable
 
     public ulong MySteamId { get; private set; }
     public string MyName { get; private set; } = "host";
+
+    // Is the SDR relay route established? InitRelayNetworkAccess resolves this in the
+    // background over a few seconds; connecting before it's Current causes 5008 timeouts.
+    public bool RelayReady() =>
+        SteamNetworkingUtils.GetRelayNetworkStatus(out _) ==
+        ESteamNetworkingAvailability.k_ESteamNetworkingAvailability_Current;
 
     public void Init()
     {
@@ -72,6 +79,7 @@ sealed class SteamRelay : IDisposable
         while (_run)
         {
             SteamAPI.RunCallbacks(); // dispatches OnStatusChanged on this thread
+            while (_log.TryDequeue(out var line)) Console.WriteLine(line); // print AFTER the lock is released
             foreach (var kv in _conns)
             {
                 int n = SteamNetworkingSockets.ReceiveMessagesOnConnection(kv.Key, msgs, msgs.Length);
@@ -97,7 +105,7 @@ sealed class SteamRelay : IDisposable
                 // Inbound (has a listen socket) needs accepting; outbound has none.
                 if (ev.m_info.m_hListenSocket != HSteamListenSocket.Invalid)
                 {
-                    Console.WriteLine("relay: incoming peer, accepting");
+                    _log.Enqueue("relay: incoming peer, accepting");
                     if (SteamNetworkingSockets.AcceptConnection(conn) == EResult.k_EResultOK)
                         _conns[conn] = new SteamConnectionStream(conn);
                     else
@@ -106,7 +114,7 @@ sealed class SteamRelay : IDisposable
                 break;
 
             case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connected:
-                Console.WriteLine("relay: peer connected");
+                _log.Enqueue("relay: peer connected");
                 if (_conns.TryGetValue(conn, out var up))
                 {
                     up.Connected.TrySetResult(up); // unblocks JOIN's ConnectAsync
@@ -116,7 +124,7 @@ sealed class SteamRelay : IDisposable
 
             case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ClosedByPeer:
             case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
-                Console.WriteLine($"relay: connection closed ({ev.m_info.m_eEndReason}: {ev.m_info.m_szEndDebug})");
+                _log.Enqueue($"relay: connection closed ({ev.m_info.m_eEndReason}: {ev.m_info.m_szEndDebug})");
                 if (_conns.TryRemove(conn, out var down))
                 {
                     down.Connected.TrySetException(new IOException("relay connection closed"));

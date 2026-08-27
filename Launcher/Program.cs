@@ -111,6 +111,12 @@ static class Program
         Console.WriteLine("point the game at 127.0.0.1 and play. Choose online matchmaking in-game to find a match.");
 
         var online = new OnlineState();
+        // Warm the Steam relay NOW so its SDR route is ready by the time a match happens.
+        // Connecting cold causes 5008 rendezvous timeouts, badly so behind CGNAT where the
+        // relay is the only viable path. Non-fatal: offline play doesn't need it.
+        try { var r = new SteamRelay(); r.Init(); online.Relay = r; Console.WriteLine("steam: relay warming up (ready by match time)"); }
+        catch (Exception ex) { Console.WriteLine($"steam: relay not started yet ({ex.Message}); will init on first match"); }
+
         var l = new TcpListener(IPAddress.Loopback, GamePort);
         l.Start();
         while (true)
@@ -132,6 +138,12 @@ static class Program
             {
                 using (game)
                 {
+                    // Wait for the SDR relay route to be ready before connecting (else 5008).
+                    for (int i = 0; i < 30 && !online.Relay!.RelayReady(); i++)
+                    {
+                        if (i == 0) Console.WriteLine("relay: waiting for the Steam relay network to be ready...");
+                        await Task.Delay(500);
+                    }
                     // The relay route or the host's listen socket may not be ready the instant
                     // the guest reconnects; retry a few times before giving up.
                     SteamConnectionStream? peer = null;
