@@ -1,5 +1,10 @@
 # PTO_C protocol, full opcode map
 
+This is the raw TCP game protocol, unchanged by the Steam P2P work: `ptolaunch` tunnels these
+bytes over Steam's relay verbatim, so the framing and every opcode below are identical whether
+the match is local or remote. See `README.md` for the transport and `Launcher/README.md` for
+the tunnel.
+
 Extracted from the client's `packet_init` (opcode → script index) and the script index table.
 Direction is from the server's point of view where a handler exists on the client (S→C), i.e.
 these are the client's receive handlers. Opcodes the client *sends* reuse the same numbers

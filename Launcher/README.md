@@ -1,9 +1,10 @@
 # ptolaunch (Steam P2P build)
 
 Launcher that tunnels the game's raw-TCP link over the Steam relay, so the game
-never learns Steam exists. It points the game at `127.0.0.1` (settings.ini
-`[NETWORK] IP=127.0.0.1`) and pumps the bytes to the peer. Framing and client
-patches 05/07/08 are untouched.
+never learns Steam exists. It keeps the client pointed at `127.0.0.1` (by enforcing
+`IP=127.0.0.1` in the GMS2 client's real config, `%LOCALAPPDATA%\ptoc\settings.ini`,
+since it ignores DisableSandbox; see NETWORKING.md) and pumps the bytes to the peer.
+Framing and the client patches are untouched.
 
 `ptolaunch play` is symmetric: no host/joiner roles. Both peers queue up; when
 paired, the LOWER SteamID is silently elected the authority and runs its local

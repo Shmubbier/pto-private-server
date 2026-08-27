@@ -1,4 +1,10 @@
-# Hosting on Oracle Cloud (Always Free)
+# Hosting on Oracle Cloud (Always Free) — LEGACY (central-server path)
+
+> **This is the archived central-server model, not the current build.** The `steam-p2p`
+> branch replaced this with peer-to-peer over Steam's relay: no VM, no port forwarding, the
+> server runs locally on each host and `ptolaunch` connects players (see `README.md` and
+> `Launcher/README.md`). Keep this guide only if you want a single always-on public server
+> instead of P2P. The matching build is on `archive/tailscale` (tag `tailscale-final`).
 
 Runs the game server (TCP 51338) and the website API (HTTP 8080) as one process on one
 free Linux VM. The website itself is hosted separately (Firebase Hosting) and just calls
