@@ -138,8 +138,18 @@ static class Program
             {
                 await server.ConnectAsync(IPAddress.Loopback, LocalPort);
                 server.NoDelay = true;
-                var sniff = new OpcodeSniffer(OpQueue, () => _ = GoOnlineAsync(meta, online, game));
-                await PumpSniffAsync(game.GetStream(), server.GetStream(), sniff);
+                // game -> server: go online on Op.Queue. server -> game: on Op.BattleEnd,
+                // if we were hosting an online match, re-arm and return to passive offline.
+                var queueSniff = new OpcodeSniffer(OpQueue, () => _ = GoOnlineAsync(meta, online, game));
+                var endSniff = new OpcodeSniffer(OpBattleEnd, () =>
+                {
+                    if (online.EndHosting())
+                    {
+                        queueSniff.Rearm();
+                        Console.WriteLine("match over; back to passive offline, ready for another match.");
+                    }
+                }, repeat: true);
+                await PumpDualSniffAsync(game.GetStream(), server.GetStream(), queueSniff, endSniff);
             }
         }
         catch (Exception ex) { Console.WriteLine($"game session ended: {ex.Message}"); }
@@ -176,10 +186,12 @@ static class Program
             if (me < partner)
             {
                 // Authority: our local server is the match server, and our game's Op.Queue
-                // already queued us there. Just bridge the guest in over the relay.
+                // already queued us there. Advertise and bridge the guest in over the relay.
+                online.MyId = me; online.MatchKey = key; online.Hosting = true;
                 await meta.SetMatchAsync(key, me);
                 Console.WriteLine($"matched with {partner}; you are hosting. Waiting for opponent to join...");
-                RunAuthorityRelay(relay, meta, me, key);
+                EnsureAuthorityListening(relay, meta, online); // once per session
+                StartAdvertise(relay, meta, online);           // per match, until the guest connects
                 return;
             }
 
@@ -215,29 +227,19 @@ static class Program
         try { await Task.WhenAll(t1, t2); } catch { /* expected on teardown */ }
     }
 
-    // Authority: accept relay peers and bridge each to the LOCAL server; feed the ladder.
-    // Keep advertising in the queue until the guest connects, then leave.
-    static void RunAuthorityRelay(SteamRelay relay, MetaClient meta, ulong me, string key)
+    // Set up the relay listener + ladder tail ONCE per session. The listener is match-
+    // agnostic: any peer that connects is bridged to the local server, and its arrival
+    // ends the current match's queue advertising.
+    static void EnsureAuthorityListening(SteamRelay relay, MetaClient meta, OnlineState online)
     {
-        _ = WatchMatchesAsync(meta);
-        var hbCts = new CancellationTokenSource();
-        int guestArrived = 0;
-        _ = Task.Run(async () =>
-        {
-            while (!hbCts.IsCancellationRequested)
-            {
-                try { await meta.EnqueueAsync(me, relay.MyName); } catch { }
-                try { await Task.Delay(3000, hbCts.Token); } catch { }
-            }
-        });
+        if (online.Listening) return;
+        online.Listening = true;
+        _ = WatchMatchesAsync(meta); // push finished matches to the shared ladder
         relay.Listen(async peer =>
         {
-            if (Interlocked.Exchange(ref guestArrived, 1) == 0)
-            {
-                hbCts.Cancel();
-                await meta.DequeueAsync(me);
-                await meta.ClearMatchAsync(key);
-            }
+            online.HeartbeatCts?.Cancel();                       // guest arrived: stop advertising this match
+            try { await meta.DequeueAsync(online.MyId); } catch { }
+            if (online.MatchKey != null) { try { await meta.ClearMatchAsync(online.MatchKey); } catch { } }
             try
             {
                 using (peer)
@@ -252,12 +254,28 @@ static class Program
         });
     }
 
-    // Bidirectional pump where the game -> server direction is teed through a sniffer.
-    static async Task PumpSniffAsync(Stream game, Stream server, OpcodeSniffer sniff)
+    // Per match: keep the authority in the queue so the guest can derive the pair, until
+    // the guest connects (the listener cancels this).
+    static void StartAdvertise(SteamRelay relay, MetaClient meta, OnlineState online)
+    {
+        var cts = new CancellationTokenSource();
+        online.HeartbeatCts = cts;
+        _ = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
+            {
+                try { await meta.EnqueueAsync(online.MyId, relay.MyName); } catch { }
+                try { await Task.Delay(3000, cts.Token); } catch { }
+            }
+        });
+    }
+
+    // Bidirectional pump where each direction is teed through its own sniffer.
+    static async Task PumpDualSniffAsync(Stream game, Stream server, OpcodeSniffer gameToServer, OpcodeSniffer serverToGame)
     {
         using var cts = new CancellationTokenSource();
-        var t1 = SniffCopyAsync(game, server, sniff, cts);
-        var t2 = CopyAsync(server, game, cts);
+        var t1 = SniffCopyAsync(game, server, gameToServer, cts);
+        var t2 = SniffCopyAsync(server, game, serverToGame, cts);
         await Task.WhenAny(t1, t2);
         cts.Cancel();
         try { await Task.WhenAll(t1, t2); } catch { /* expected on teardown */ }
@@ -523,10 +541,26 @@ static class Program
             Array.Copy(all, off, chunk, 0, n);
             sniff.Feed(chunk, n);
         }
-        bool ok = fired == 1;
+        bool oneShot = fired == 1;
+
+        // repeat mode: fires on every Op.BattleEnd (authority watches many battles)
+        int ends = 0;
+        var rep = new OpcodeSniffer(3, () => ends++, repeat: true);
+        var s2 = new List<byte>();
+        s2.AddRange(Frame(3, 2)); s2.AddRange(Frame(20, 5)); s2.AddRange(Frame(3, 0));
+        var b2 = s2.ToArray();
+        for (int off = 0; off < b2.Length; off += 4) { int n = Math.Min(4, b2.Length - off); var c = new byte[n]; Array.Copy(b2, off, c, 0, n); rep.Feed(c, n); }
+
+        // one-shot re-arm: fires again after Rearm()
+        int q2 = 0;
+        var os = new OpcodeSniffer(0, () => q2++);
+        var qf = Frame(0, 1);
+        os.Feed(qf, qf.Length); os.Rearm(); os.Feed(qf, qf.Length);
+
+        bool ok = oneShot && ends == 2 && q2 == 2;
         Console.WriteLine(ok
-            ? "sniffdemo OK: fired once on Op.Queue, ignored login + campaign, no double-fire"
-            : $"sniffdemo FAIL: fired {fired} times (want 1)");
+            ? "sniffdemo OK: one-shot fires once (ignored login+campaign); repeat fires per battle-end; rearm re-fires"
+            : $"sniffdemo FAIL: oneShot={oneShot} ends={ends}(want 2) rearm={q2}(want 2)");
         return ok ? 0 : 1;
     }
 
@@ -632,8 +666,26 @@ sealed class OnlineState
     int _begun;
     public SteamRelay? Relay;    // created on first online use, reused across matches
     public ulong GuestAuthority; // set once we've been elected guest; then game reconnects route to the relay
+
+    // Authority side, updated per match; the persistent relay listener reads these.
+    public bool Listening;                    // relay.Listen + ladder tail set up once
+    public volatile bool Hosting;             // currently advertising/hosting a match
+    public volatile CancellationTokenSource? HeartbeatCts;
+    public ulong MyId;
+    public string? MatchKey;
+
     public bool Begin() => Interlocked.Exchange(ref _begun, 1) == 0; // go online at most once per match
-    public void Reset() { GuestAuthority = 0; Interlocked.Exchange(ref _begun, 0); } // after a match: back offline, re-armed
+    public void Reset() { GuestAuthority = 0; Interlocked.Exchange(ref _begun, 0); } // guest match end: offline, re-armed
+
+    // Authority match end (guarded so offline campaign battles, which also send
+    // Op.BattleEnd, don't trip it). Returns true if we were actually hosting.
+    public bool EndHosting()
+    {
+        if (!Hosting) return false;
+        Hosting = false;
+        Interlocked.Exchange(ref _begun, 0);
+        return true;
+    }
 }
 
 // Watches a framed client->server byte stream (transparent: the caller still forwards
@@ -644,15 +696,19 @@ sealed class OpcodeSniffer
 {
     readonly byte _target;
     readonly Action _onSeen;
+    readonly bool _repeat; // false: fire once then go idle until Rearm(); true: fire on every occurrence
     byte[] _buf = Array.Empty<byte>();
     int _len;
     bool _fired;
 
-    public OpcodeSniffer(byte targetOpcode, Action onSeen) { _target = targetOpcode; _onSeen = onSeen; }
+    public OpcodeSniffer(byte targetOpcode, Action onSeen, bool repeat = false)
+    { _target = targetOpcode; _onSeen = onSeen; _repeat = repeat; }
+
+    public void Rearm() => _fired = false; // re-arm a one-shot sniffer for the next match
 
     public void Feed(byte[] data, int count)
     {
-        if (_fired || count <= 0) return;
+        if (count <= 0 || (_fired && !_repeat)) return;
         Append(data, count);
         int off = 0;
         while (_len - off >= 7)
@@ -660,10 +716,14 @@ sealed class OpcodeSniffer
             uint size = BitConverter.ToUInt32(_buf, off + 3);
             if (size < 7) { off++; continue; }      // resync on garbage (shouldn't happen on a valid stream)
             if (_len - off < size) break;            // packet not complete yet
-            if (_buf[off] == _target) { _fired = true; _onSeen(); break; }
+            if (_buf[off] == _target)
+            {
+                _onSeen();
+                if (!_repeat) { _fired = true; off += (int)size; break; }
+            }
             off += (int)size;
         }
-        if (off > 0 && !_fired) { Array.Copy(_buf, off, _buf, 0, _len - off); _len -= off; }
+        if (off > 0) { Array.Copy(_buf, off, _buf, 0, _len - off); _len -= off; }
     }
 
     void Append(byte[] data, int count)
