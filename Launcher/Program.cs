@@ -105,6 +105,8 @@ static class Program
     {
         var meta = new MetaClient(); // only used once the player goes online
         if (!await EnsureServerAsync()) return 1;
+        EnsureClientLocal();          // point the Steam client's real config at us
+        _ = KeepClientLocalAsync();   // keep it there (the game rewrites it on exit)
         Console.WriteLine("offline: local server ready. Login, deckbuilding, and campaign work with no internet.");
         Console.WriteLine("point the game at 127.0.0.1 and play. Choose online matchmaking in-game to find a match.");
 
@@ -298,6 +300,57 @@ static class Program
 
     // Ensure the local PtoServer is accepting on LocalPort: connect if up, else spawn
     // PtoServer.exe (PTO_SERVER_EXE, default "PtoServer.exe") with --port and wait.
+    // The Steam client ignores DisableSandbox and reads its server IP from
+    // %LOCALAPPDATA%\ptoc\settings.ini (default 100.107.105.101 = the old Tailscale
+    // host). Force it to the local launcher, and re-assert since the game rewrites
+    // that file when it exits. Only writes on drift, so the poll loop is quiet.
+    static string ClientIniPath()
+    {
+        string name = Environment.GetEnvironmentVariable("PTO_CLIENT_SANDBOX") ?? "ptoc";
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), name, "settings.ini");
+    }
+
+    static bool IsIpLine(string line) =>
+        line.Replace(" ", "").TrimStart().StartsWith("IP=", StringComparison.OrdinalIgnoreCase);
+
+    static void EnsureClientLocal()
+    {
+        const string want = "IP=\"127.0.0.1\"";
+        try
+        {
+            string path = ClientIniPath();
+            if (File.Exists(path))
+            {
+                var lines = new List<string>(File.ReadAllLines(path));
+                int ip = lines.FindIndex(IsIpLine);
+                if (ip >= 0)
+                {
+                    string val = lines[ip].Split('=', 2)[1].Trim().Trim('"');
+                    if (val == "127.0.0.1") return; // already correct: no write (no churn)
+                    lines[ip] = want;
+                }
+                else
+                {
+                    int net = lines.FindIndex(l => l.Trim().StartsWith("[NETWORK]", StringComparison.OrdinalIgnoreCase));
+                    if (net >= 0) lines.Insert(net + 1, want); else { lines.Add("[NETWORK]"); lines.Add(want); }
+                }
+                File.WriteAllLines(path, lines);
+            }
+            else
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                File.WriteAllLines(path, new[] { "[NETWORK]", want });
+            }
+            Console.WriteLine($"client server IP -> 127.0.0.1 ({path})");
+        }
+        catch (Exception ex) { Console.WriteLine($"client IP enforce skipped: {ex.Message}"); }
+    }
+
+    static async Task KeepClientLocalAsync()
+    {
+        while (true) { EnsureClientLocal(); await Task.Delay(4000); }
+    }
+
     static async Task<bool> EnsureServerAsync()
     {
         if (await TryConnectServerAsync(LocalPort)) return true;
