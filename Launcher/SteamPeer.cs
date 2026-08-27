@@ -1,37 +1,37 @@
 using System.Collections.Concurrent;
-using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using Steamworks;
 
 namespace PtoLauncher;
 
-// Step 1b: the peer hop over Steam's relay (SDR), replacing the plain-TCP link.
-// A relay connection is exposed as a Stream so it plugs straight into PumpAsync,
-// so nothing else in the launcher changes. Reliable+ordered messages behave like
-// TCP, so the game's framing and patch-07 reassembly are untouched.
+// The peer hop over Steam, using the CLASSIC ISteamNetworking P2P API
+// (SendP2PPacket / ReadP2PPacket) instead of the newer SteamNetworkingSockets/SDR.
+// SDR-relayed P2P does not work on AppID 480 for CGNAT'd peers (5008 rendezvous
+// timeout); the classic API does its own NAT-punch + Valve relay and historically
+// works on 480. A peer session is exposed as a duplex Stream so nothing else in the
+// launcher changes; reliable+ordered packets behave like TCP, so the game's framing
+// and patch-07 reassembly are untouched.
 //
-// AppID 480 (Spacewar) via steam_appid.txt. Requires the Steam client running;
-// the SteamRelay pump thread owns SteamAPI callbacks and message receive.
+// AppID 480 (Spacewar) via steam_appid.txt. Requires the Steam client running; the
+// pump thread owns SteamAPI callbacks and P2P packet receive. Sessions are keyed by
+// the remote SteamID64 (the classic API has no connection handles or listen sockets).
 sealed class SteamRelay : IDisposable
 {
-    const int VirtualPort = 0; // single service; ConnectP2P and the listen socket must agree
-
-    readonly ConcurrentDictionary<HSteamNetConnection, SteamConnectionStream> _conns = new();
+    readonly ConcurrentDictionary<ulong, SteamConnectionStream> _conns = new();
     readonly ConcurrentQueue<string> _log = new(); // status logs, drained OFF the callback thread
-    Callback<SteamNetConnectionStatusChangedCallback_t>? _cb;
-    HSteamListenSocket _listen = HSteamListenSocket.Invalid;
+    Callback<P2PSessionRequest_t>? _reqCb;
+    Callback<P2PSessionConnectFail_t>? _failCb;
     Func<SteamConnectionStream, Task>? _onAccept;
+    volatile bool _listening;
     Thread? _pump;
     volatile bool _run = true;
 
     public ulong MySteamId { get; private set; }
     public string MyName { get; private set; } = "host";
 
-    // Is the SDR relay route established? InitRelayNetworkAccess resolves this in the
-    // background over a few seconds; connecting before it's Current causes 5008 timeouts.
-    public bool RelayReady() =>
-        SteamNetworkingUtils.GetRelayNetworkStatus(out _) ==
-        ESteamNetworkingAvailability.k_ESteamNetworkingAvailability_Current;
+    // The classic path has no SDR route to wait on; kept because the guest still polls
+    // it before connecting. Always ready.
+    public bool RelayReady() => true;
 
     public void Init()
     {
@@ -40,118 +40,96 @@ sealed class SteamRelay : IDisposable
                 "SteamAPI.Init failed. Is Steam running, and steam_appid.txt (480) beside the exe?");
         MySteamId = SteamUser.GetSteamID().m_SteamID;
         MyName = SteamFriends.GetPersonaName();
-        SteamNetworkingUtils.InitRelayNetworkAccess(); // start warming a relay route
-        _cb = Callback<SteamNetConnectionStatusChangedCallback_t>.Create(OnStatusChanged);
+        SteamNetworkingUtils.InitRelayNetworkAccess(); // harmless; may warm the relay classic routes through
+        _reqCb = Callback<P2PSessionRequest_t>.Create(OnSessionRequest);
+        _failCb = Callback<P2PSessionConnectFail_t>.Create(OnSessionConnectFail);
         _pump = new Thread(PumpLoop) { IsBackground = true, Name = "steam-pump" };
         _pump.Start();
     }
 
-    // HOST: listen for inbound relay connections; onAccept gets each as a Stream.
+    // HOST: accept inbound peers; onAccept gets each new peer session as a Stream.
     public void Listen(Func<SteamConnectionStream, Task> onAccept)
     {
         _onAccept = onAccept;
-        _listen = SteamNetworkingSockets.CreateListenSocketP2P(VirtualPort, 0, null);
-        Console.WriteLine("steam: listening for peers on the relay");
+        _listening = true;
+        Console.WriteLine("steam: listening for peers (classic P2P)");
     }
 
-    // JOIN: open a relay connection to a host SteamID, resolved when it connects, with a
-    // timeout so a stuck "connecting" (relay route not ready, host unreachable) can't hang.
-    public async Task<SteamConnectionStream> ConnectAsync(ulong hostSteamId, int timeoutSeconds = 15)
+    // JOIN: open a session to a host SteamID. The classic API has no pre-data "connected"
+    // event, so the stream is returned immediately; a peer that can't be reached surfaces
+    // later as a P2PSessionConnectFail. timeoutSeconds kept for signature compatibility.
+    public Task<SteamConnectionStream> ConnectAsync(ulong hostSteamId, int timeoutSeconds = 15)
     {
-        var id = new SteamNetworkingIdentity();
-        id.SetSteamID64(hostSteamId);
-        HSteamNetConnection conn = SteamNetworkingSockets.ConnectP2P(ref id, VirtualPort, 0, null);
-        var s = new SteamConnectionStream(conn);
-        _conns[conn] = s;
-        var done = await Task.WhenAny(s.Connected.Task, Task.Delay(TimeSpan.FromSeconds(timeoutSeconds)));
-        if (done != s.Connected.Task)
-        {
-            _conns.TryRemove(conn, out _);
-            SteamNetworkingSockets.CloseConnection(conn, 0, "connect timeout", false);
-            throw new TimeoutException($"relay connect to {hostSteamId} timed out after {timeoutSeconds}s");
-        }
-        return await s.Connected.Task; // completed, or faulted (peer closed)
+        var s = _conns.GetOrAdd(hostSteamId, id => new SteamConnectionStream(id));
+        s.Connected.TrySetResult(s);
+        return s.Connected.Task;
     }
 
     void PumpLoop()
     {
-        var msgs = new IntPtr[64];
         while (_run)
         {
-            SteamAPI.RunCallbacks(); // dispatches OnStatusChanged on this thread
+            SteamAPI.RunCallbacks(); // dispatches OnSessionRequest / OnSessionConnectFail on this thread
             while (_log.TryDequeue(out var line)) Console.WriteLine(line); // print AFTER the lock is released
-            foreach (var kv in _conns)
+            while (SteamNetworking.IsP2PPacketAvailable(out uint size) && size > 0)
             {
-                int n = SteamNetworkingSockets.ReceiveMessagesOnConnection(kv.Key, msgs, msgs.Length);
-                for (int i = 0; i < n; i++)
+                var buf = new byte[size];
+                if (SteamNetworking.ReadP2PPacket(buf, size, out uint read, out CSteamID sender) && read > 0)
                 {
-                    SteamNetworkingMessage_t m = Marshal.PtrToStructure<SteamNetworkingMessage_t>(msgs[i]);
-                    var data = new byte[m.m_cbSize];
-                    Marshal.Copy(m.m_pData, data, 0, m.m_cbSize);
-                    kv.Value.Deliver(data);
-                    SteamNetworkingMessage_t.Release(msgs[i]);
+                    if (read != size) Array.Resize(ref buf, (int)read);
+                    if (_conns.TryGetValue(sender.m_SteamID, out var s)) s.Deliver(buf);
+                    // else: packet from an unknown/closed peer -> drop
                 }
             }
             Thread.Sleep(4);
         }
     }
 
-    void OnStatusChanged(SteamNetConnectionStatusChangedCallback_t ev)
+    // A peer wants to send to us. Always accept; if it's a new inbound peer and we're the
+    // host, create its stream and hand it to the bridge.
+    void OnSessionRequest(P2PSessionRequest_t ev)
     {
-        HSteamNetConnection conn = ev.m_hConn;
-        switch (ev.m_info.m_eState)
+        ulong id = ev.m_steamIDRemote.m_SteamID;
+        SteamNetworking.AcceptP2PSessionWithUser(ev.m_steamIDRemote);
+        if (!_conns.ContainsKey(id) && _listening)
         {
-            case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connecting:
-                // Inbound (has a listen socket) needs accepting; outbound has none.
-                if (ev.m_info.m_hListenSocket != HSteamListenSocket.Invalid)
-                {
-                    _log.Enqueue("relay: incoming peer, accepting");
-                    if (SteamNetworkingSockets.AcceptConnection(conn) == EResult.k_EResultOK)
-                        _conns[conn] = new SteamConnectionStream(conn);
-                    else
-                        SteamNetworkingSockets.CloseConnection(conn, 0, "accept failed", false);
-                }
-                break;
-
-            case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_Connected:
-                _log.Enqueue("relay: peer connected");
-                if (_conns.TryGetValue(conn, out var up))
-                {
-                    up.Connected.TrySetResult(up); // unblocks JOIN's ConnectAsync
-                    if (_onAccept != null) _ = _onAccept(up); // HOST: start bridging this peer
-                }
-                break;
-
-            case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ClosedByPeer:
-            case ESteamNetworkingConnectionState.k_ESteamNetworkingConnectionState_ProblemDetectedLocally:
-                _log.Enqueue($"relay: connection closed ({ev.m_info.m_eEndReason}: {ev.m_info.m_szEndDebug})");
-                if (_conns.TryRemove(conn, out var down))
-                {
-                    down.Connected.TrySetException(new IOException("relay connection closed"));
-                    down.Complete(); // read side returns 0, tearing down the bridge
-                }
-                SteamNetworkingSockets.CloseConnection(conn, 0, "", false);
-                break;
+            var s = _conns.GetOrAdd(id, x => new SteamConnectionStream(x));
+            _log.Enqueue("relay: incoming peer, accepting");
+            if (_onAccept != null) _ = _onAccept(s);
         }
     }
 
-    internal void Forget(HSteamNetConnection conn) => _conns.TryRemove(conn, out _);
+    // A session could not be established (peer unreachable / not on the app). The error
+    // code is the key diagnostic: 4 = Timeout (relay couldn't carry it), 2 = NoRightsToApp,
+    // 3 = DestinationNotLoggedIn, 1 = NotRunningApp.
+    void OnSessionConnectFail(P2PSessionConnectFail_t ev)
+    {
+        ulong id = ev.m_steamIDRemote.m_SteamID;
+        _log.Enqueue($"relay: P2P session failed (error {ev.m_eP2PSessionError})");
+        if (_conns.TryRemove(id, out var down))
+        {
+            down.Connected.TrySetException(new IOException($"P2P session failed (error {ev.m_eP2PSessionError})"));
+            down.Complete(); // read side returns 0, tearing down the bridge
+        }
+        SteamNetworking.CloseP2PSessionWithUser(ev.m_steamIDRemote);
+    }
+
+    internal void Forget(ulong peer) => _conns.TryRemove(peer, out _);
 
     public void Dispose()
     {
         _run = false;
         _pump?.Join(500);
-        if (_listen != HSteamListenSocket.Invalid) SteamNetworkingSockets.CloseListenSocket(_listen);
         SteamAPI.Shutdown();
     }
 }
 
-// One relay connection as a duplex Stream. Writes are reliable Steam messages;
-// reads drain a channel the SteamRelay pump fills. Ordered+reliable, so bytes
-// arrive intact and in order like TCP.
+// One peer session as a duplex Stream. Writes are reliable P2P packets; reads drain a
+// channel the SteamRelay pump fills. Reliable+ordered, so bytes arrive intact and in
+// order like TCP. Keyed by the remote SteamID64.
 sealed class SteamConnectionStream : Stream
 {
-    readonly HSteamNetConnection _conn;
+    readonly ulong _peer;
     readonly Channel<byte[]> _rx = Channel.CreateUnbounded<byte[]>(
         new UnboundedChannelOptions { SingleReader = true });
     byte[]? _left;
@@ -160,7 +138,7 @@ sealed class SteamConnectionStream : Stream
     public readonly TaskCompletionSource<SteamConnectionStream> Connected =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public SteamConnectionStream(HSteamNetConnection conn) => _conn = conn;
+    public SteamConnectionStream(ulong peerSteamId) => _peer = peerSteamId;
 
     internal void Deliver(byte[] data) => _rx.Writer.TryWrite(data);
     internal void Complete() => _rx.Writer.TryComplete();
@@ -178,18 +156,12 @@ sealed class SteamConnectionStream : Stream
         return n;
     }
 
-    public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
     {
-        IntPtr p = Marshal.AllocHGlobal(buffer.Length);
-        try
-        {
-            Marshal.Copy(buffer.ToArray(), 0, p, buffer.Length);
-            EResult r = SteamNetworkingSockets.SendMessageToConnection(
-                _conn, p, (uint)buffer.Length, Constants.k_nSteamNetworkingSend_Reliable, out _);
-            if (r != EResult.k_EResultOK) throw new IOException("steam send: " + r);
-        }
-        finally { Marshal.FreeHGlobal(p); }
-        await Task.CompletedTask;
+        var data = buffer.ToArray();
+        if (!SteamNetworking.SendP2PPacket(new CSteamID(_peer), data, (uint)data.Length, EP2PSend.k_EP2PSendReliable))
+            throw new IOException("steam SendP2PPacket failed");
+        return ValueTask.CompletedTask;
     }
 
     // Sync shims over the async paths (PumpAsync only uses the async ones).
@@ -199,7 +171,7 @@ sealed class SteamConnectionStream : Stream
     protected override void Dispose(bool disposing)
     {
         _rx.Writer.TryComplete();
-        SteamNetworkingSockets.CloseConnection(_conn, 0, "", false);
+        SteamNetworking.CloseP2PSessionWithUser(new CSteamID(_peer));
         base.Dispose(disposing);
     }
 
