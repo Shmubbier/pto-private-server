@@ -16,7 +16,9 @@ namespace PtoLauncher;
 // there, pump bytes" (ServeAsync / PumpAsync), unchanged.
 static class Program
 {
-    const int GamePort = 51338; // loopback port the game dials (settings.ini IP=127.0.0.1)
+    const int GamePort = 51338;  // loopback port the game dials (settings.ini IP=127.0.0.1); the launcher proxy
+    const int LocalPort = 51339; // the local PtoServer sits here; the proxy forwards GamePort -> here
+    const byte OpQueue = 0;      // client -> server: join online matchmaking (the "go online" trigger)
 
     static async Task<int> Main(string[] args)
     {
@@ -34,10 +36,12 @@ static class Program
                 return await QueueDemoAsync();
             case "matchdemo": // deterministic pairing/election self-check (pure)
                 return MatchDemo();
+            case "sniffdemo": // Op.Queue detection across chunk boundaries (pure)
+                return SniffDemo();
             case "rankeddemo": // ranked accumulation self-check (fake RTDB)
                 return await RankedDemoAsync();
             default:
-                Console.WriteLine("usage: ptolaunch play | check | ladder | demo | queuedemo | matchdemo | rankeddemo");
+                Console.WriteLine("usage: ptolaunch play | check | ladder | demo | queuedemo | matchdemo | sniffdemo | rankeddemo");
                 return 1;
         }
     }
@@ -91,60 +95,105 @@ static class Program
 
     static string PairKey(ulong a, ulong b) => $"{Math.Min(a, b)}_{Math.Max(a, b)}";
 
-    // Symmetric matchmaking. No host/joiner: register in the queue, pair, and the
-    // lower SteamID is silently elected the authority (runs its local PtoServer);
-    // the other connects to it over the relay. Same UX on both machines.
+    // Offline-first. The launcher always runs a local server and proxies the game to
+    // it, so login, deckbuilding, and the campaign work with no internet and no
+    // broadcasting. It watches the game -> server stream and only when the game sends
+    // Op.Queue (the player chose online matchmaking) does it go online. The campaign
+    // (Op.StartStage) is a local bot battle, so it never trips this.
     static async Task<int> PlayAsync()
     {
-        var meta = new MetaClient();
-        if (!meta.Enabled) { Console.WriteLine("matchmaking needs PTO_FIREBASE_URL (or firebase.txt)"); return 1; }
-        using var relay = new SteamRelay();
-        relay.Init();
-        ulong me = relay.MySteamId;
-        Console.WriteLine($"looking for a match as {relay.MyName} ({me})...");
-        Console.CancelKeyPress += (_, _) => meta.DequeueAsync(me).Wait(2000);
+        var meta = new MetaClient(); // only used once the player goes online
+        if (!await EnsureServerAsync()) return 1;
+        Console.WriteLine("offline: local server ready. Login, deckbuilding, and campaign work with no internet.");
+        Console.WriteLine("point the game at 127.0.0.1 and play. Choose online matchmaking in-game to find a match.");
 
+        var online = new OnlineState();
+        var l = new TcpListener(IPAddress.Loopback, GamePort);
+        l.Start();
         while (true)
         {
-            await meta.EnqueueAsync(me, relay.MyName); // heartbeat "looking for match"
-            var queue = await meta.ListQueueAsync();
-            ulong partner = ElectPartner(queue.Select(q => ulong.TryParse(q.steamId, out var v) ? v : 0), me);
-            if (partner == 0) { await Task.Delay(2000); continue; }
-
-            string key = PairKey(me, partner);
-            if (me < partner)
-            {
-                // Elected authority. Announce it so the partner can confirm reciprocity.
-                // Stay in the queue (RunAuthorityAsync keeps heartbeating) until the guest
-                // connects, otherwise the guest could no longer see us to derive the pair.
-                await meta.SetMatchAsync(key, me);
-                Console.WriteLine($"matched with {partner}; elected authority, running local server");
-                if (!await EnsureServerAsync()) { await meta.ClearMatchAsync(key); await meta.DequeueAsync(me); return 1; }
-                await RunAuthorityAsync(relay, meta, me, key);
-                return 0;
-            }
-            else
-            {
-                // Wait for the authority to confirm THIS pair before committing (closes
-                // the snapshot-skew race: if it chose someone else, re-poll).
-                ulong confirmed = await meta.GetMatchAuthorityAsync(key);
-                if (confirmed != partner) { await Task.Delay(1500); continue; }
-                await meta.DequeueAsync(me);
-                Console.WriteLine($"matched with {partner}; connecting to authority over relay");
-                await RunGuestAsync(relay, partner);
-                return 0;
-            }
+            var game = await l.AcceptTcpClientAsync();
+            game.NoDelay = true;
+            _ = HandleGameAsync(game, meta, online);
         }
     }
 
-    // Authority: accept relay peers, bridge each to the local server, feed the ladder.
-    // The authority's own game connects to 127.0.0.1:51338 directly (not proxied).
-    static async Task RunAuthorityAsync(SteamRelay relay, MetaClient meta, ulong me, string key)
+    // Route one game connection. Once we've been elected the guest, the game's
+    // (reconnected) session is tunneled to the authority over the relay. Otherwise it
+    // goes to the local server, with the game -> server side sniffed for Op.Queue.
+    static async Task HandleGameAsync(TcpClient game, MetaClient meta, OnlineState online)
     {
-        _ = WatchMatchesAsync(meta); // push finished matches to the shared ladder
+        try
+        {
+            if (online.GuestAuthority != 0)
+            {
+                using (game)
+                using (var peer = await online.Relay!.ConnectAsync(online.GuestAuthority))
+                    await PumpAsync(game.GetStream(), peer);
+                return;
+            }
+            using (game)
+            using (var server = new TcpClient())
+            {
+                await server.ConnectAsync(IPAddress.Loopback, LocalPort);
+                server.NoDelay = true;
+                var sniff = new OpcodeSniffer(OpQueue, () => _ = GoOnlineAsync(meta, online, game));
+                await PumpSniffAsync(game.GetStream(), server.GetStream(), sniff);
+            }
+        }
+        catch (Exception ex) { Console.WriteLine($"game session ended: {ex.Message}"); }
+    }
 
-        // Keep advertising in the queue so the guest can still derive the pair; stop and
-        // leave the queue once the guest actually connects over the relay.
+    // Fired once, when the game asks to matchmake. Brings up Steam + Firebase, pairs,
+    // and elects. The authority hosts on its own local server (its game is already
+    // queued there). The guest must reconnect onto the authority (the fixed client
+    // cannot move a live session), so we drop its connection and route the reconnect
+    // to the relay.
+    static async Task GoOnlineAsync(MetaClient meta, OnlineState online, TcpClient game)
+    {
+        if (!online.Begin()) return; // once
+        if (!meta.Enabled) { Console.WriteLine("online needs Firebase (firebase.txt); staying offline"); return; }
+        SteamRelay relay;
+        try { relay = new SteamRelay(); relay.Init(); }
+        catch (Exception ex) { Console.WriteLine($"online needs Steam running: {ex.Message}"); return; }
+        online.Relay = relay;
+        ulong me = relay.MySteamId;
+        Console.WriteLine($"online: matchmaking as {relay.MyName} ({me})...");
+
+        while (true)
+        {
+            await meta.EnqueueAsync(me, relay.MyName);
+            var queue = await meta.ListQueueAsync();
+            ulong partner = ElectPartner(queue.Select(q => ulong.TryParse(q.steamId, out var v) ? v : 0), me);
+            if (partner == 0) { await Task.Delay(2000); continue; }
+            string key = PairKey(me, partner);
+
+            if (me < partner)
+            {
+                // Authority: our local server is the match server, and our game's Op.Queue
+                // already queued us there. Just bridge the guest in over the relay.
+                await meta.SetMatchAsync(key, me);
+                Console.WriteLine($"matched with {partner}; you are hosting. Waiting for opponent to join...");
+                RunAuthorityRelay(relay, meta, me, key);
+                return;
+            }
+
+            ulong confirmed = await meta.GetMatchAuthorityAsync(key);
+            if (confirmed != partner) { await Task.Delay(1500); continue; }
+            await meta.DequeueAsync(me);
+            online.GuestAuthority = partner; // route the reconnect to the relay
+            Console.WriteLine($"matched with {partner}; joining their game.");
+            Console.WriteLine(">> Restart the game when it says 'disconnected', then choose online matchmaking again to enter the match.");
+            try { game.Close(); } catch { } // drop the local session so the client reconnects via the relay
+            return;
+        }
+    }
+
+    // Authority: accept relay peers and bridge each to the LOCAL server; feed the ladder.
+    // Keep advertising in the queue until the guest connects, then leave.
+    static void RunAuthorityRelay(SteamRelay relay, MetaClient meta, ulong me, string key)
+    {
+        _ = WatchMatchesAsync(meta);
         var hbCts = new CancellationTokenSource();
         int guestArrived = 0;
         _ = Task.Run(async () =>
@@ -155,7 +204,6 @@ static class Program
                 try { await Task.Delay(3000, hbCts.Token); } catch { }
             }
         });
-
         relay.Listen(async peer =>
         {
             if (Interlocked.Exchange(ref guestArrived, 1) == 0)
@@ -169,57 +217,59 @@ static class Program
                 using (peer)
                 using (var server = new TcpClient())
                 {
-                    await server.ConnectAsync(IPAddress.Loopback, GamePort);
+                    await server.ConnectAsync(IPAddress.Loopback, LocalPort);
                     server.NoDelay = true;
                     await PumpAsync(peer, server.GetStream());
                 }
             }
             catch (Exception ex) { Console.WriteLine($"peer bridge closed: {ex.Message}"); }
         });
-        Console.WriteLine("ready. point the game at 127.0.0.1 and play.");
-        await Task.Delay(Timeout.Infinite); // ponytail: no idle timeout; Ctrl+C to stop
     }
 
-    // Guest: local game -> relay -> authority. One relay connection per game TCP conn.
-    static async Task RunGuestAsync(SteamRelay relay, ulong authority)
+    // Bidirectional pump where the game -> server direction is teed through a sniffer.
+    static async Task PumpSniffAsync(Stream game, Stream server, OpcodeSniffer sniff)
     {
-        var l = new TcpListener(IPAddress.Loopback, GamePort);
-        l.Start();
-        Console.WriteLine("ready. point the game at 127.0.0.1 and play.");
-        while (true)
-        {
-            var game = await l.AcceptTcpClientAsync();
-            game.NoDelay = true;
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    using (game)
-                    using (var peer = await relay.ConnectAsync(authority))
-                        await PumpAsync(game.GetStream(), peer);
-                }
-                catch (Exception ex) { Console.WriteLine($"game bridge closed: {ex.Message}"); }
-            });
-        }
+        using var cts = new CancellationTokenSource();
+        var t1 = SniffCopyAsync(game, server, sniff, cts);
+        var t2 = CopyAsync(server, game, cts);
+        await Task.WhenAny(t1, t2);
+        cts.Cancel();
+        try { await Task.WhenAll(t1, t2); } catch { /* expected on teardown */ }
     }
 
-    // Ensure a local PtoServer is accepting on 51338: connect if it's up, else spawn
-    // PtoServer.exe (PTO_SERVER_EXE, default "PtoServer.exe") and wait for the port.
+    static async Task SniffCopyAsync(Stream from, Stream to, OpcodeSniffer sniff, CancellationTokenSource cts)
+    {
+        var buf = new byte[16384];
+        try
+        {
+            int n;
+            while ((n = await from.ReadAsync(buf.AsMemory(0, buf.Length), cts.Token)) > 0)
+            {
+                await to.WriteAsync(buf.AsMemory(0, n), cts.Token);
+                sniff.Feed(buf, n);
+            }
+        }
+        finally { cts.Cancel(); }
+    }
+
+    // Ensure the local PtoServer is accepting on LocalPort: connect if up, else spawn
+    // PtoServer.exe (PTO_SERVER_EXE, default "PtoServer.exe") with --port and wait.
     static async Task<bool> EnsureServerAsync()
     {
-        if (await TryConnectServerAsync()) return true;
+        if (await TryConnectServerAsync(LocalPort)) return true;
         string exe = Environment.GetEnvironmentVariable("PTO_SERVER_EXE") ?? "PtoServer.exe";
-        if (TrySpawnServer(exe) == null) return false;
-        for (int i = 0; i < 20; i++) { if (await TryConnectServerAsync()) return true; await Task.Delay(500); }
-        Console.WriteLine("server did not come up on 127.0.0.1:51338");
+        if (TrySpawnServer(exe, LocalPort) == null) return false;
+        for (int i = 0; i < 20; i++) { if (await TryConnectServerAsync(LocalPort)) return true; await Task.Delay(500); }
+        Console.WriteLine($"server did not come up on 127.0.0.1:{LocalPort}");
         return false;
     }
 
-    static System.Diagnostics.Process? TrySpawnServer(string exe)
+    static System.Diagnostics.Process? TrySpawnServer(string exe, int port)
     {
         try
         {
             var psi = new System.Diagnostics.ProcessStartInfo(exe) { UseShellExecute = false };
+            psi.ArgumentList.Add("--port"); psi.ArgumentList.Add(port.ToString());
             var dir = Path.GetDirectoryName(Path.GetFullPath(exe));
             if (!string.IsNullOrEmpty(dir)) psi.WorkingDirectory = dir;
             return System.Diagnostics.Process.Start(psi);
@@ -227,9 +277,9 @@ static class Program
         catch (Exception ex) { Console.WriteLine($"could not start server '{exe}': {ex.Message}"); return null; }
     }
 
-    static async Task<bool> TryConnectServerAsync()
+    static async Task<bool> TryConnectServerAsync(int port)
     {
-        try { using var c = new TcpClient(); await c.ConnectAsync(IPAddress.Loopback, GamePort); return true; }
+        try { using var c = new TcpClient(); await c.ConnectAsync(IPAddress.Loopback, port); return true; }
         catch { return false; }
     }
 
@@ -294,20 +344,20 @@ static class Program
         catch (Exception ex) { Console.WriteLine($"[FAIL] Steam: {FirstLine(ex)}"); ok = false; }
 
         string exe = Environment.GetEnvironmentVariable("PTO_SERVER_EXE") ?? "PtoServer.exe";
-        if (await TryConnectServerAsync()) Console.WriteLine("[ ok ] Server: already listening on 127.0.0.1:51338");
+        if (await TryConnectServerAsync(LocalPort)) Console.WriteLine($"[ ok ] Server: already listening on 127.0.0.1:{LocalPort}");
         else if (!File.Exists(exe)) { Console.WriteLine($"[FAIL] Server: '{exe}' not found (set PTO_SERVER_EXE)"); ok = false; }
         else
         {
             // Actually launch it: a present-but-unrunnable server (e.g. missing .NET
             // runtime) must fail here, not silently mid-match.
-            var proc = TrySpawnServer(exe);
+            var proc = TrySpawnServer(exe, LocalPort);
             if (proc == null) { Console.WriteLine("[FAIL] Server: could not start (see error above)"); ok = false; }
             else
             {
                 bool up = false;
-                for (int i = 0; i < 16 && !up; i++) { if (await TryConnectServerAsync()) up = true; else await Task.Delay(250); }
+                for (int i = 0; i < 16 && !up; i++) { if (await TryConnectServerAsync(LocalPort)) up = true; else await Task.Delay(250); }
                 Console.WriteLine(up
-                    ? "[ ok ] Server: starts and binds 127.0.0.1:51338"
+                    ? $"[ ok ] Server: starts and binds 127.0.0.1:{LocalPort}"
                     : "[FAIL] Server: present but did not bind (is the .NET 10 runtime installed?)");
                 ok &= up;
                 try { proc.Kill(true); } catch { }
@@ -420,6 +470,40 @@ static class Program
         return ok ? 0 : 1;
     }
 
+    // Self-check: the sniffer fires once on Op.Queue and ignores login + campaign, even
+    // when packets are split across read boundaries (5-byte chunks here).
+    static int SniffDemo()
+    {
+        static byte[] Frame(byte op, int payloadLen)
+        {
+            var p = new byte[7 + payloadLen];
+            p[0] = op;
+            BitConverter.GetBytes((ushort)1374).CopyTo(p, 1);
+            BitConverter.GetBytes((uint)(7 + payloadLen)).CopyTo(p, 3);
+            return p;
+        }
+        int fired = 0;
+        var sniff = new OpcodeSniffer(OpQueue, () => fired++);
+        var stream = new List<byte>();
+        stream.AddRange(Frame(46, 20)); // Op.Login   - ignore
+        stream.AddRange(Frame(55, 3));  // Op.StartStage (campaign) - ignore
+        stream.AddRange(Frame(0, 1));   // Op.Queue   - the trigger
+        stream.AddRange(Frame(7, 4));   // a later packet - must not double-fire
+        var all = stream.ToArray();
+        for (int off = 0; off < all.Length; off += 5)
+        {
+            int n = Math.Min(5, all.Length - off);
+            var chunk = new byte[n];
+            Array.Copy(all, off, chunk, 0, n);
+            sniff.Feed(chunk, n);
+        }
+        bool ok = fired == 1;
+        Console.WriteLine(ok
+            ? "sniffdemo OK: fired once on Op.Queue, ignored login + campaign, no double-fire"
+            : $"sniffdemo FAIL: fired {fired} times (want 1)");
+        return ok ? 0 : 1;
+    }
+
     // Self-check: ranked counts accumulate host-independently and rank derives right.
     static async Task<int> RankedDemoAsync()
     {
@@ -513,5 +597,52 @@ static class Program
             }
         }
         finally { l.Stop(); }
+    }
+}
+
+// Shared state for a single launcher session's transition from offline to online.
+sealed class OnlineState
+{
+    int _begun;
+    public SteamRelay? Relay;
+    public ulong GuestAuthority; // set once we've been elected guest; then game reconnects route to the relay
+    public bool Begin() => Interlocked.Exchange(ref _begun, 1) == 0; // go online at most once
+}
+
+// Watches a framed client->server byte stream (transparent: the caller still forwards
+// every byte) and fires ONCE when a packet with the target opcode appears. Framing is
+// [id u8][key u16][size u32 total incl 7-byte header][payload]; an accumulator handles
+// packets split across reads. Client->server packets are small, so buffering is cheap.
+sealed class OpcodeSniffer
+{
+    readonly byte _target;
+    readonly Action _onSeen;
+    byte[] _buf = Array.Empty<byte>();
+    int _len;
+    bool _fired;
+
+    public OpcodeSniffer(byte targetOpcode, Action onSeen) { _target = targetOpcode; _onSeen = onSeen; }
+
+    public void Feed(byte[] data, int count)
+    {
+        if (_fired || count <= 0) return;
+        Append(data, count);
+        int off = 0;
+        while (_len - off >= 7)
+        {
+            uint size = BitConverter.ToUInt32(_buf, off + 3);
+            if (size < 7) { off++; continue; }      // resync on garbage (shouldn't happen on a valid stream)
+            if (_len - off < size) break;            // packet not complete yet
+            if (_buf[off] == _target) { _fired = true; _onSeen(); break; }
+            off += (int)size;
+        }
+        if (off > 0 && !_fired) { Array.Copy(_buf, off, _buf, 0, _len - off); _len -= off; }
+    }
+
+    void Append(byte[] data, int count)
+    {
+        if (_len + count > _buf.Length) Array.Resize(ref _buf, Math.Max(_len + count, _buf.Length * 2 + 256));
+        Array.Copy(data, 0, _buf, _len, count);
+        _len += count;
     }
 }

@@ -33,11 +33,19 @@ PtoServer, the other connects to it over the relay. Same on both machines.
    only genuinely-shared state lives in Firebase RTDB, reached by REST (no SDK). Set
    `PTO_FIREBASE_URL` (+ optional `PTO_FIREBASE_AUTH`) or drop the RTDB URL in
    `firebase.txt`.
-   - **Symmetric matchmaking**: `ptolaunch play` enqueues "looking for match"; both
-     peers compute the same pairing from the queue (`ElectPartner`: sort ids, pair
-     adjacent) and the lower SteamID is elected authority. The authority writes a
-     match record so the other confirms reciprocity before connecting (closes the
-     snapshot-skew race). No host/join wording anywhere. `matchdemo` / `queuedemo`
+   - **Offline-first + auto-detect online**: `ptolaunch play` always runs a local
+     PtoServer (on `LocalPort` 51339) and proxies the game (`GamePort` 51338) to it,
+     so login, deckbuilding, and the campaign work with no internet or broadcasting.
+     The proxy sniffs the game->server stream (`OpcodeSniffer`) and only when it sees
+     **Op.Queue (0)** does it go online; the campaign (Op.StartStage 55) is a local
+     bot battle so it never trips it. `sniffdemo` self-checks the detection.
+   - **Symmetric matchmaking**: on going online both peers enqueue and compute the
+     same pairing (`ElectPartner`: sort ids, pair adjacent); the lower SteamID is
+     elected authority and hosts on its own local server (its game is already queued
+     there); the guest reconnects onto the authority over the relay (the fixed client
+     can't migrate a live session, so the launcher drops its connection to force it).
+     The authority writes a match record the guest confirms (closes the snapshot-skew
+     race) and stays in the queue until the guest connects. `matchdemo` / `queuedemo`
      self-check the election and queue.
    - **Ranked ladder**: rank is a personal climb ladder
      (`rank = clamp(25 - wins + losses, 1, 99)`), a pure function of a player's own
@@ -59,6 +67,7 @@ The authority auto-spawns `PtoServer.exe` if 51338 isn't already up
 
     dotnet run -c Release demo        # transport tunnel (4-hop byte round-trip)
     dotnet run -c Release matchdemo   # deterministic pairing / authority election
+    dotnet run -c Release sniffdemo   # Op.Queue "go online" detection
     dotnet run -c Release queuedemo   # match queue against a local fake RTDB
     dotnet run -c Release rankeddemo  # ranked count accumulation + rank derivation
 
