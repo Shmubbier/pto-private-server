@@ -46,7 +46,10 @@ PtoServer, the other connects to it over the relay. Same on both machines.
      can't migrate a live session, so the launcher drops its connection to force it).
      The authority writes a match record the guest confirms (closes the snapshot-skew
      race) and stays in the queue until the guest connects. `matchdemo` / `queuedemo`
-     self-check the election and queue.
+     self-check the election and queue. On **Op.BattleEnd (3)** the guest's launcher
+     forwards the result then drops the relay so the client reconnects back to its own
+     local server (offline); the authority is already local. Ranked is pushed to
+     Firebase by the authority tailing `matches.txt`.
    - **Ranked ladder**: rank is a personal climb ladder
      (`rank = clamp(25 - wins + losses, 1, 99)`), a pure function of a player's own
      counts, so it is authority-independent: Firebase just accumulates wins/losses.
