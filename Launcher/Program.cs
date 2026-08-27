@@ -19,6 +19,7 @@ static class Program
     const int GamePort = 51338;  // loopback port the game dials (settings.ini IP=127.0.0.1); the launcher proxy
     const int LocalPort = 51339; // the local PtoServer sits here; the proxy forwards GamePort -> here
     const byte OpQueue = 0;      // client -> server: join online matchmaking (the "go online" trigger)
+    const byte OpBattleEnd = 3;  // server -> client: battle finished (the "match over" signal)
 
     static async Task<int> Main(string[] args)
     {
@@ -129,7 +130,7 @@ static class Program
             {
                 using (game)
                 using (var peer = await online.Relay!.ConnectAsync(online.GuestAuthority))
-                    await PumpAsync(game.GetStream(), peer);
+                    await GuestBridgeAsync(game, peer, online);
                 return;
             }
             using (game)
@@ -151,12 +152,16 @@ static class Program
     // to the relay.
     static async Task GoOnlineAsync(MetaClient meta, OnlineState online, TcpClient game)
     {
-        if (!online.Begin()) return; // once
+        if (!online.Begin()) return; // once per match (Reset re-arms it after the match ends)
         if (!meta.Enabled) { Console.WriteLine("online needs Firebase (firebase.txt); staying offline"); return; }
         SteamRelay relay;
-        try { relay = new SteamRelay(); relay.Init(); }
-        catch (Exception ex) { Console.WriteLine($"online needs Steam running: {ex.Message}"); return; }
-        online.Relay = relay;
+        if (online.Relay != null) relay = online.Relay; // reuse across matches
+        else
+        {
+            try { relay = new SteamRelay(); relay.Init(); }
+            catch (Exception ex) { Console.WriteLine($"online needs Steam running: {ex.Message}"); return; }
+            online.Relay = relay;
+        }
         ulong me = relay.MySteamId;
         Console.WriteLine($"online: matchmaking as {relay.MyName} ({me})...");
 
@@ -187,6 +192,27 @@ static class Program
             try { game.Close(); } catch { } // drop the local session so the client reconnects via the relay
             return;
         }
+    }
+
+    // Guest online session: pump game <-> relay, watching the relay -> game side for
+    // Op.BattleEnd. When the match ends we forward the result, then drop the connection
+    // and re-arm; the client reconnects and (GuestAuthority now cleared) lands back on
+    // its own local server, offline. Firebase is updated by the authority, not here.
+    static async Task GuestBridgeAsync(TcpClient game, SteamConnectionStream peer, OnlineState online)
+    {
+        using var cts = new CancellationTokenSource();
+        var g = game.GetStream();
+        var endSniff = new OpcodeSniffer(OpBattleEnd, () =>
+        {
+            Console.WriteLine("match over; returning to offline. Restart the game to reconnect to your local server.");
+            online.Reset();
+            cts.Cancel();
+        });
+        var t1 = CopyAsync(g, peer, cts);                 // game -> relay (plain)
+        var t2 = SniffCopyAsync(peer, g, endSniff, cts);  // relay -> game (watch for battle end)
+        await Task.WhenAny(t1, t2);
+        cts.Cancel();
+        try { await Task.WhenAll(t1, t2); } catch { /* expected on teardown */ }
     }
 
     // Authority: accept relay peers and bridge each to the LOCAL server; feed the ladder.
@@ -604,9 +630,10 @@ static class Program
 sealed class OnlineState
 {
     int _begun;
-    public SteamRelay? Relay;
+    public SteamRelay? Relay;    // created on first online use, reused across matches
     public ulong GuestAuthority; // set once we've been elected guest; then game reconnects route to the relay
-    public bool Begin() => Interlocked.Exchange(ref _begun, 1) == 0; // go online at most once
+    public bool Begin() => Interlocked.Exchange(ref _begun, 1) == 0; // go online at most once per match
+    public void Reset() { GuestAuthority = 0; Interlocked.Exchange(ref _begun, 0); } // after a match: back offline, re-armed
 }
 
 // Watches a framed client->server byte stream (transparent: the caller still forwards
