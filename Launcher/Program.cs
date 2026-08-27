@@ -115,11 +115,12 @@ static class Program
             if (me < partner)
             {
                 // Elected authority. Announce it so the partner can confirm reciprocity.
+                // Stay in the queue (RunAuthorityAsync keeps heartbeating) until the guest
+                // connects, otherwise the guest could no longer see us to derive the pair.
                 await meta.SetMatchAsync(key, me);
-                await meta.DequeueAsync(me);
                 Console.WriteLine($"matched with {partner}; elected authority, running local server");
-                if (!await EnsureServerAsync()) { await meta.ClearMatchAsync(key); return 1; }
-                await RunAuthorityAsync(relay, meta);
+                if (!await EnsureServerAsync()) { await meta.ClearMatchAsync(key); await meta.DequeueAsync(me); return 1; }
+                await RunAuthorityAsync(relay, meta, me, key);
                 return 0;
             }
             else
@@ -138,11 +139,31 @@ static class Program
 
     // Authority: accept relay peers, bridge each to the local server, feed the ladder.
     // The authority's own game connects to 127.0.0.1:51338 directly (not proxied).
-    static async Task RunAuthorityAsync(SteamRelay relay, MetaClient meta)
+    static async Task RunAuthorityAsync(SteamRelay relay, MetaClient meta, ulong me, string key)
     {
         _ = WatchMatchesAsync(meta); // push finished matches to the shared ladder
+
+        // Keep advertising in the queue so the guest can still derive the pair; stop and
+        // leave the queue once the guest actually connects over the relay.
+        var hbCts = new CancellationTokenSource();
+        int guestArrived = 0;
+        _ = Task.Run(async () =>
+        {
+            while (!hbCts.IsCancellationRequested)
+            {
+                try { await meta.EnqueueAsync(me, relay.MyName); } catch { }
+                try { await Task.Delay(3000, hbCts.Token); } catch { }
+            }
+        });
+
         relay.Listen(async peer =>
         {
+            if (Interlocked.Exchange(ref guestArrived, 1) == 0)
+            {
+                hbCts.Cancel();
+                await meta.DequeueAsync(me);
+                await meta.ClearMatchAsync(key);
+            }
             try
             {
                 using (peer)
