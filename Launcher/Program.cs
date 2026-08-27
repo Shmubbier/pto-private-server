@@ -131,8 +131,27 @@ static class Program
             if (online.GuestAuthority != 0)
             {
                 using (game)
-                using (var peer = await online.Relay!.ConnectAsync(online.GuestAuthority))
-                    await GuestBridgeAsync(game, peer, online);
+                {
+                    // The relay route or the host's listen socket may not be ready the instant
+                    // the guest reconnects; retry a few times before giving up.
+                    SteamConnectionStream? peer = null;
+                    for (int attempt = 1; attempt <= 4 && peer == null; attempt++)
+                    {
+                        Console.WriteLine($"relay: connecting to host {online.GuestAuthority} (attempt {attempt}/4)...");
+                        try { peer = await online.Relay!.ConnectAsync(online.GuestAuthority); }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"  attempt {attempt} failed: {ex.Message}");
+                            if (attempt < 4) await Task.Delay(2000);
+                        }
+                    }
+                    if (peer == null)
+                    {
+                        Console.WriteLine("could not reach the host over the relay. Restart the game and pick matchmaking again to retry.");
+                        return;
+                    }
+                    using (peer) await GuestBridgeAsync(game, peer, online);
+                }
                 return;
             }
             using (game)
