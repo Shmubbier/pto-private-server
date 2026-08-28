@@ -20,6 +20,8 @@ static class Program
     const int LocalPort = 51339; // the local PtoServer sits here; the proxy forwards GamePort -> here
     const byte OpQueue = 0;      // client -> server: join online matchmaking (the "go online" trigger)
     const byte OpBattleEnd = 3;  // server -> client: battle finished (the "match over" signal)
+    const byte OpLogin = 46;     // client -> server: login (captured to replay onto the host)
+    const byte OpLoaded = 48;    // server -> client: login flow done, door open -> lobby
 
     static async Task<int> Main(string[] args)
     {
@@ -167,15 +169,20 @@ static class Program
                 return;
             }
             using (game)
-            using (var server = new TcpClient())
             {
+                var server = new TcpClient();
                 await server.ConnectAsync(IPAddress.Loopback, LocalPort);
                 server.NoDelay = true;
-                // game -> server: go online on Op.Queue. server -> game: on Op.BattleEnd,
-                // if we were hosting an online match, re-arm and return to passive offline.
-                var queueSniff = new OpcodeSniffer(OpQueue, () => _ = GoOnlineAsync(meta, online, game));
+                using var localCts = new CancellationTokenSource();
+
+                // Capture the game's login (op46) and matchmaking (op0) so we can replay them onto
+                // the authority and hand the LIVE connection over with no visible disconnect.
+                var loginSniff = new OpcodeSniffer(OpLogin, pkt => online.LoginPacket = pkt, repeat: true);
+                var handoff = new TaskCompletionSource<SteamConnectionStream?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var queueSniff = new OpcodeSniffer(OpQueue, pkt => { online.QueuePacket = pkt; _ = GoOnlineAsync(meta, online, game, handoff); });
                 online.QueueSniff = queueSniff;
-                var endSniff = new OpcodeSniffer(OpBattleEnd, () =>
+                // server -> game: on Op.BattleEnd, if we were hosting, re-arm and go passive offline.
+                var endSniff = new OpcodeSniffer(OpBattleEnd, _ =>
                 {
                     if (online.EndHosting())
                     {
@@ -183,7 +190,23 @@ static class Program
                         Console.WriteLine("match over; back to passive offline, ready for another match.");
                     }
                 }, repeat: true);
-                await PumpDualSniffAsync(game.GetStream(), server.GetStream(), queueSniff, endSniff);
+
+                var pump = PumpDualSniffAsync(game.GetStream(), server.GetStream(),
+                                              new[] { loginSniff, queueSniff }, new[] { endSniff }, localCts);
+                var done = await Task.WhenAny(pump, handoff.Task);
+                if (done == handoff.Task && handoff.Task.Result is SteamConnectionStream peer)
+                {
+                    // SEAMLESS: stop the local pump, drop the local server, and splice the SAME game
+                    // connection to the authority over the relay - no disconnect, no scary message.
+                    localCts.Cancel();
+                    try { await pump; } catch { }
+                    try { server.Close(); } catch { }
+                    Console.WriteLine("joined - handed your live session to the host, no reconnect needed.");
+                    using (peer) await GuestBridgeAsync(game, peer, online);
+                    return;
+                }
+                try { server.Close(); } catch { }
+                await pump; // normal offline / authority session end
             }
         }
         catch (Exception ex) { Console.WriteLine($"game session ended: {ex.Message}"); }
@@ -194,19 +217,20 @@ static class Program
     // queued there). The guest must reconnect onto the authority (the fixed client
     // cannot move a live session), so we drop its connection and route the reconnect
     // to the relay.
-    static async Task GoOnlineAsync(MetaClient meta, OnlineState online, TcpClient game)
+    static async Task GoOnlineAsync(MetaClient meta, OnlineState online, TcpClient game, TaskCompletionSource<SteamConnectionStream?> handoff)
     {
         // Fire-and-forget from the sniffer: swallow nothing silently. On any error, re-arm
         // so the player can just try matchmaking again.
-        try { await GoOnlineCoreAsync(meta, online, game); }
+        try { await GoOnlineCoreAsync(meta, online, game, handoff); }
         catch (Exception ex)
         {
             Console.WriteLine($"matchmaking stopped: {ex.Message}. Choose matchmaking again to retry.");
             online.CancelHosting();
+            handoff.TrySetResult(null); // never leave HandleGameAsync waiting
         }
     }
 
-    static async Task GoOnlineCoreAsync(MetaClient meta, OnlineState online, TcpClient game)
+    static async Task GoOnlineCoreAsync(MetaClient meta, OnlineState online, TcpClient game, TaskCompletionSource<SteamConnectionStream?> handoff)
     {
         if (!online.Begin()) return; // once per match (Reset re-arms it after the match ends)
         if (!meta.Enabled) { Console.WriteLine("online needs Firebase (firebase.txt); staying offline"); return; }
@@ -259,11 +283,74 @@ static class Program
                 continue;
             }
             await meta.DequeueAsync(me);
-            online.GuestAuthority = partner; // route the reconnect to the relay
-            Console.WriteLine($"matched with {partner} - joining their game.");
-            Console.WriteLine(">> When the game says 'disconnected', restart it and choose online matchmaking again to enter the match.");
-            try { game.Close(); } catch { } // drop the local session so the client reconnects via the relay
+            Console.WriteLine($"matched with {partner} - connecting you into their game...");
+            // Seamless: connect the relay and pre-run the login onto the authority on the game's
+            // behalf, so the launcher can splice the LIVE game connection over (HandleGameAsync
+            // does the splice). Falls back to a forced reconnect if the seamless join fails.
+            try
+            {
+                var peer = await SeamlessGuestConnectAsync(online, partner);
+                handoff.TrySetResult(peer);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"  seamless join failed ({ex.Message}); falling back to reconnect.");
+                online.GuestAuthority = partner;              // route the reconnect to the relay
+                Console.WriteLine(">> If the game shows 'disconnected', it will auto-rejoin the match.");
+                handoff.TrySetResult(null);
+                try { game.Close(); } catch { }               // force the client to reconnect via the relay
+            }
             return;
+        }
+    }
+
+    // Guest seamless join: connect the relay to the authority, replay the captured login onto it
+    // and swallow the authority's login-flow responses (the game already logged in to the local
+    // server), then replay the matchmaking op so the authority pairs us into the host's match.
+    // The returned stream is positioned so its next bytes are the battle setup; HandleGameAsync
+    // bridges the live game connection to it, so the player never sees a disconnect.
+    static async Task<SteamConnectionStream> SeamlessGuestConnectAsync(OnlineState online, ulong authority)
+    {
+        if (online.LoginPacket == null || online.QueuePacket == null)
+            throw new InvalidOperationException("no captured login/queue to replay");
+        for (int i = 0; i < 30 && !online.Relay!.RelayReady(); i++) await Task.Delay(500);
+        SteamConnectionStream? peer = null;
+        for (int attempt = 1; attempt <= 4 && peer == null; attempt++)
+        {
+            try { peer = await online.Relay!.ConnectAsync(authority); }
+            catch (Exception ex) { Console.WriteLine($"  relay connect attempt {attempt} failed: {ex.Message}"); if (attempt < 4) await Task.Delay(2000); }
+        }
+        if (peer == null) throw new IOException("could not reach the host over the relay");
+
+        await peer.WriteAsync(online.LoginPacket);
+        await SuppressUntilAsync(peer, OpLoaded);   // discard the authority's login flow up to op48
+        await peer.WriteAsync(online.QueuePacket);  // queue on the authority -> it pairs us in
+        return peer;
+    }
+
+    // Read and discard whole framed packets from a stream until (and including) one with `opcode`.
+    static async Task SuppressUntilAsync(Stream s, byte opcode)
+    {
+        var acc = new byte[8192];
+        int len = 0;
+        var buf = new byte[16384];
+        while (true)
+        {
+            int n = await s.ReadAsync(buf);
+            if (n <= 0) throw new IOException("host closed during the login handoff");
+            if (len + n > acc.Length) Array.Resize(ref acc, Math.Max(len + n, acc.Length * 2));
+            Array.Copy(buf, 0, acc, len, n); len += n;
+            int off = 0;
+            while (len - off >= 7)
+            {
+                uint size = BitConverter.ToUInt32(acc, off + 3);
+                if (size < 7) { off++; continue; }
+                if (len - off < size) break;
+                byte op = acc[off];
+                off += (int)size;
+                if (op == opcode) return; // login flow consumed; the rest of the burst ends here
+            }
+            if (off > 0) { Array.Copy(acc, off, acc, 0, len - off); len -= off; }
         }
     }
 
@@ -275,14 +362,14 @@ static class Program
     {
         using var cts = new CancellationTokenSource();
         var g = game.GetStream();
-        var endSniff = new OpcodeSniffer(OpBattleEnd, () =>
+        var endSniff = new OpcodeSniffer(OpBattleEnd, _ =>
         {
-            Console.WriteLine("match over; returning to offline. Restart the game to reconnect to your local server.");
+            Console.WriteLine("match over; returning to offline.");
             online.Reset();
             cts.Cancel();
         });
-        var t1 = CopyAsync(g, peer, cts);                 // game -> relay (plain)
-        var t2 = SniffCopyAsync(peer, g, endSniff, cts);  // relay -> game (watch for battle end)
+        var t1 = CopyAsync(g, peer, cts);                     // game -> relay (plain)
+        var t2 = SniffCopyAsync(peer, g, cts, endSniff);      // relay -> game (watch for battle end)
         await Task.WhenAny(t1, t2);
         cts.Cancel();
         try { await Task.WhenAll(t1, t2); } catch { /* expected on teardown */ }
@@ -342,18 +429,18 @@ static class Program
         });
     }
 
-    // Bidirectional pump where each direction is teed through its own sniffer.
-    static async Task PumpDualSniffAsync(Stream game, Stream server, OpcodeSniffer gameToServer, OpcodeSniffer serverToGame)
+    // Bidirectional pump where each direction is teed through its sniffers. Caller may pass
+    // a CTS to cancel the pump externally (used to hand the game off to the relay seamlessly).
+    static async Task PumpDualSniffAsync(Stream game, Stream server, OpcodeSniffer[] gameToServer, OpcodeSniffer[] serverToGame, CancellationTokenSource cts)
     {
-        using var cts = new CancellationTokenSource();
-        var t1 = SniffCopyAsync(game, server, gameToServer, cts);
-        var t2 = SniffCopyAsync(server, game, serverToGame, cts);
+        var t1 = SniffCopyAsync(game, server, cts, gameToServer);
+        var t2 = SniffCopyAsync(server, game, cts, serverToGame);
         await Task.WhenAny(t1, t2);
         cts.Cancel();
         try { await Task.WhenAll(t1, t2); } catch { /* expected on teardown */ }
     }
 
-    static async Task SniffCopyAsync(Stream from, Stream to, OpcodeSniffer sniff, CancellationTokenSource cts)
+    static async Task SniffCopyAsync(Stream from, Stream to, CancellationTokenSource cts, params OpcodeSniffer[] sniffs)
     {
         var buf = new byte[16384];
         try
@@ -362,7 +449,7 @@ static class Program
             while ((n = await from.ReadAsync(buf.AsMemory(0, buf.Length), cts.Token)) > 0)
             {
                 await to.WriteAsync(buf.AsMemory(0, n), cts.Token);
-                sniff.Feed(buf, n);
+                foreach (var s in sniffs) s.Feed(buf, n);
             }
         }
         finally { cts.Cancel(); }
@@ -650,7 +737,7 @@ static class Program
             return p;
         }
         int fired = 0;
-        var sniff = new OpcodeSniffer(OpQueue, () => fired++);
+        var sniff = new OpcodeSniffer(OpQueue, _ => fired++);
         var stream = new List<byte>();
         stream.AddRange(Frame(46, 20)); // Op.Login   - ignore
         stream.AddRange(Frame(55, 3));  // Op.StartStage (campaign) - ignore
@@ -668,7 +755,7 @@ static class Program
 
         // repeat mode: fires on every Op.BattleEnd (authority watches many battles)
         int ends = 0;
-        var rep = new OpcodeSniffer(3, () => ends++, repeat: true);
+        var rep = new OpcodeSniffer(3, _ => ends++, repeat: true);
         var s2 = new List<byte>();
         s2.AddRange(Frame(3, 2)); s2.AddRange(Frame(20, 5)); s2.AddRange(Frame(3, 0));
         var b2 = s2.ToArray();
@@ -676,7 +763,7 @@ static class Program
 
         // one-shot re-arm: fires again after Rearm()
         int q2 = 0;
-        var os = new OpcodeSniffer(0, () => q2++);
+        var os = new OpcodeSniffer(0, _ => q2++);
         var qf = Frame(0, 1);
         os.Feed(qf, qf.Length); os.Rearm(); os.Feed(qf, qf.Length);
 
@@ -797,6 +884,8 @@ sealed class OnlineState
     public ulong MyId;
     public string? MatchKey;
     public OpcodeSniffer? QueueSniff; // the game's Op.Queue trigger, re-armed after a match/cancel
+    public byte[]? LoginPacket;       // guest: last op46 seen, replayed onto the authority
+    public byte[]? QueuePacket;       // guest: the op0 that triggered matchmaking, replayed onto the authority
 
     public bool Begin() => Interlocked.Exchange(ref _begun, 1) == 0; // go online at most once per match
     public void Reset() { GuestAuthority = 0; Interlocked.Exchange(ref _begun, 0); } // guest match end: offline, re-armed
@@ -828,13 +917,13 @@ sealed class OnlineState
 sealed class OpcodeSniffer
 {
     readonly byte _target;
-    readonly Action _onSeen;
+    readonly Action<byte[]> _onSeen; // receives the full framed packet bytes
     readonly bool _repeat; // false: fire once then go idle until Rearm(); true: fire on every occurrence
     byte[] _buf = Array.Empty<byte>();
     int _len;
     bool _fired;
 
-    public OpcodeSniffer(byte targetOpcode, Action onSeen, bool repeat = false)
+    public OpcodeSniffer(byte targetOpcode, Action<byte[]> onSeen, bool repeat = false)
     { _target = targetOpcode; _onSeen = onSeen; _repeat = repeat; }
 
     public void Rearm() => _fired = false; // re-arm a one-shot sniffer for the next match
@@ -851,7 +940,7 @@ sealed class OpcodeSniffer
             if (_len - off < size) break;            // packet not complete yet
             if (_buf[off] == _target)
             {
-                _onSeen();
+                _onSeen(_buf[off..(off + (int)size)]);
                 if (!_repeat) { _fired = true; off += (int)size; break; }
             }
             off += (int)size;
