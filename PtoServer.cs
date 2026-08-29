@@ -87,10 +87,13 @@ namespace PtoServer
         public const byte SpellCreate  = 44;  // battle: caster cast-pose + spell text; blocks queue (next_que_effect=0) [isMe u8/bool, xx u8, yy u8]
         public const byte Effect       = 41;  // battle: effect projectile/hit [isOrder,xf,yf,gridf,xt,yt,gridt,eid u16,isheal,dmg]
         public const byte SpellRemove  = 45;  // battle: end the cast window; releases queue (next_que_effect=1) [no payload]
+        public const byte OrderCreate  = 42;  // battle: play an order -> show the order HERO + spell-name textbox (container_order_create) [isMe bool, card u16]
+        public const byte OrderRemove  = 43;  // battle: order done -> order hero flies away + releases queue (container_order_remove) [d bool]
         public const byte ScryResult   = 51;  // client->server: scry pick result [u8 handSize][handSize bools: 0=draw this, 1=shuffle back]
         public const byte DeckUpdate   = 54;
         public const byte StartStage   = 55;  // client -> server: start a singleplayer campaign stage [deckId u8][sid u16]
         public const byte Concede      = 57;  // client -> server: sender concedes (empty payload); opponent wins
+        public const byte Pause        = 58;  // client -> server: campaign pause toggle [u8 paused]; halts the bot mid-turn
         public const byte CardHover    = 7;   // client->server: card hover (cosmetic)
         public const byte ArrowPos     = 34;  // client->server: arrow position (cosmetic)
         public const byte SlotHover    = 64;  // client->server: slot hover (cosmetic)
@@ -234,6 +237,10 @@ namespace PtoServer
             int httpPort; if (!int.TryParse(Environment.GetEnvironmentVariable("PTO_HTTP_PORT"), out httpPort)) httpPort = 8080;
             HttpApi.Start(httpPort);
 
+            // Optional: upload each match's bot-training records to a Firebase Realtime Database (so copies
+            // sent to playtesters report back to one place). Configured via firebase.txt / env; off if unset.
+            FirebaseUploader.Init();
+
             while (true)
             {
                 TcpClient c = listener.AcceptTcpClient();
@@ -332,6 +339,7 @@ namespace PtoServer
                         case Op.CancelQueue:Matchmaker.Cancel(ns); break;
                         case Op.StartStage: HandleStartStage(ns, username, payload); break;
                         case Op.Concede:    HandleConcede(ns); break;
+                        case Op.Pause:      HandlePause(ns, payload); break;
                         case Op.BattleReady:SendBattleSetup(ns); MaybeSetupBotOpponent(ns); break;
                         case Op.Mulligan:   HandleMulligan(ns, payload); break;
                         case Op.Summon:     HandleSummon(ns, payload); break;
@@ -452,8 +460,26 @@ namespace PtoServer
         const int CardDbCount = 232;
         const int BackCount   = 11;
         const int LandCount   = 5;
-        const int StageCount  = 49;
+        const int StageCount  = 76;  // Steam build: Deck Test + 3 worlds (25 nodes). Client reads exactly `stagesize` entries.
         const byte CardCopies = 3;
+
+        // Per-stage [completed][unlocked] (op60). Completed is persisted (StageStore); unlock is derived by
+        // StageUnlocked: Deck Test + each world's first node are always open, and a later node opens at
+        // difficulty d once the previous node was cleared at difficulty >= d (nested cross-difficulty
+        // progression). Sent at login AND re-sent after a stage win so the star/unlock updates live (the
+        // client's container_stages overwrites its stages[] from this).
+        static byte[] BuildStagesPacket(string username)
+        {
+            var completed = StageStore.Completed(username);
+            var st = new PacketWriter();
+            for (int i = 0; i < StageCount; i++)
+            {
+                bool com = completed.Contains(i);
+                bool unl = StageUnlocked(i, completed);
+                st.WriteBool(com).WriteBool(unl);
+            }
+            return st.Frame(Op.Stages);
+        }
 
         static void SendAccountData(NetworkStream ns, string username)
         {
@@ -493,9 +519,7 @@ namespace PtoServer
                 deckCount++;
             }
 
-            var st = new PacketWriter();
-            for (int i = 0; i < StageCount; i++) st.WriteBool(false).WriteBool(true);
-            byte[] stagePkt = st.Frame(Op.Stages);
+            byte[] stagePkt = BuildStagesPacket(username);
             ms.Write(stagePkt, 0, stagePkt.Length);
 
             byte[] blob = ms.ToArray();
@@ -1085,7 +1109,7 @@ namespace PtoServer
         // Build a 20-byte update_buff payload for a unit at (x, y). All fields are 1 byte. s8 fields
         // default to -1 (sent as 255). We only vary atktype (ranged), inter(cept), and adpx (= grid_x,
         // which drives the client's wave-spell selection); everything else is the no-buff default.
-        static PacketWriter BuildBuff(int x, int y, byte atktype, bool intercept, bool counter, bool incorp, bool shield, bool silence, bool decoy, bool immort)
+        static PacketWriter BuildBuff(int x, int y, byte atktype, bool intercept, bool counter, bool incorp, bool shield, bool silence, bool decoy, bool immort, bool rev = false)
         {
             return new PacketWriter()
                 .WriteU8((byte)x).WriteU8((byte)y).WriteU8(atktype)
@@ -1096,7 +1120,7 @@ namespace PtoServer
                 .WriteBool(incorp)        // incorp (transparent to melee); 0 also avoids the return_noone_infront crash
                 .WriteBool(shield)        // shield
                 .WriteBool(silence)       // silence
-                .WriteBool(false)         // rev
+                .WriteBool(rev)           // rev (revenge icon: only while revenge is actually active)
                 .WriteBool(counter)       // cnter
                 .WriteBool(immort)        // immort (vanguard Immortality)
                 .WriteBool(false)         // deathpro
@@ -1118,8 +1142,25 @@ namespace PtoServer
             bool counter = (unit.Abilities & UnitAbility.Counter) != 0;
             bool incorp = (unit.Abilities & UnitAbility.Incorporeal) != 0;
             bool immort = ownerSlot.Battle != null && IsImmortalVanguard(ownerSlot.Battle.P[ownerSlot.P], x);
-            Send(ownerSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy, immort).Frame(Op.UpdateBuff));
-            if (oppSlot != null) Send(oppSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy, immort).Frame(Op.UpdateBuffGet));
+            // Revenge icon (spr_*_revenge_icon): show it ONLY while revenge is actually active, i.e. the
+            // hero HAS "Revenge: Strength N" at its current wave AND is itself damaged (the +N is live).
+            // Computed from the card so it's correct for every SendUnitBuff caller, not just the sync path.
+            int revWave = (unit.MarkedWave >= 0) ? unit.MarkedWave : x;
+            bool revActive = GetUnitRevenge(unit.Card, revWave) > 0 && unit.Damage > 0;
+            Send(ownerSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy, immort, revActive).Frame(Op.UpdateBuff));
+            if (oppSlot != null) Send(oppSlot.Me.Ns, BuildBuff(x, y, atktype, intercept, counter, incorp, unit.Shield, unit.Silenced, unit.Decoy, immort, revActive).Frame(Op.UpdateBuffGet));
+
+            // Ranged-gain flourish: play obj_give_ranged (eid 20) on a unit that receives Ranged Attack from
+            // ELSEWHERE (an aura like Pyromancer's "Forerunner: R.Attack", or Lizaveta's grant) - i.e. the
+            // grantee, not the granter. A unit ranged by its own card (ownRanged) is skipped (it still gets the
+            // client icon pop). Fires once per gain via WasRanged; Lizaveta's order path pre-sets it so its own
+            // effect isn't doubled.
+            bool nowRanged = atktype == 1;
+            int rwave = (unit.MarkedWave >= 0) ? unit.MarkedWave : x;
+            bool ownRanged = IsRangedAtWave(unit.Card, rwave);
+            if (nowRanged && !ownRanged && !unit.WasRanged)
+                SendEffect(ownerSlot, oppSlot, x, y, x, y, true, 20, false, 0);
+            unit.WasRanged = nowRanged;
         }
 
         static int GetUnitArmor(ushort card, int wave)    { return PassiveOf(card, wave).Armor; }
@@ -1159,8 +1200,23 @@ namespace PtoServer
             public int Active = 0; // absolute player index whose turn it is
             public int BotP = -1;  // player index controlled by the AI bot, or -1 if none
             public int BotDifficulty = 2; // 0=easy,1=medium,2=hard: the rank window the bot picks moves from
+            public int StageSid = -1;     // campaign stage id if this is an op55 stage battle (-1 = not a stage)
             public bool BotActing; // guard so only one bot-turn thread runs at a time
+            public volatile bool BotPaused; // campaign pause (client op58): bot-turn thread blocks while true
             public bool RankRecorded; // guard so a battle updates the ranked ladder at most once
+            // Order cast-bracket end deferral: an order wraps ResolveEffect in SendSpellCast/SendSpellEnd
+            // (op44/op45). If a lethal effect sent the battle-end (op3 -> queues the game_end screen) BEFORE
+            // SendSpellEnd (op45 -> queues spell_end), game_end is not the LAST queued action, so the client's
+            // end screen finds action_list non-empty and its click just dismisses it instead of exiting. While
+            // DeferEnd is set, ResolveEffect records the winner/loser instead of sending; HandleOrder sends the
+            // end AFTER SendSpellEnd, making game_end the final action.
+            public bool DeferEnd;
+            public bool EndPending;
+            public Waiting EndWinner, EndLoser;
+            // Training log: one buffered record per bot decision (state features + chosen move's rank/score).
+            // Flushed with the win/loss label when the battle ends (TrainingStore). Used to tune the best-N
+            // move bands and, later, to learn a better move ranking.
+            public System.Collections.Generic.List<string> Training;
         }
 
         internal class PlayerState
@@ -1230,7 +1286,9 @@ namespace PtoServer
             public bool RecruitedThisWave;  // cannot attack on the turn recruited
             public bool HasAttackedThisWave; // can only attack once per wave
             public bool GrantedRanged;      // Lizaveta leader active: persistently granted Ranged Attack
+            public bool WasRanged;          // client already knows this unit is ranged; fire the gain effect only on false->true
             public int MarkedWave = -1;     // Pendros: overrides the wave used for this unit's abilities (-1 = use its cell)
+            public int BotAggro;            // AI target priority: raised when this (enemy) hero attacks the bot or the bot attacks it; decays each bot turn
         }
 
         // What a Cover:X unit protects. It takes damage that would land on the covered position.
@@ -1287,6 +1345,7 @@ namespace PtoServer
             var battle = new Battle();
             if (a.IsBot) { battle.BotP = 1; battle.BotDifficulty = a.BotDifficulty; }
             else if (b.IsBot) { battle.BotP = 0; battle.BotDifficulty = b.BotDifficulty; }
+            battle.StageSid = a.StageSid >= 0 ? a.StageSid : b.StageSid;
             lock (_battleLock)
             {
                 _battles[a.Ns] = new BattleSlot { Me = a, Opp = b, FirstPlayer = false, Battle = battle, P = 1 };
@@ -1332,31 +1391,91 @@ namespace PtoServer
             SendBattleEnd(slot.Battle, slot.Opp, slot.Me);
         }
 
+        // Campaign pause (op58). Sets/clears Battle.BotPaused so the bot-turn thread blocks mid-turn while the
+        // human has the game paused (see BotWaitWhilePaused). Only vs-bot battles can pause; the client already
+        // hides the button in PvP, this is the server-side guard. The turn timer is already off for bot battles.
+        static void HandlePause(NetworkStream ns, byte[] payload)
+        {
+            BattleSlot slot;
+            lock (_battleLock) { if (!_battles.TryGetValue(ns, out slot)) return; }
+            Battle b = slot.Battle;
+            if (b == null || b.BotP < 0) return; // only campaign / vs-bot battles are pausable
+            bool paused = payload != null && payload.Length > 0 && payload[0] != 0;
+            b.BotPaused = paused;
+            Log("PAUSE " + (paused ? "ON" : "OFF") + " by " + slot.Me.User);
+        }
+
+        // Block the bot-turn thread while the human has the campaign paused. Cheap poll; the bot simply doesn't
+        // advance to its next action until resumed, and bails if the battle ends while paused.
+        static void BotWaitWhilePaused(Battle b)
+        {
+            while (b != null && b.BotPaused && !b.Over) Thread.Sleep(100);
+        }
+
         // Campaign stage tables, ported from the client's stage_setup (16 nodes, 8 per world). Each node's
         // three difficulty ids (easy/hard/challenge) share the node's AI leader, so sid -> leader is just
         // the node index within its world. Values are REAL card ids (LeaderCard = real*2).
+        // Steam build: 3 worlds / 25 nodes / 76 stages (0..75). Worlds 1-2 are 8 nodes each (sids 1-24,
+        // 25-48). World 3 is 9 nodes: nodes 3-1..3-8 keep the 8-block pattern (49-72), and node 3-9 is
+        // tacked on at the end as three consecutive sids (73 easy / 74 hard / 75 challenge).
         static readonly int[] World1Leaders = { 78, 72, 75, 77, 73, 71, 74, 76 };
         static readonly int[] World2Leaders = { 9, 4, 107, 8, 100, 79, 10, 108 };
+        static readonly int[] World3Leaders = { 99, 22, 5, 23, 11, 18, 16, 14, 111 }; // 9th (index 8) = node 3-9, sids 73-75
         static int StageLeaderReal(int sid)
         {
             if (sid >= 1  && sid <= 24) return World1Leaders[(sid - 1)  % 8];
             if (sid >= 25 && sid <= 48) return World2Leaders[(sid - 25) % 8];
+            if (sid >= 49 && sid <= 72) return World3Leaders[(sid - 49) % 8]; // 3-1..3-8
+            if (sid >= 73 && sid <= 75) return World3Leaders[8];              // 3-9 (easy/hard/challenge)
             return 0; // sid 0 (Deck Test) / unknown -> bot's default leader
         }
 
-        // sid -> bot difficulty (0=easy,1=medium,2=hard). Each world's 24 stages run easy(1-8)/hard(9-16)/
-        // challenge(17-24); the node's three ids share a leader but scale the AI: easy stage = easy bot,
-        // hard stage = medium bot, challenge = hard bot. Deck Test / unknown = full-strength AI.
+        // sid -> bot difficulty (0=easy,1=medium,2=hard). Each world's 24-stage block runs easy(x1-8)/
+        // hard(x9-16)/challenge(x17-24); the node's three ids share a leader but scale the AI: easy stage =
+        // easy bot, hard = medium bot, challenge = hard bot. The 3-9 block (73-75) is one node's three
+        // difficulties in a row. Deck Test / unknown = full-strength AI.
         static int StageDifficulty(int sid)
         {
-            if (sid < 1 || sid > 48) return 2;
-            return ((sid - 1) % 24) / 8; // 0..7 -> 0 (easy), 8..15 -> 1 (hard), 16..23 -> 2 (challenge)
+            if (sid < 1 || sid > 75) return 2;
+            if (sid >= 73) return sid - 73;    // 73->0 easy, 74->1 hard, 75->2 challenge
+            return ((sid - 1) % 24) / 8;       // 0..7 -> 0 (easy), 8..15 -> 1 (hard), 16..23 -> 2 (challenge)
+        }
+
+        // Decompose a campaign sid into (world 0-2, node index, difficulty 0-2). Returns false for sid 0
+        // (Deck Test) / out of range. World 2's 9th node (index 8) lives at sids 73-75 (easy/hard/challenge).
+        static bool StageDecompose(int sid, out int world, out int node, out int diff)
+        {
+            world = -1; node = 0; diff = 0;
+            if (sid >= 73 && sid <= 75) { world = 2; node = 8; diff = sid - 73; return true; }
+            if (sid >= 1 && sid <= 72) { world = (sid - 1) / 24; int within = (sid - 1) % 24; diff = within / 8; node = within % 8; return true; }
+            return false;
+        }
+        // Inverse of StageDecompose: (world, node, difficulty) -> sid.
+        static int StageCompose(int world, int node, int diff)
+        {
+            if (world == 2 && node == 8) return 73 + diff;
+            return world * 24 + diff * 8 + node + 1;
+        }
+        // Campaign unlock (nested cross-difficulty progression). The first node of each world (node 0, the
+        // "band start") is always open at all three difficulties. Every later node opens at difficulty d once
+        // the PREVIOUS node was cleared at difficulty >= d: clearing a level on Hard opens the next level's
+        // Easy+Hard, clearing on Challenge opens Easy+Hard+Challenge, clearing on Easy opens only Easy.
+        static bool StageUnlocked(int sid, HashSet<int> completed)
+        {
+            if (sid == 0) return true;                                             // Deck Test
+            int world, node, diff;
+            if (!StageDecompose(sid, out world, out node, out diff)) return true;  // unknown -> open
+            if (node == 0) return true;                                            // band start: always open
+            for (int dd = diff; dd <= 2; dd++)                                     // prev node cleared at >= this difficulty
+                if (completed.Contains(StageCompose(world, node - 1, dd))) return true;
+            return false;
         }
 
         // op55: start a singleplayer campaign stage. Payload: [deckId u8][sid u16]. Starts a battle of the
-        // human (chosen deck) vs the AI bot, forcing the bot's leader to the stage node's leader. The client
-        // then follows the same BattleReady path as a queued bot match. Difficulty scaling + win-persistence
-        // are deferred (roadmap steps 3-4). ponytail: leader-only AI; difficulty-scaled decks when it matters.
+        // human (chosen deck) vs the AI bot, forcing the bot's leader to the stage node's leader + scaling the
+        // AI's skill by difficulty. A human win persists (StageStore) via Battle.StageSid. The client then
+        // follows the same BattleReady path as a queued bot match. ponytail: difficulty scales the AI's move
+        // choice, not its deck; give stages themed decks when it matters.
         static void HandleStartStage(NetworkStream ns, string username, byte[] payload)
         {
             if (string.IsNullOrEmpty(username) || payload.Length < 3) return;
@@ -1366,7 +1485,7 @@ namespace PtoServer
             int leaderReal = StageLeaderReal(sid);
             int diff = StageDifficulty(sid);
             Log("STAGE: " + username + " starts stage " + sid + " (deck " + deckId + ", AI leader " + leaderReal + ", difficulty " + diff + ")");
-            var human = new Waiting { Ns = ns, User = username, DeckId = deckId };
+            var human = new Waiting { Ns = ns, User = username, DeckId = deckId, StageSid = sid };
             var bot = new Waiting { Ns = MakeBotStream(), User = "bot", DeckId = 0, IsBot = true,
                                     LeaderOverride = (ushort)(leaderReal * 2), BotDifficulty = diff };
             StartBattle(human, bot, Matchmaker.NextBattleId());
@@ -1418,18 +1537,31 @@ namespace PtoServer
             {
                 bool myTurn; lock (_battleLock) myTurn = (b.Started && b.Active == bot.P);
                 if (!myTurn) break;
-                Thread.Sleep(1100); // let the human's turn_get settle / pace the moves
+                BotWaitWhilePaused(b); if (b.Over) break; // hold at the start of the bot's turn if paused
+                // Aggro fades: halve every human unit's priority so "attacked me/attacked it" mostly reflects
+                // the last turn or two, not the whole game.
+                lock (_battleLock) foreach (var u in b.P[1 - bot.P].Units.Values) if (u != null) u.BotAggro /= 2;
+                Thread.Sleep(500); // let the human's turn_get settle / pace the moves
+                BotMove prev = null;
                 for (int step = 0; step < 12 && !b.Over; step++)
                 {
+                    BotWaitWhilePaused(b); if (b.Over) break; // hold before each action while paused
                     int actions; lock (_battleLock) actions = (b.Active == bot.P) ? b.P[bot.P].ActionsRemaining : 0;
                     if (actions <= 0) break;
-                    if (!BotDoOneAction(bot)) break;
-                    Thread.Sleep(1000);
+                    BotMove mv = BotDoOneAction(bot);
+                    if (mv == null) break;
+                    // A real move always changes board state (slot filled, attacker exhausted, card discarded),
+                    // so it never re-appears identically. An identical repeat means the pick was refused+refunded
+                    // (e.g. an op22 cast during ceasefire): stop re-picking it and end the turn.
+                    if (prev != null && mv.Kind == prev.Kind && BytesEqual(mv.Payload, prev.Payload)) break;
+                    prev = mv;
+                    Thread.Sleep(450);
                 }
                 if (b.Over) break;
-                Thread.Sleep(600);
+                BotWaitWhilePaused(b); if (b.Over) break; // hold before ending the turn if paused
+                Thread.Sleep(400);
                 HandleEndTurn(bot.Me.Ns); // ns=null -> _battles[null] = bot; advances the turn
-                Thread.Sleep(300);
+                Thread.Sleep(200);
             }
         }
 
@@ -1438,8 +1570,9 @@ namespace PtoServer
         // economy (the old free turn-start refill let the bot draw AND summon 3, bypassing the rules).
         const int BotHandTarget = 3;
 
-        // One candidate move the bot could make this action, with the priority score it scored.
-        class BotMove { public int Kind; public byte[] Payload; public double Score; public string Desc; } // Kind: 1=summon,2=attack,3=draw
+        // One candidate move the bot could make this action, with the priority score it scored. Rank/Pool/Top
+        // are filled by BotChoose for the training log (chosen rank within the sorted pool, and the best score).
+        class BotMove { public int Kind; public byte[] Payload; public double Score; public string Desc; public int Rank; public int Pool; public double Top; } // Kind: 1=summon,2=attack,3=draw,4=clear,5=order,6=reserve,7=spell
 
         // Difficulty -> the [lo,hi) rank window (into the best-first sorted candidate list) the bot draws its
         // pick from. Harder = nearer the top = more likely a very good move. Absolute bands per design;
@@ -1457,25 +1590,39 @@ namespace PtoServer
         // Decide and perform ONE bot action. Enumerate every LEGAL move (same rules/limit a human has),
         // score each with the formulas below, sort best-first, then pick one from the difficulty's rank
         // window. Returns false when the bot has no legal move (ends its turn).
-        static bool BotDoOneAction(BattleSlot bot)
+        static BotMove BotDoOneAction(BattleSlot bot)
         {
             Battle b = bot.Battle;
             BotMove move;
             lock (_battleLock)
             {
-                if (b.Over || b.Active != bot.P) return false;
+                if (b.Over || b.Active != bot.P) return null;
                 PlayerState ps = b.P[bot.P], hp = b.P[1 - bot.P];
-                if (ps.ActionsRemaining <= 0) return false;
+                if (ps.ActionsRemaining <= 0) return null;
                 move = BotChoose(BotEnumerateMoves(b, bot, ps, hp), b.BotDifficulty);
+                if (move != null) BotLogDecision(b, ps, hp, move);
             }
-            if (move == null) return false;
+            if (move == null) return null;
             switch (move.Kind) // handlers spend the action + enforce legality, so a bad pick can't cheat
             {
-                case 3: Log("BOT: draw (" + move.Desc + ")");   HandleDraw(bot.Me.Ns);            return true;
-                case 1: Log("BOT: summon " + move.Desc);        HandleSummon(bot.Me.Ns, move.Payload); return true;
-                case 2: Log("BOT: attack " + move.Desc);        HandleAttack(bot.Me.Ns, move.Payload); return true;
+                case 3: Log("BOT: draw (" + move.Desc + ")");   HandleDraw(bot.Me.Ns);                 break;
+                case 1: Log("BOT: summon " + move.Desc);        HandleSummon(bot.Me.Ns, move.Payload);      break;
+                case 2: Log("BOT: attack " + move.Desc);        HandleAttack(bot.Me.Ns, move.Payload);      break;
+                case 4: Log("BOT: clear corpse " + move.Desc);  HandleClearCorpse(bot.Me.Ns, move.Payload); break;
+                case 5: Log("BOT: order " + move.Desc);         HandleOrder(bot.Me.Ns, move.Payload);       break;
+                case 6: Log("BOT: reserve " + move.Desc);       HandleSummon(bot.Me.Ns, move.Payload);      break; // trap/operation to grid_x=3
+                case 7: Log("BOT: spell " + move.Desc);         HandleAttack(bot.Me.Ns, move.Payload);      break; // isSpell path
+                default: return null;
             }
-            return false;
+            return move;
+        }
+
+        static bool BytesEqual(byte[] a, byte[] b)
+        {
+            if (a == b) return true;
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
         }
 
         // Sort candidates best-first and pick one from the difficulty's rank window (clamped: with only n
@@ -1490,36 +1637,159 @@ namespace PtoServer
             if (hi > n) hi = n;
             if (hi <= lo) hi = lo + 1;
             int idx; lock (_rng) idx = _rng.Next(lo, hi);
+            moves[idx].Rank = idx; moves[idx].Pool = n; moves[idx].Top = moves[0].Score; // for the training log
             return moves[idx];
         }
 
-        // Enumerate every legal move for the current action and score it. Legality mirrors HandleSummon/
-        // HandleAttack exactly (wave, empty slot, summon-sickness, melee front-blocking + frontmost target,
-        // ranged targeting, forced decoy), so no enumerated move is ever rejected (which would waste the
-        // action). Called under _battleLock.
+        // Buffer one bot decision as a JSON fragment (state features + the chosen move's rank/score). The
+        // win/loss label is appended when the battle ends. Called under _battleLock.
+        static void BotLogDecision(Battle b, PlayerState ps, PlayerState hp, BotMove m)
+        {
+            int myU = 0, opU = 0;
+            foreach (var u in ps.Units.Values) if (u != null && !u.IsCorpse) myU++;
+            foreach (var u in hp.Units.Values) if (u != null && !u.IsCorpse) opU++;
+            string rec = "\"r\":" + b.Round + ",\"w\":" + b.Wave
+                + ",\"myLead\":" + ps.LeaderLife + ",\"opLead\":" + hp.LeaderLife
+                + ",\"myU\":" + myU + ",\"opU\":" + opU + ",\"orbs\":" + ps.Orbs
+                + ",\"diff\":" + b.BotDifficulty + ",\"leader\":" + (ps.LeaderCard / 2)
+                + ",\"kind\":" + m.Kind + ",\"rank\":" + m.Rank + ",\"pool\":" + m.Pool
+                + ",\"top\":" + m.Top.ToString("0.#") + ",\"pick\":" + m.Score.ToString("0.#");
+            (b.Training ?? (b.Training = new System.Collections.Generic.List<string>())).Add(rec);
+        }
+
+        // Enumerate every legal move for the current action and score it. Legality mirrors the handlers
+        // exactly (wave, empty slot, summon-sickness, melee front-blocking + frontmost target, ranged
+        // targeting, forced decoy, orb cost, correct target board), so an enumerated move is never rejected
+        // (which would waste the action). Covers draw, summon, order, trap/operation, clear-corpse, attack,
+        // unit wave-spell, and leader active. Called under _battleLock.
         static List<BotMove> BotEnumerateMoves(Battle b, BattleSlot bot, PlayerState ps, PlayerState hp)
         {
             var moves = new List<BotMove>();
             int wave = b.Wave;
 
+            // Defensive context: the bot LOSES if its own leader dies, so weight leader-protection against
+            // offense. Measure enemy attack power that can currently reach the bot's leader (ranged from
+            // anywhere unless the leader is Ranged-Immune; melee down the center lane only while the center
+            // Vanguard (2,1) is open) and amplify as the leader's life drops. defenseNeed feeds block/heal/
+            // shield/kill-the-threat scoring; at full life with no reachable threat it is 0 (pure offense).
+            bool leaderRimm = (ps.LeaderAbilities & UnitAbility.RImmunity) != 0;
+            bool centerOpen = BotCenterVanguardOpen(ps);
+            int enemyMeleeToLeader = 0, enemyRangedAtk = 0;
+            foreach (var kv in hp.Units)
+            {
+                BUnit eu = kv.Value; if (eu == null || eu.IsCorpse) continue;
+                int elane = kv.Key % 10, epow = Math.Max(1, eu.Atk + eu.Strength);
+                if ((eu.Abilities & UnitAbility.RangedAttack) != 0) enemyRangedAtk += epow;
+                else if (elane == 1) enemyMeleeToLeader += epow;
+            }
+            double leaderLifeFrac = ps.LeaderMax > 0 ? (double)Math.Max(0, ps.LeaderLife) / ps.LeaderMax : 1.0;
+            double leaderUrgency = 1.0 + 2.0 * (1.0 - leaderLifeFrac); // 1x at full life -> 3x near death
+            int incomingToLeader = (leaderRimm ? 0 : enemyRangedAtk) + (centerOpen ? enemyMeleeToLeader : 0);
+            double defenseNeed = BotDefenseWeight * incomingToLeader * leaderUrgency;
+
             // Draw (costs an action). More attractive the thinner the hand; skipped at/above the target.
             if (ps.Deck != null && ps.Deck.Count > 0 && bot.Hand.Count < BotHandTarget)
                 moves.Add(new BotMove { Kind = 3, Score = 55 - bot.Hand.Count * 8, Desc = "hand=" + bot.Hand.Count });
 
-            // Summon: every hand card into every empty legal slot of the current wave.
+            int freeLane = BotFreeReserveLane(ps);
             for (int h = 0; h < bot.Hand.Count; h++)
             {
                 ushort card = bot.Hand[h];
+                OrderEffect oe = OrderOf(card);
+                bool isTrap = oe.Kind == OrderKind.TrapCancelAttack || oe.Kind == OrderKind.TrapCancelSpell || oe.Kind == OrderKind.TrapCancelOrder;
+                OngoingOp og; bool isOngoing = TryOngoingOp(card, out og);
+                bool isReserve = isTrap || oe.Kind == OrderKind.Immortality || isOngoing;
+
+                if (isReserve)
+                {
+                    // Trap / operation: play face-down/face-up to a free reserve lane (op10 to grid_x=3).
+                    if (freeLane >= 0 && ps.Orbs >= OrbCostOf(card))
+                        moves.Add(new BotMove { Kind = 6, Score = 55,
+                            Payload = new byte[] { 0, 3, (byte)freeLane, (byte)h },
+                            Desc = "card " + card + " -> reserve lane " + freeLane });
+                    continue; // reserve-only cards are never summoned as heroes
+                }
+
+                // Hero card: it can be SUMMONED as a unit, or (its Order text) played as an ORDER.
                 int catk = AtkOf(card), clife = LifeOf(card);
                 for (int col = 0; col < 3; col++)
                 {
                     if (wave == 1 && col == 1) continue;               // leader cell
                     if (ps.Units.ContainsKey(Key(wave, col))) continue;
-                    double score = 70 + catk * 6 + clife * 2 + (wave == 2 ? 15 : wave == 1 ? 5 : 0);
-                    moves.Add(new BotMove { Kind = 1, Score = score,
-                        Payload = new byte[] { (byte)h, (byte)wave, (byte)col, 0 },
+                    double sscore = 70 + catk * 6 + clife * 2 + (wave == 2 ? 15 : wave == 1 ? 5 : 0);
+                    // Defensive: a body in the center Vanguard (2,1) blocks melee to the leader. Worth more
+                    // the harder the melee threat and the lower the leader's life (a tankier body helps most).
+                    if (wave == 2 && col == 1 && centerOpen && enemyMeleeToLeader > 0)
+                        sscore += BotDefenseWeight * (10 + enemyMeleeToLeader * 3 + clife) * leaderUrgency;
+                    moves.Add(new BotMove { Kind = 1, Score = sscore,
+                        Payload = new byte[] { 0, (byte)wave, (byte)col, (byte)h }, // handIndex is byte[3]
                         Desc = "card " + card + " -> (" + wave + "," + col + ")" });
                 }
+                if (oe.Kind != OrderKind.None && ps.Orbs >= OrbCostOf(card))
+                {
+                    bool grid; int tx, ty; double oscore;
+                    if (BotPlanEffect(oe, ps, hp, out grid, out tx, out ty, out oscore) && (grid || b.Round >= 2)) // ceasefire: no enemy-targeting in round 1
+                        moves.Add(new BotMove { Kind = 5, Score = oscore + BotProtectBonus(oe.Kind, defenseNeed),
+                            Payload = new byte[] { (byte)h, (byte)(grid ? 1 : 0), (byte)tx, (byte)ty, (byte)(card & 0xFF), (byte)(card >> 8) },
+                            Desc = "card " + card + " " + oe.Kind + " -> (" + tx + "," + ty + ")" });
+                }
+            }
+
+            // Clear one of the bot's own corpses, but ONLY to free a tile it will actually summon into this
+            // turn: the corpse must be in the current wave (summonable) and the bot must hold a hero to place
+            // there. This stops the bot from wasting actions clearing corpses it has no plan to use.
+            bool botHasHero = false;
+            for (int hh = 0; hh < bot.Hand.Count; hh++)
+            {
+                OngoingOp _og; ushort hc = bot.Hand[hh];
+                OrderEffect hoe = OrderOf(hc);
+                bool hReserve = hoe.Kind == OrderKind.TrapCancelAttack || hoe.Kind == OrderKind.TrapCancelSpell
+                              || hoe.Kind == OrderKind.TrapCancelOrder || hoe.Kind == OrderKind.Immortality || TryOngoingOp(hc, out _og);
+                if (!hReserve) { botHasHero = true; break; }
+            }
+            if (botHasHero)
+                foreach (var kv in ps.Units)
+                {
+                    BUnit u = kv.Value;
+                    if (u == null || !u.IsCorpse) continue;
+                    int cx = kv.Key / 10, cy = kv.Key % 10;
+                    if (cx != wave) continue;                     // only clear a corpse we can re-summon over this wave
+                    if (wave == 1 && cy == 1) continue;           // leader cell is never a summon slot
+                    moves.Add(new BotMove { Kind = 4, Score = 50, Payload = new byte[] { (byte)cx, (byte)cy },
+                        Desc = "(" + cx + "," + cy + ") to free a summon slot" });
+                }
+
+            // Leader active (cast from 1,1 via the isSpell path). Skip Batrov/Pendros (need extra targeting bytes).
+            {
+                int lr = ps.LeaderCard / 2;
+                OrderEffect le = SpellOf(ps.LeaderCard, 1);
+                if (le.Kind != OrderKind.None && lr != 100 && lr != 108)
+                {
+                    bool grid; int tx, ty; double lscore;
+                    // Leader active casts via op22, which the server blocks ENTIRELY during round-1 ceasefire
+                    // (even self-target spells). Gating on round>=2 keeps the bot from looping on a refunded cast.
+                    if (BotPlanEffect(le, ps, hp, out grid, out tx, out ty, out lscore) && b.Round >= 2)
+                        moves.Add(new BotMove { Kind = 7, Score = lscore + 5 + BotProtectBonus(le.Kind, defenseNeed),
+                            Payload = new byte[] { 1, (byte)(grid ? 1 : 0), 1, 1, (byte)tx, (byte)ty },
+                            Desc = "leader " + le.Kind + " -> (" + tx + "," + ty + ")" });
+                }
+            }
+
+            // Unit wave-spells (each ready unit in the current wave casts its wave's spell via op22).
+            foreach (var kv in ps.Units)
+            {
+                BUnit u = kv.Value;
+                if (u == null || u.IsCorpse) continue;
+                if (kv.Key / 10 != wave) continue;
+                OrderEffect se = SpellOf(u.Card, wave);
+                if (se.Kind == OrderKind.None) continue;
+                int ay2 = kv.Key % 10;
+                bool grid; int tx, ty; double cscore;
+                // Wave-spells cast via op22 too, so they are also ceasefire-blocked in round 1.
+                if (BotPlanEffect(se, ps, hp, out grid, out tx, out ty, out cscore) && b.Round >= 2)
+                    moves.Add(new BotMove { Kind = 7, Score = cscore + BotProtectBonus(se.Kind, defenseNeed),
+                        Payload = new byte[] { 1, (byte)(grid ? 1 : 0), (byte)wave, (byte)ay2, (byte)tx, (byte)ty },
+                        Desc = "(" + wave + "," + ay2 + ") " + se.Kind + " -> (" + tx + "," + ty + ")" });
             }
 
             // Attack (round 2+): every ready unit in the current wave x every legal target.
@@ -1541,7 +1811,7 @@ namespace PtoServer
                     {
                         int dwave = decoy / 10, dlane = decoy % 10;
                         if (!ranged && dlane != ay) continue; // melee can't reach a decoy in another lane
-                        BotAddAttack(moves, hp, wave, ay, dwave, dlane, atk, heroKiller, false);
+                        BotAddAttack(moves, hp, ps, centerOpen, leaderUrgency, wave, ay, dwave, dlane, atk, heroKiller, false);
                         continue;
                     }
                     if (ranged)
@@ -1551,10 +1821,10 @@ namespace PtoServer
                             {
                                 BUnit t;
                                 if (hp.Units.TryGetValue(Key(w, col), out t) && t != null && !t.IsCorpse)
-                                { BotAddAttack(moves, hp, wave, ay, w, col, atk, heroKiller, false); break; }
+                                { BotAddAttack(moves, hp, ps, centerOpen, leaderUrgency, wave, ay, w, col, atk, heroKiller, false); break; }
                             }
                         if ((hp.LeaderAbilities & UnitAbility.RImmunity) == 0)
-                            BotAddAttack(moves, hp, wave, ay, 1, 1, atk, heroKiller, true); // snipe the leader
+                            BotAddAttack(moves, hp, ps, centerOpen, leaderUrgency, wave, ay, 1, 1, atk, heroKiller, true); // snipe the leader
                     }
                     else
                     {
@@ -1563,13 +1833,13 @@ namespace PtoServer
                         {
                             BUnit t;
                             if (hp.Units.TryGetValue(Key(w, ay), out t) && t != null && !t.IsCorpse)
-                            { BotAddAttack(moves, hp, wave, ay, w, ay, atk, heroKiller, false); hit = true; break; }
+                            { BotAddAttack(moves, hp, ps, centerOpen, leaderUrgency, wave, ay, w, ay, atk, heroKiller, false); hit = true; break; }
                         }
                         if (!hit && ay == 1) // melee the leader down the center lane when its Vanguard is clear
                         {
                             BUnit v;
                             if (!(hp.Units.TryGetValue(Key(2, 1), out v) && v != null && !v.IsCorpse))
-                                BotAddAttack(moves, hp, wave, ay, 1, 1, atk, heroKiller, true);
+                                BotAddAttack(moves, hp, ps, centerOpen, leaderUrgency, wave, ay, 1, 1, atk, heroKiller, true);
                         }
                     }
                 }
@@ -1579,26 +1849,278 @@ namespace PtoServer
 
         // Score one attack candidate and append it. Killing a hero (or damaging/killing the leader, which
         // wins) scores highest; otherwise damage + the threat removed drive the score.
-        static void BotAddAttack(List<BotMove> moves, PlayerState hp, int aw, int al, int tw, int tl,
-                                 int atk, bool heroKiller, bool targetIsLeader)
+        static void BotAddAttack(List<BotMove> moves, PlayerState hp, PlayerState ps, bool centerOpen, double leaderUrgency,
+                                 int aw, int al, int tw, int tl, int atk, bool heroKiller, bool targetIsLeader)
         {
             int raw = heroKiller ? atk * 2 : atk;
-            int armor, rem, tgtAtk = 0;
+            int armor, rem, tgtAtk = 0, aggro = 0; bool threatensMyLeader = false;
             if (targetIsLeader) { armor = hp.LeaderArmorBonus; rem = Math.Max(1, hp.LeaderLife); }
             else
             {
                 BUnit t; hp.Units.TryGetValue(Key(tw, tl), out t);
                 if (t == null) return;
-                armor = t.Armor; rem = Math.Max(1, t.Max - t.Damage); tgtAtk = t.Atk + t.Strength;
+                armor = t.Armor; rem = Math.Max(1, t.Max - t.Damage); tgtAtk = t.Atk + t.Strength; aggro = t.BotAggro;
+                threatensMyLeader = BotEnemyThreatensLeader(t, tl, ps, centerOpen);
             }
             int dmg = Math.Max(0, raw - armor);
             bool kills = dmg >= rem;
-            double score = 90 + dmg * 4;
+            double score = 90 + dmg * 4 + aggro;                                 // aggro: finish who I hit / who hit me
             if (targetIsLeader) { score += dmg * 8; if (kills) score += 800; }   // leader damage wins the game
             else score += kills ? 60 + tgtAtk * 5 : tgtAtk * 2;                  // value removing a threat
+            // Defensive: removing an enemy that can hit MY leader is worth more the lower my leader's life
+            // (full value on a kill that ends the threat, partial for chip). Balances offense vs. protection.
+            if (threatensMyLeader) score += BotDefenseWeight * tgtAtk * leaderUrgency * (kills ? 1.0 : 0.4);
             moves.Add(new BotMove { Kind = 2, Score = score,
                 Payload = new byte[] { 0, 0, (byte)aw, (byte)al, (byte)tw, (byte)tl },
                 Desc = "(" + aw + "," + al + ")->(" + tw + "," + tl + ") dmg" + dmg + (kills ? " KILL" : "") });
+        }
+
+        // ---- bot order/spell targeting helpers --------------------------------
+        // All target coords are SERVER coords (no mirror), matching ResolveEffect (enemyGy = y).
+
+        // First reserve lane (0..2) not already holding a trap/operation, or -1 if all three are taken.
+        static int BotFreeReserveLane(PlayerState ps)
+        {
+            for (int lane = 0; lane < 3; lane++)
+            {
+                bool taken = ps.TrapAttackLane == lane || ps.TrapSpellLane == lane || ps.TrapOrderLane == lane || ps.ImmortalLane == lane;
+                if (!taken) foreach (var o in ps.Ongoing) if (o.Lane == lane) { taken = true; break; }
+                if (!taken) return lane;
+            }
+            return -1;
+        }
+
+        // Best (frontmost, only reachable) enemy hero to hit: highest aggro, then attack. False if no unit.
+        static bool BotBestEnemy(PlayerState hp, out int tx, out int ty)
+        {
+            tx = 1; ty = 1; int best = int.MinValue; bool found = false;
+            for (int lane = 0; lane < 3; lane++)
+                for (int w = 2; w >= 0; w--)
+                {
+                    BUnit u;
+                    if (hp.Units.TryGetValue(Key(w, lane), out u) && u != null && !u.IsCorpse)
+                    {
+                        int rank = u.BotAggro * 100 + (u.Atk + u.Strength);
+                        if (rank > best) { best = rank; tx = w; ty = lane; found = true; }
+                        break; // only the frontmost per lane is reachable
+                    }
+                }
+            return found;
+        }
+
+        static void BotEnemyInfo(PlayerState hp, int x, int y, out int rem, out int aggro)
+        {
+            BUnit u; rem = 1; aggro = 0;
+            if (hp.Units.TryGetValue(Key(x, y), out u) && u != null) { rem = Math.Max(1, u.Max - u.Damage); aggro = u.BotAggro; }
+        }
+
+        // Highest-value frontmost enemy for a KILL effect (they die regardless of life), scored by threat.
+        static bool BotBestEnemyKill(PlayerState hp, out int tx, out int ty, out double score)
+        {
+            tx = 1; ty = 1; score = 0; int best = int.MinValue; bool found = false;
+            for (int lane = 0; lane < 3; lane++)
+                for (int w = 2; w >= 0; w--)
+                {
+                    BUnit u;
+                    if (hp.Units.TryGetValue(Key(w, lane), out u) && u != null && !u.IsCorpse)
+                    {
+                        int rank = u.BotAggro * 100 + (u.Atk + u.Strength) * 10 + (u.Max - u.Damage);
+                        if (rank > best) { best = rank; tx = w; ty = lane; found = true; }
+                        break;
+                    }
+                }
+            if (found) { BUnit t = hp.Units[Key(tx, ty)]; score = 120 + (t.Atk + t.Strength) * 6 + t.BotAggro; }
+            return found;
+        }
+
+        // Frontmost enemy that already has damage (for Finisher-style "defeat a DAMAGED hero").
+        static bool BotDamagedEnemy(PlayerState hp, out int tx, out int ty)
+        {
+            tx = 1; ty = 1;
+            for (int lane = 0; lane < 3; lane++)
+                for (int w = 2; w >= 0; w--)
+                {
+                    BUnit u;
+                    if (hp.Units.TryGetValue(Key(w, lane), out u) && u != null && !u.IsCorpse)
+                    { if (u.Damage > 0) { tx = w; ty = lane; return true; } break; }
+                }
+            return false;
+        }
+
+        static bool BotMostDamagedOwn(PlayerState ps, out int x, out int y, out int dmg)
+        {
+            x = 0; y = 0; dmg = 0;
+            foreach (var kv in ps.Units)
+            { BUnit u = kv.Value; if (u != null && !u.IsCorpse && u.Damage > dmg) { dmg = u.Damage; x = kv.Key / 10; y = kv.Key % 10; } }
+            return dmg > 0;
+        }
+
+        // Strongest living own unit (for a self buff/shield).
+        // Balance knob: how strongly the bot weights defending its own leader vs pressing the attack.
+        // 1.0 = balanced. Raise for a turtlier bot, lower for a more reckless one. All defensive bonuses
+        // (center block, heal/shield-leader, killing a leader threat) scale by this; offense is unscaled.
+        // ponytail: one global weight; make it per-difficulty if stages need distinct temperaments.
+        const double BotDefenseWeight = 1.0;
+
+        // True when the bot's center Vanguard (2,1) has no living blocker, so enemy center-lane melee can
+        // reach the bot's leader.
+        static bool BotCenterVanguardOpen(PlayerState ps)
+        {
+            BUnit v; return !(ps.Units.TryGetValue(Key(2, 1), out v) && v != null && !v.IsCorpse);
+        }
+
+        // Can this enemy unit currently hit the bot's leader? Ranged reaches it from anywhere (unless the
+        // leader is Ranged-Immune); melee only down the center lane while the center Vanguard is open.
+        static bool BotEnemyThreatensLeader(BUnit u, int lane, PlayerState ps, bool centerOpen)
+        {
+            if (u == null || u.IsCorpse) return false;
+            if ((u.Abilities & UnitAbility.RangedAttack) != 0) return (ps.LeaderAbilities & UnitAbility.RImmunity) == 0;
+            return lane == 1 && centerOpen;
+        }
+
+        // Extra score for a leader-protecting order/spell, scaled by how threatened the leader is now.
+        static double BotProtectBonus(OrderKind k, double defenseNeed)
+        {
+            switch (k)
+            {
+                case OrderKind.HealLeader:   return defenseNeed;       // undoing leader damage directly buys life
+                case OrderKind.ShieldLeader: return defenseNeed + 10;  // pre-empts the next hit; small base pull
+                default: return 0;
+            }
+        }
+
+        static bool BotFrontOwn(PlayerState ps, out int x, out int y)
+        {
+            x = 0; y = 0; int best = int.MinValue; bool f = false;
+            foreach (var kv in ps.Units)
+            { BUnit u = kv.Value; if (u != null && !u.IsCorpse) { int r = u.Atk + u.Strength; if (r > best) { best = r; x = kv.Key / 10; y = kv.Key % 10; f = true; } } }
+            return f;
+        }
+
+        // Strongest own living unit that passes `ok` (e.g. not already ranged/shielded), so a persistent
+        // buff isn't wasted re-applying to a unit that already has it. False if no eligible target.
+        static bool BotBuffTargetOwn(PlayerState ps, out int x, out int y, Func<BUnit, bool> ok)
+        {
+            x = 0; y = 0; int best = int.MinValue; bool f = false;
+            foreach (var kv in ps.Units)
+            { BUnit u = kv.Value; if (u != null && !u.IsCorpse && ok(u)) { int r = u.Atk + u.Strength; if (r > best) { best = r; x = kv.Key / 10; y = kv.Key % 10; f = true; } } }
+            return f;
+        }
+
+        static bool BotOwnCorpse(PlayerState ps, out int x, out int y)
+        {
+            x = 0; y = 0;
+            foreach (var kv in ps.Units)
+            { BUnit u = kv.Value; if (u != null && u.IsCorpse) { x = kv.Key / 10; y = kv.Key % 10; return true; } }
+            return false;
+        }
+
+        // Plan how the bot aims an order/spell effect: pick target cell + board and a value score. Returns
+        // false to SKIP effects we can't confidently aim (they'd fizzle or need multi-target UI we don't
+        // build). grid=true means own board (self effects); (tx,ty) are server coords.
+        static bool BotPlanEffect(OrderEffect eff, PlayerState ps, PlayerState hp,
+                                  out bool grid, out int tx, out int ty, out double score)
+        {
+            grid = false; tx = 1; ty = 1; score = 0;
+            int amt = eff.Amount, rem, aggro, heal, cnt, tot;
+            switch (eff.Kind)
+            {
+                // enemy single-target damage
+                case OrderKind.DamageSingle:
+                case OrderKind.DamageIce:
+                    if (!BotBestEnemy(hp, out tx, out ty)) return false;
+                    BotEnemyInfo(hp, tx, ty, out rem, out aggro);
+                    score = 90 + amt * 4 + (amt >= rem ? 60 : 0) + aggro; return true;
+                // outright kill
+                case OrderKind.KillHero:
+                case OrderKind.Takedown:
+                    return BotBestEnemyKill(hp, out tx, out ty, out score);
+                case OrderKind.FinisherKill:
+                    if (!BotDamagedEnemy(hp, out tx, out ty)) return false;
+                    BotEnemyInfo(hp, tx, ty, out rem, out aggro); score = 140 + aggro; return true;
+                // enemy single-target debuff/removal
+                case OrderKind.Silence:
+                case OrderKind.Enervate:
+                case OrderKind.Entomb:
+                case OrderKind.Unsummon:
+                case OrderKind.MindControl:
+                case OrderKind.Backlash:
+                    if (!BotBestEnemy(hp, out tx, out ty)) return false;
+                    BotEnemyInfo(hp, tx, ty, out rem, out aggro); score = 70 + aggro; return true;
+                // enemy leader
+                case OrderKind.DamageLeader:
+                    grid = false; tx = 1; ty = 1;
+                    score = 95 + amt * 10 + (amt >= hp.LeaderLife ? 800 : 0); return true;
+                // enemy AoE (aim at the frontmost cluster; value scales with the number of enemies)
+                case OrderKind.DamageRow:
+                case OrderKind.DamageColumn:
+                case OrderKind.DamageBlast:
+                case OrderKind.DamageAll:
+                case OrderKind.DamageRandom:
+                case OrderKind.DamageFrontEach:
+                case OrderKind.DamageSpread:
+                    cnt = 0; aggro = 0;
+                    foreach (var kv in hp.Units) if (kv.Value != null && !kv.Value.IsCorpse) { cnt++; aggro += kv.Value.BotAggro; }
+                    if (cnt == 0) return false;
+                    BotBestEnemy(hp, out tx, out ty);
+                    score = 80 + amt * 3 * cnt + aggro; return true;
+                // self heal
+                case OrderKind.HealSingle:
+                    grid = true;
+                    if (!BotMostDamagedOwn(ps, out tx, out ty, out heal)) return false;
+                    score = 40 + Math.Min(amt, heal) * 3; return true;
+                case OrderKind.HealAll:
+                    grid = true; tot = 0;
+                    foreach (var u in ps.Units.Values) if (u != null && !u.IsCorpse) tot += Math.Min(amt, u.Damage);
+                    if (tot == 0) return false;
+                    score = 40 + tot * 2; return true;
+                case OrderKind.HealLeader:
+                    grid = true; tx = 1; ty = 1;
+                    if (ps.LeaderMax - ps.LeaderLife <= 0) return false;
+                    score = 40 + Math.Min(amt, ps.LeaderMax - ps.LeaderLife) * 3; return true;
+                // self buff on the strongest unit
+                case OrderKind.ShieldHero:
+                case OrderKind.StrengthBuff:
+                case OrderKind.StrengthBuffVanguard:
+                case OrderKind.ShieldVanguard:
+                case OrderKind.ShieldRear:
+                case OrderKind.Decoy:
+                case OrderKind.Infusion:
+                    grid = true;
+                    if (!BotFrontOwn(ps, out tx, out ty)) return false;
+                    score = 50 + amt * 4; return true;
+                // GrantRanged is PERSISTENT: re-granting an already-ranged unit wastes an action, so only
+                // target the strongest own MELEE unit; skip entirely if every unit already has ranged.
+                case OrderKind.GrantRanged:
+                    grid = true;
+                    if (!BotBuffTargetOwn(ps, out tx, out ty, uu => (uu.Abilities & UnitAbility.RangedAttack) == 0)) return false;
+                    score = 50 + amt * 4; return true;
+                case OrderKind.ShieldLeader:
+                    grid = true; tx = 1; ty = 1; score = 45; return true;
+                // revive: needs an own corpse
+                case OrderKind.Revive:
+                case OrderKind.Resurrect:
+                case OrderKind.RaiseDead:
+                case OrderKind.ResurrectAll:
+                case OrderKind.Seance:
+                    grid = true;
+                    if (!BotOwnCorpse(ps, out tx, out ty)) return false;
+                    score = 65; return true;
+                // fire-and-forget utility
+                case OrderKind.GainActions: grid = true; score = 110; return true;
+                case OrderKind.LucHaste:    grid = true; score = 100; return true;
+                case OrderKind.Inspire:     // needs a friendly HERO target, never the leader (server rejects 1,1)
+                    grid = true;
+                    if (!BotFrontOwn(ps, out tx, out ty)) return false;
+                    score = 60; return true;
+                case OrderKind.DrawCards:   grid = true; score = 55;  return true;
+                case OrderKind.OrbBoost:    grid = true; score = 45;  return true;
+                case OrderKind.Reload:      grid = true; score = 45;  return true;
+                case OrderKind.Restructure: grid = true; score = 45;  return true;
+                case OrderKind.Phantom:     grid = true; score = 35;  return true;
+                case OrderKind.Scry:        grid = true; score = 30;  return true;
+                default: return false; // SummonRandom/WildSummon/Swap/Polymorph/Copycat/Replicate/Duplicate/... deferred
+            }
         }
 
         // ---- battle setup + mulligan ------------------------------------------
@@ -1606,13 +2128,35 @@ namespace PtoServer
         // Ranked battle end (op3). Records the ladder result exactly once (human-vs-human only; bot
         // matches are skipped), persists it, then sends each present player their result + NEW rank.
         // The client (container_battle_end) reads bool won + u16 rank and shows the rank on the end screen.
+        // Send the battle-end now, or (inside an order's cast bracket) record it so HandleOrder can send it
+        // after SendSpellEnd. Keeps game_end the last queued client action so its end-screen click exits.
+        static void EndOrDefer(Battle b, Waiting winner, Waiting loser)
+        {
+            if (b.DeferEnd) { b.EndPending = true; b.EndWinner = winner; b.EndLoser = loser; return; }
+            SendBattleEnd(b, winner, loser);
+        }
+
         static void SendBattleEnd(Battle b, Waiting winner, Waiting loser)
         {
+            // Flush the bot's decision records for this battle, labeled with whether the bot won (stage/bot
+            // battles only). Null the buffer so a second SendBattleEnd call can't double-write.
+            if (b != null && b.BotP >= 0 && b.Training != null)
+            {
+                TrainingStore.Flush(b.Training, winner != null && winner.IsBot);
+                b.Training = null;
+            }
             if (b != null && !b.RankRecorded && b.BotP < 0 && winner != null && loser != null)
             {
                 b.RankRecorded = true;
                 RankStore.RecordResult(winner.User, loser.User);
                 MatchStore.Record(winner.User, loser.User);
+            }
+            // Campaign progress: a human win on a stage battle marks that stage completed (persisted), then
+            // re-pushes the stages packet so the winner's star/next-node unlock updates without re-login.
+            if (b != null && b.StageSid >= 0 && winner != null && !winner.IsBot)
+            {
+                StageStore.Complete(winner.User, b.StageSid);
+                try { Send(winner.Ns, BuildStagesPacket(winner.User)); } catch { }
             }
             if (winner != null)
                 try { Send(winner.Ns, new PacketWriter().WriteBool(true).WriteU16(RankStore.RankOf(winner.User)).Frame(Op.BattleEnd)); } catch { }
@@ -1644,11 +2188,16 @@ namespace PtoServer
 
             var ms = new MemoryStream();
 
+            // AIMode: 1 for a vs-bot (campaign / arena-vs-AI) battle, 0 for PvP. Drives the client's campaign
+            // UI (stage icons, unlock, post-battle nav) AND the pause button. Both detail packets carry the same
+            // flag since the client sets obj_battle_control.AI from each. (Was hardcoded 0, which hid the pause
+            // button and mis-routed campaign screens.)
+            bool aiBattle = slot.Battle != null && slot.Battle.BotP >= 0;
             byte[] d1 = new PacketWriter().WriteBool(true).WriteU16(myBack).WriteU16(myLand)
-                .WriteString(Display(me.User)).WriteBool(RankStore.IsLegend(me.User)).WriteU16(RankStore.RankOf(me.User)).WriteBool(false).WriteBool(true)
+                .WriteString(Display(me.User)).WriteBool(RankStore.IsLegend(me.User)).WriteU16(RankStore.RankOf(me.User)).WriteBool(aiBattle).WriteBool(true)
                 .Frame(Op.BattleDetails);
             byte[] d2 = new PacketWriter().WriteBool(false).WriteU16(opBack).WriteU16(opLand)
-                .WriteString(Display(opp.User)).WriteBool(RankStore.IsLegend(opp.User)).WriteU16(RankStore.RankOf(opp.User)).WriteBool(false).WriteBool(true)
+                .WriteString(Display(opp.User)).WriteBool(RankStore.IsLegend(opp.User)).WriteU16(RankStore.RankOf(opp.User)).WriteBool(aiBattle).WriteBool(true)
                 .Frame(Op.BattleDetails);
             ms.Write(d1, 0, d1.Length);
             ms.Write(d2, 0, d2.Length);
@@ -2149,6 +2698,21 @@ namespace PtoServer
             if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().Frame(Op.SpellRemove));
         }
 
+        // Order visual: show the order's HERO casting (obj_order_unit) with its spell-name textbox at the
+        // central order slot, instead of the leader cast pose + zoom. Brackets ResolveEffect exactly like
+        // SendSpellCast/SendSpellEnd - order_create blocks the effect queue (next_que_effect=0), order_remove
+        // releases it and flies the hero away (which releases the main queue on exit).
+        static void SendOrderCreate(BattleSlot mine, BattleSlot theirs, ushort card)
+        {
+            Send(mine.Me.Ns, new PacketWriter().WriteBool(true).WriteU16(card).Frame(Op.OrderCreate));
+            if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(false).WriteU16(card).Frame(Op.OrderCreate));
+        }
+        static void SendOrderRemove(BattleSlot mine, BattleSlot theirs)
+        {
+            Send(mine.Me.Ns, new PacketWriter().WriteBool(true).Frame(Op.OrderRemove));
+            if (theirs != null) Send(theirs.Me.Ns, new PacketWriter().WriteBool(true).Frame(Op.OrderRemove));
+        }
+
         // Fire an effect (op41 container_effect) from `mine`'s cell (fx,fy) to a cell (tx,ty) on the
         // target board (targetIsMine=true => the effect lands on mine's own board, e.g. a heal). Sent to
         // both clients with the grid flags flipped per viewer; anim_effect mirrors Y for the opponent
@@ -2258,8 +2822,10 @@ namespace PtoServer
             {
                 case OrderKind.DamageSingle: case OrderKind.Backlash:
                 case OrderKind.KillHero: case OrderKind.FinisherKill: case OrderKind.Takedown:
-                case OrderKind.Silence: case OrderKind.DamageRandom:
+                case OrderKind.Silence:
                     cells.Add(Key(gx, enemyGy)); break;
+                case OrderKind.DamageRandom: // gx/enemyGy set to the real hit cell in ResolveEffect (-1 = no target)
+                    if (gx >= 0 && enemyGy >= 0) cells.Add(Key(gx, enemyGy)); break;
                 case OrderKind.DamageLeader:
                     cells.Add(Key(1, 1)); break;
                 case OrderKind.DamageRow:
@@ -2443,9 +3009,13 @@ namespace PtoServer
                 return;
             }
 
-            SendSpellCast(mine, theirs, 1, 1);
+            b.DeferEnd = true;
+            SendOrderCreate(mine, theirs, cardId); // show the order's hero + spell-name textbox (not the leader cast pose)
             ResolveEffect(eff, mine, theirs, b, x, y, 1, 1, grid); // grid(isgrid): 1=own board clicked (for either-board effects)
-            SendSpellEnd(mine, theirs);
+            SendOrderRemove(mine, theirs);
+            b.DeferEnd = false;
+            // Send the deferred battle-end AFTER SendSpellEnd so game_end is the client's last queued action.
+            if (b.EndPending) { b.EndPending = false; SendBattleEnd(b, b.EndWinner, b.EndLoser); return; }
             // Leader on-order passives (Rukyuk Bombard 3 / Tatsumi first-order draw+action).
             if (!b.Over) ApplyLeaderOnOrder(mine, theirs, b);
             // Lukas: the first order this turn also bonus-summons a copy of the card.
@@ -2503,8 +3073,16 @@ namespace PtoServer
                     {
                         var alive = new List<int>();
                         foreach (var kv in opPs.Units) if (kv.Value != null && !kv.Value.IsCorpse) alive.Add(kv.Key);
-                        if (alive.Count > 0) { int k; lock (_rng) k = alive[_rng.Next(alive.Count)]; DamageEnemyAt(opPs, k / 10, k % 10, eff.Amount); }
-                        else Log("  bombard: no enemy heroes");
+                        if (alive.Count > 0)
+                        {
+                            int k; lock (_rng) k = alive[_rng.Next(alive.Count)];
+                            DamageEnemyAt(opPs, k / 10, k % 10, eff.Amount);
+                            // Aim the fire visual/number at the unit actually hit. Bombard has no player-chosen
+                            // target, so gx/enemyGy still hold the throwaway click (often the leader 1,1) that
+                            // FireEffect would otherwise splash on. Overwrite them with the real random cell.
+                            gx = k / 10; enemyGy = k % 10;
+                        }
+                        else { gx = -1; enemyGy = -1; Log("  bombard: no enemy heroes"); }
                     }
                     break;
                 case OrderKind.DamageLeader: // Backstab: the rival leader
@@ -2602,7 +3180,7 @@ namespace PtoServer
                         if (gx == 1 && selfGy == 1) { Log("  grant ranged: choose a hero, not the leader"); break; }
                         BUnit u;
                         if (ps.Units.TryGetValue(Key(gx, selfGy), out u) && u != null && !u.IsCorpse)
-                        { u.GrantedRanged = true; u.Abilities |= UnitAbility.RangedAttack; Log("  GRANT RANGED -> (" + gx + "," + selfGy + ")"); }
+                        { u.GrantedRanged = true; u.WasRanged = true; u.Abilities |= UnitAbility.RangedAttack; Log("  GRANT RANGED -> (" + gx + "," + selfGy + ")"); }
                         else Log("  grant ranged: no friendly hero at (" + gx + "," + selfGy + ")");
                     }
                     break;
@@ -3067,7 +3645,7 @@ namespace PtoServer
             {
                 b.Over = true;
                 Log("BATTLE END: " + mine.Me.User + " wins (order/spell lethal)");
-                SendBattleEnd(b, mine.Me, theirs != null ? theirs.Me : null);
+                EndOrDefer(b, mine.Me, theirs != null ? theirs.Me : null);
                 return;
             }
             // The caster's own leader can die from reflected effect damage, the caster then LOSES.
@@ -3075,7 +3653,7 @@ namespace PtoServer
             {
                 b.Over = true;
                 Log("BATTLE END: " + mine.Me.User + " loses (own leader killed by reflected effect damage)");
-                SendBattleEnd(b, theirs != null ? theirs.Me : null, mine.Me);
+                EndOrDefer(b, theirs != null ? theirs.Me : null, mine.Me);
                 return;
             }
 
@@ -3972,6 +4550,16 @@ namespace PtoServer
             BUnit counterUnit = null;
             if (!targetIsLeader) opPs.Units.TryGetValue(Key(origTx, origTy), out counterUnit);
 
+            // AI aggro: raise the priority the bot places on an enemy hero when the bot attacks it (finish
+            // it next turn) OR when it attacks the bot (retaliate). Aggro always lives on the HUMAN unit;
+            // it decays each bot turn. counterUnit is the pre-cover targeted hero.
+            if (b.BotP >= 0)
+            {
+                const int AggroHit = 6;
+                if (mine.P == b.BotP) { if (counterUnit != null) counterUnit.BotAggro += AggroHit; }        // bot -> human hero
+                else if (1 - mine.P == b.BotP && !attackerIsLeader) attacker.BotAggro += AggroHit;          // human hero -> bot
+            }
+
             // --- Cover: a living coverer takes damage aimed at a covered position (its forerunner, the
             // leader, or vanguard). Applies to melee AND ranged; redirect the hit to the coverer. (No
             // jump-in animation yet, the damage just lands on the coverer; animation is a later pass.)
@@ -4842,8 +5430,11 @@ namespace PtoServer
                         if (kv.Value != null && kv.Value.IsCorpse) kv.Value.CorpseFresh = false;
             SyncUnitStates(p0, p1, act.Battle);
 
-            // Start the turn clock for the auto-advance timeout.
-            if (act.Battle != null) act.Battle.TurnDeadline = DateTime.UtcNow.AddSeconds(TurnSeconds);
+            // Start the turn clock for the auto-advance timeout - PvP only. Human-vs-bot battles
+            // (campaign stages / arena-vs-AI) get no server deadline (default = TurnTimeoutLoop skips it),
+            // so a single-player can take their time / pause without the turn being force-ended.
+            if (act.Battle != null)
+                act.Battle.TurnDeadline = act.Battle.BotP < 0 ? DateTime.UtcNow.AddSeconds(TurnSeconds) : default(DateTime);
 
             // Re-send the current orb counts each turn to keep both clients in sync (idempotent).
             // Orbs are gained per wave (GrantWaveOrbs) and spent on orders (HandleOrder).
@@ -5044,6 +5635,7 @@ namespace PtoServer
         public bool IsBot;
         public ushort LeaderOverride; // 0 = none; else force this LeaderCard (real*2) for a campaign-stage AI
         public int BotDifficulty = 2; // 0=easy,1=medium,2=hard; copied to Battle.BotDifficulty when this bot plays
+        public int StageSid = -1;     // campaign stage id (human side); copied to Battle.StageSid for win-persistence
     }
 
     // Simple 1v1 matchmaking: hold at most one waiting player; the next joiner is paired with them.
@@ -5278,6 +5870,81 @@ namespace PtoServer
     // ("user|rank|wins|losses"). Rank is a personal climb-ladder position: the client draws
     // floor(5/rank) for its icon, so LOWER is better and rank must be >= 1. New players start at
     // StartRank; each win climbs toward 1, each loss falls toward MaxRank. Tune the constants below.
+    // Persistent campaign progress: data/stages.txt, one line per account "user|sid,sid,sid" of COMPLETED
+    // stage ids. Unlock is derived at send time (see the op60 account-data build), not stored.
+    static class StageStore
+    {
+        static readonly object _lock = new object();
+        static Dictionary<string, HashSet<int>> _done;
+        static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data"); } }
+        static string FilePath { get { return Path.Combine(Dir, "stages.txt"); } }
+        static string Norm(string u) { return (u ?? "").Trim().ToLowerInvariant(); }
+
+        static void EnsureLoaded()
+        {
+            if (_done != null) return;
+            _done = new Dictionary<string, HashSet<int>>();
+            try
+            {
+                if (File.Exists(FilePath))
+                    foreach (string line in File.ReadAllLines(FilePath))
+                    {
+                        string[] f = line.Split('|');
+                        if (f.Length < 2 || f[0].Length == 0) continue;
+                        var set = new HashSet<int>();
+                        foreach (string s in f[1].Split(',')) { int v; if (int.TryParse(s, out v)) set.Add(v); }
+                        _done[f[0]] = set;
+                    }
+            }
+            catch (Exception e) { Console.WriteLine("StageStore load error: " + e.Message); }
+        }
+
+        static void Persist()
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                var sb = new StringBuilder();
+                foreach (var kv in _done)
+                {
+                    if (kv.Value.Count == 0) continue;
+                    sb.Append(kv.Key).Append('|');
+                    bool first = true;
+                    foreach (int sid in kv.Value) { if (!first) sb.Append(','); sb.Append(sid); first = false; }
+                    sb.Append('\n');
+                }
+                File.WriteAllText(FilePath, sb.ToString());
+            }
+            catch (Exception e) { Console.WriteLine("StageStore save error: " + e.Message); }
+        }
+
+        // Completed stage ids for a user (a copy; safe to read without the lock).
+        public static HashSet<int> Completed(string user)
+        {
+            string n = Norm(user);
+            lock (_lock)
+            {
+                EnsureLoaded();
+                HashSet<int> set;
+                return (n.Length > 0 && _done.TryGetValue(n, out set)) ? new HashSet<int>(set) : new HashSet<int>();
+            }
+        }
+
+        // Mark a stage completed (idempotent). The bot / empty users are never persisted.
+        public static void Complete(string user, int sid)
+        {
+            string n = Norm(user);
+            if (n.Length == 0 || n == "bot" || sid < 0) return;
+            lock (_lock)
+            {
+                EnsureLoaded();
+                HashSet<int> set;
+                if (!_done.TryGetValue(n, out set)) { set = new HashSet<int>(); _done[n] = set; }
+                if (set.Add(sid)) Persist();
+            }
+        }
+    }
+
     static class RankStore
     {
         const int StartRank = 25;  // where new players enter (outside the top icon tiers)
@@ -5374,6 +6041,113 @@ namespace PtoServer
                 le[0] = Math.Min(MaxRank, le[0] + LossStep); le[2]++;
                 Persist();
             }
+        }
+    }
+
+    // Bot training log: data/training.jsonl, one JSON object per bot decision, appended when a stage/bot
+    // battle ends. Each line = state features + the chosen move's rank/score within the sorted candidate
+    // pool + whether the bot ultimately WON. Use it to see which ranks/features correlate with wins and to
+    // tune the best-N move bands (and, later, learn a better ranking). ponytail: plain append-only JSONL;
+    // rotate/compact it if it grows large.
+    static class TrainingStore
+    {
+        static readonly object _lock = new object();
+        static string Dir { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data"); } }
+        static string FilePath { get { return Path.Combine(Dir, "training.jsonl"); } }
+
+        public static void Flush(System.Collections.Generic.List<string> recs, bool botWon)
+        {
+            if (recs == null || recs.Count == 0) return;
+            // Durable local copy: one JSON object per decision line (append-only).
+            var sb = new StringBuilder();
+            foreach (var r in recs) sb.Append('{').Append(r).Append(",\"won\":").Append(botWon ? 1 : 0).Append("}\n");
+            lock (_lock)
+                try { Directory.CreateDirectory(Dir); File.AppendAllText(FilePath, sb.ToString()); }
+                catch (Exception e) { Console.WriteLine("TrainingStore save error: " + e.Message); }
+
+            // Optional central upload: one match object { ts, src, won, decisions[] } to Firebase RTDB.
+            if (FirebaseUploader.Enabled)
+            {
+                long ts = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+                var m = new StringBuilder();
+                m.Append("{\"ts\":").Append(ts)
+                 .Append(",\"src\":\"").Append(FirebaseUploader.InstallId).Append('"')
+                 .Append(",\"won\":").Append(botWon ? 1 : 0)
+                 .Append(",\"decisions\":[");
+                for (int i = 0; i < recs.Count; i++) { if (i > 0) m.Append(','); m.Append('{').Append(recs[i]).Append('}'); }
+                m.Append("]}");
+                FirebaseUploader.Upload(m.ToString());
+            }
+        }
+    }
+
+    // Uploads finished-match bot-training records to a Firebase Realtime Database via its REST API (no
+    // Cloud Functions needed - works on the free Spark plan). One HTTP POST per match creates one child
+    // under <path> with a time-ordered push key. Config (first found wins): env PTO_FIREBASE_URL /
+    // PTO_FIREBASE_AUTH / PTO_FIREBASE_PATH, else a firebase.txt next to the exe (line1=RTDB base url,
+    // line2=optional auth token, line3=optional path, default "training"). Disabled if no url is set, so
+    // copies without config still run. The local training.jsonl is always written regardless; upload is
+    // best-effort (logged on failure), fire-and-forget so it never blocks a battle.
+    static class FirebaseUploader
+    {
+        static string _url, _auth, _path = "training", _install;
+        static readonly System.Net.Http.HttpClient _http = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+        public static bool Enabled { get { return !string.IsNullOrEmpty(_url); } }
+        public static string InstallId { get { return _install; } }
+
+        public static void Init()
+        {
+            _url  = Environment.GetEnvironmentVariable("PTO_FIREBASE_URL");
+            _auth = Environment.GetEnvironmentVariable("PTO_FIREBASE_AUTH");
+            string p = Environment.GetEnvironmentVariable("PTO_FIREBASE_PATH");
+            if (!string.IsNullOrEmpty(p)) _path = p;
+            try
+            {
+                string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "firebase.txt");
+                if (string.IsNullOrEmpty(_url) && File.Exists(cfg))
+                {
+                    string[] lines = File.ReadAllLines(cfg);
+                    if (lines.Length > 0) _url  = lines[0].Trim();
+                    if (lines.Length > 1) _auth = lines[1].Trim();
+                    if (lines.Length > 2 && lines[2].Trim().Length > 0) _path = lines[2].Trim();
+                }
+            }
+            catch (Exception e) { Console.WriteLine("Firebase config error: " + e.Message); }
+            if (string.IsNullOrEmpty(_url)) { _url = null; return; }
+            _url = _url.TrimEnd('/');
+            _install = LoadOrMakeInstallId();
+            Program.Log("Firebase upload ON -> " + _url + "/" + _path + ".json (install " + _install + ")");
+        }
+
+        static string LoadOrMakeInstallId()
+        {
+            try
+            {
+                string dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data");
+                string f = Path.Combine(dir, "installid.txt");
+                if (File.Exists(f)) { string s = File.ReadAllText(f).Trim(); if (s.Length > 0) return s; }
+                Directory.CreateDirectory(dir);
+                string id = Guid.NewGuid().ToString("N").Substring(0, 12);
+                File.WriteAllText(f, id);
+                return id;
+            }
+            catch { return "unknown"; }
+        }
+
+        public static void Upload(string json)
+        {
+            if (!Enabled) return;
+            string endpoint = _url + "/" + _path + ".json" + (string.IsNullOrEmpty(_auth) ? "" : "?auth=" + Uri.EscapeDataString(_auth));
+            _ = System.Threading.Tasks.Task.Run(async () =>
+            {
+                try
+                {
+                    var content = new System.Net.Http.StringContent(json, Encoding.UTF8, "application/json");
+                    var resp = await _http.PostAsync(endpoint, content).ConfigureAwait(false);
+                    if (!resp.IsSuccessStatusCode) Program.Log("Firebase upload failed: HTTP " + (int)resp.StatusCode);
+                }
+                catch (Exception e) { Program.Log("Firebase upload error: " + e.Message); }
+            });
         }
     }
 
