@@ -132,84 +132,113 @@ static class Program
     // Route one game connection. Once we've been elected the guest, the game's
     // (reconnected) session is tunneled to the authority over the relay. Otherwise it
     // goes to the local server, with the game -> server side sniffed for Op.Queue.
+    // One game connection, for its whole life. It cycles offline <-> online with NO visible
+    // disconnect either way: on Op.Queue the guest's live session is spliced onto the host over
+    // the relay; on Op.BattleEnd it is spliced back onto the local server (login replayed, its
+    // login-flow suppressed). The authority just stays on its local server the whole time.
     static async Task HandleGameAsync(TcpClient game, MetaClient meta, OnlineState online)
     {
         try
         {
-            if (online.GuestAuthority != 0)
-            {
-                using (game)
-                {
-                    // Wait for the SDR relay route to be ready before connecting (else 5008).
-                    for (int i = 0; i < 30 && !online.Relay!.RelayReady(); i++)
-                    {
-                        if (i == 0) Console.WriteLine("relay: waiting for the Steam relay network to be ready...");
-                        await Task.Delay(500);
-                    }
-                    // The relay route or the host's listen socket may not be ready the instant
-                    // the guest reconnects; retry a few times before giving up.
-                    SteamConnectionStream? peer = null;
-                    for (int attempt = 1; attempt <= 4 && peer == null; attempt++)
-                    {
-                        Console.WriteLine($"relay: connecting to host {online.GuestAuthority} (attempt {attempt}/4)...");
-                        try { peer = await online.Relay!.ConnectAsync(online.GuestAuthority); }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"  attempt {attempt} failed: {ex.Message}");
-                            if (attempt < 4) await Task.Delay(2000);
-                        }
-                    }
-                    if (peer == null)
-                    {
-                        Console.WriteLine("could not reach the host over the relay. Restart the game and pick matchmaking again to retry.");
-                        return;
-                    }
-                    using (peer) await GuestBridgeAsync(game, peer, online);
-                }
-                return;
-            }
             using (game)
             {
-                var server = new TcpClient();
-                await server.ConnectAsync(IPAddress.Loopback, LocalPort);
-                server.NoDelay = true;
-                using var localCts = new CancellationTokenSource();
+                bool replayLoginToLocal = false;
 
-                // Capture the game's login (op46) and matchmaking (op0) so we can replay them onto
-                // the authority and hand the LIVE connection over with no visible disconnect.
-                var loginSniff = new OpcodeSniffer(OpLogin, pkt => online.LoginPacket = pkt, repeat: true);
-                var handoff = new TaskCompletionSource<SteamConnectionStream?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                var queueSniff = new OpcodeSniffer(OpQueue, pkt => { online.QueuePacket = pkt; _ = GoOnlineAsync(meta, online, game, handoff); });
-                online.QueueSniff = queueSniff;
-                // server -> game: on Op.BattleEnd, if we were hosting, re-arm and go passive offline.
-                var endSniff = new OpcodeSniffer(OpBattleEnd, _ =>
+                // Rare fallback: the game reconnected after a forced disconnect (a seamless join
+                // once failed). Bridge it to the authority, then rejoin the offline loop on end.
+                if (online.GuestAuthority != 0)
                 {
-                    if (online.EndHosting())
-                    {
-                        queueSniff.Rearm();
-                        Console.WriteLine("match over; back to passive offline, ready for another match.");
-                    }
-                }, repeat: true);
-
-                var pump = PumpDualSniffAsync(game.GetStream(), server.GetStream(),
-                                              new[] { loginSniff, queueSniff }, new[] { endSniff }, localCts);
-                var done = await Task.WhenAny(pump, handoff.Task);
-                if (done == handoff.Task && handoff.Task.Result is SteamConnectionStream peer)
-                {
-                    // SEAMLESS: stop the local pump, drop the local server, and splice the SAME game
-                    // connection to the authority over the relay - no disconnect, no scary message.
-                    localCts.Cancel();
-                    try { await pump; } catch { }
-                    try { server.Close(); } catch { }
-                    Console.WriteLine("joined - handed your live session to the host, no reconnect needed.");
-                    using (peer) await GuestBridgeAsync(game, peer, online);
-                    return;
+                    var fb = await ConnectGuestRelayAsync(online);
+                    if (fb == null) return;
+                    bool ended; using (fb) ended = await GuestBridgeAsync(game, fb, online);
+                    if (!ended) return;
+                    replayLoginToLocal = true;
                 }
-                try { server.Close(); } catch { }
-                await pump; // normal offline / authority session end
+
+                while (true)
+                {
+                    var server = new TcpClient();
+                    await server.ConnectAsync(IPAddress.Loopback, LocalPort);
+                    server.NoDelay = true;
+                    if (replayLoginToLocal)
+                    {
+                        // Returning from a match: re-home the LIVE game onto the local server by
+                        // replaying its login and swallowing the local login-flow, so no reconnect.
+                        try
+                        {
+                            if (online.LoginPacket != null)
+                            {
+                                await server.GetStream().WriteAsync(online.LoginPacket);
+                                await SuppressUntilAsync(server.GetStream(), OpLoaded);
+                            }
+                            Console.WriteLine("match over; slid back to your offline server, no reconnect.");
+                        }
+                        catch (Exception ex) { Console.WriteLine($"return-to-offline replay failed: {ex.Message}"); }
+                        replayLoginToLocal = false;
+                    }
+
+                    SteamConnectionStream? peer = await RunLocalSessionAsync(game, server, meta, online);
+                    try { server.Close(); } catch { }
+                    if (peer == null) return; // game disconnected (or authority session ended)
+
+                    bool ended; using (peer) ended = await GuestBridgeAsync(game, peer, online);
+                    if (!ended) return;       // relay dropped: game will reconnect (fallback path)
+                    replayLoginToLocal = true; // loop back to offline, seamlessly
+                }
             }
         }
         catch (Exception ex) { Console.WriteLine($"game session ended: {ex.Message}"); }
+    }
+
+    // Bridge game <-> local server (offline). Captures login/queue; on Op.Queue it goes online.
+    // Returns the relay stream if we were elected guest (caller bridges it), or null if the game
+    // connection ended or we hosted (authority stays local the whole time).
+    static async Task<SteamConnectionStream?> RunLocalSessionAsync(TcpClient game, TcpClient server, MetaClient meta, OnlineState online)
+    {
+        using var localCts = new CancellationTokenSource();
+        var loginSniff = new OpcodeSniffer(OpLogin, pkt => online.LoginPacket = pkt, repeat: true);
+        var handoff = new TaskCompletionSource<SteamConnectionStream?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var queueSniff = new OpcodeSniffer(OpQueue, pkt => { online.QueuePacket = pkt; _ = GoOnlineAsync(meta, online, game, handoff); });
+        online.QueueSniff = queueSniff;
+        var endSniff = new OpcodeSniffer(OpBattleEnd, _ =>
+        {
+            if (online.EndHosting())
+            {
+                queueSniff.Rearm();
+                Console.WriteLine("match over; back to passive offline, ready for another match.");
+            }
+        }, repeat: true);
+
+        var pump = PumpDualSniffAsync(game.GetStream(), server.GetStream(),
+                                      new[] { loginSniff, queueSniff }, new[] { endSniff }, localCts);
+        var done = await Task.WhenAny(pump, handoff.Task);
+        if (done == handoff.Task && handoff.Task.Result is SteamConnectionStream peer)
+        {
+            localCts.Cancel();
+            try { await pump; } catch { }
+            Console.WriteLine("joined - handed your live session to the host, no reconnect needed.");
+            return peer;
+        }
+        try { await pump; } catch { }
+        return null;
+    }
+
+    // Fallback only: connect the relay to the authority with a readiness wait + retries.
+    static async Task<SteamConnectionStream?> ConnectGuestRelayAsync(OnlineState online)
+    {
+        for (int i = 0; i < 30 && !online.Relay!.RelayReady(); i++)
+        {
+            if (i == 0) Console.WriteLine("relay: waiting for the Steam relay network to be ready...");
+            await Task.Delay(500);
+        }
+        for (int attempt = 1; attempt <= 4; attempt++)
+        {
+            Console.WriteLine($"relay: connecting to host {online.GuestAuthority} (attempt {attempt}/4)...");
+            try { return await online.Relay!.ConnectAsync(online.GuestAuthority); }
+            catch (Exception ex) { Console.WriteLine($"  attempt {attempt} failed: {ex.Message}"); if (attempt < 4) await Task.Delay(2000); }
+        }
+        Console.WriteLine("could not reach the host over the relay.");
+        return null;
     }
 
     // Fired once, when the game asks to matchmake. Brings up Steam + Firebase, pairs,
@@ -358,13 +387,17 @@ static class Program
     // Op.BattleEnd. When the match ends we forward the result, then drop the connection
     // and re-arm; the client reconnects and (GuestAuthority now cleared) lands back on
     // its own local server, offline. Firebase is updated by the authority, not here.
-    static async Task GuestBridgeAsync(TcpClient game, SteamConnectionStream peer, OnlineState online)
+    // Bridge the guest's game <-> the authority over the relay. Returns true if the match ended
+    // cleanly (Op.BattleEnd seen: the caller then re-homes to the local server seamlessly), or
+    // false if the relay dropped first (the caller lets the game reconnect as a fallback).
+    static async Task<bool> GuestBridgeAsync(TcpClient game, SteamConnectionStream peer, OnlineState online)
     {
         using var cts = new CancellationTokenSource();
+        bool matchEnded = false;
         var g = game.GetStream();
         var endSniff = new OpcodeSniffer(OpBattleEnd, _ =>
         {
-            Console.WriteLine("match over; returning to offline.");
+            matchEnded = true;   // result already forwarded to the game; now re-home to local
             online.Reset();
             cts.Cancel();
         });
@@ -373,6 +406,7 @@ static class Program
         await Task.WhenAny(t1, t2);
         cts.Cancel();
         try { await Task.WhenAll(t1, t2); } catch { /* expected on teardown */ }
+        return matchEnded;
     }
 
     // Set up the relay listener + ladder tail ONCE per session. The listener is match-
