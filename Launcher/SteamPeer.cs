@@ -60,7 +60,13 @@ sealed class SteamRelay : IDisposable
     // later as a P2PSessionConnectFail. timeoutSeconds kept for signature compatibility.
     public Task<SteamConnectionStream> ConnectAsync(ulong hostSteamId, int timeoutSeconds = 15)
     {
-        var s = _conns.GetOrAdd(hostSteamId, id => new SteamConnectionStream(id));
+        // Fresh session every time. A stale stream from a previous match has a completed read
+        // channel (reads return 0 -> "host closed"), so drop any old one and reset the P2P
+        // session so the host gets a clean P2PSessionRequest.
+        if (_conns.TryRemove(hostSteamId, out var old)) old.Complete();
+        SteamNetworking.CloseP2PSessionWithUser(new CSteamID(hostSteamId));
+        var s = new SteamConnectionStream(this, hostSteamId);
+        _conns[hostSteamId] = s;
         s.Connected.TrySetResult(s);
         return s.Connected.Task;
     }
@@ -91,12 +97,15 @@ sealed class SteamRelay : IDisposable
     {
         ulong id = ev.m_steamIDRemote.m_SteamID;
         SteamNetworking.AcceptP2PSessionWithUser(ev.m_steamIDRemote);
-        if (!_conns.ContainsKey(id) && _listening)
-        {
-            var s = _conns.GetOrAdd(id, x => new SteamConnectionStream(x));
-            _log.Enqueue("relay: incoming peer, accepting");
-            if (_onAccept != null) _ = _onAccept(s);
-        }
+        if (!_listening) return; // only the host bridges inbound peers (the guest initiated its own)
+        // A request starts a (re)connection. If we're already bridging this peer, ignore the dup;
+        // if a stale stream lingers (previous match), replace it and re-bridge.
+        if (_conns.TryGetValue(id, out var live) && !live.Completed) return;
+        if (_conns.TryRemove(id, out var stale)) stale.Complete();
+        var s = new SteamConnectionStream(this, id);
+        _conns[id] = s;
+        _log.Enqueue("relay: incoming peer, accepting");
+        if (_onAccept != null) _ = _onAccept(s);
     }
 
     // A session could not be established (peer unreachable / not on the app). The error
@@ -129,19 +138,22 @@ sealed class SteamRelay : IDisposable
 // order like TCP. Keyed by the remote SteamID64.
 sealed class SteamConnectionStream : Stream
 {
+    readonly SteamRelay _relay;
     readonly ulong _peer;
     readonly Channel<byte[]> _rx = Channel.CreateUnbounded<byte[]>(
         new UnboundedChannelOptions { SingleReader = true });
     byte[]? _left;
     int _leftOff;
 
+    public bool Completed { get; private set; } // read channel closed: a dead/reusable-only-fresh stream
+
     public readonly TaskCompletionSource<SteamConnectionStream> Connected =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public SteamConnectionStream(ulong peerSteamId) => _peer = peerSteamId;
+    public SteamConnectionStream(SteamRelay relay, ulong peerSteamId) { _relay = relay; _peer = peerSteamId; }
 
     internal void Deliver(byte[] data) => _rx.Writer.TryWrite(data);
-    internal void Complete() => _rx.Writer.TryComplete();
+    internal void Complete() { Completed = true; _rx.Writer.TryComplete(); }
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
     {
@@ -170,7 +182,8 @@ sealed class SteamConnectionStream : Stream
 
     protected override void Dispose(bool disposing)
     {
-        _rx.Writer.TryComplete();
+        Complete();
+        _relay.Forget(_peer); // remove from the relay's map so the next match gets a fresh stream
         SteamNetworking.CloseP2PSessionWithUser(new CSteamID(_peer));
         base.Dispose(disposing);
     }
