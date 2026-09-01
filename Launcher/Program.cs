@@ -120,13 +120,44 @@ static class Program
         catch (Exception ex) { Console.WriteLine($"steam: relay not started yet ({ex.Message}); will init on first match"); }
 
         var l = new TcpListener(IPAddress.Loopback, GamePort);
-        l.Start();
+        if (!TryStart(l))
+        {
+            // GamePort is held, almost always by a stale ptolaunch from a previous run that
+            // did not exit. Kill it (its spawned server survives and is reused) and retry.
+            Console.WriteLine($"port {GamePort} is in use; clearing a stale launcher instance...");
+            KillOtherLaunchers();
+            await Task.Delay(800);
+            if (!TryStart(l))
+            {
+                Console.WriteLine($"could not free port {GamePort}. Close any other launcher window, then run play again.");
+                return 1;
+            }
+        }
         while (true)
         {
             var game = await l.AcceptTcpClientAsync();
             game.NoDelay = true;
             _ = HandleGameAsync(game, meta, online);
         }
+    }
+
+    static bool TryStart(TcpListener l)
+    {
+        try { l.Start(); return true; }
+        catch (SocketException) { return false; }
+    }
+
+    // Single instance: kill any other ptolaunch process (not its spawned PtoServer child, which
+    // survives on LocalPort and gets reused). Frees GamePort left held by a stale run.
+    static void KillOtherLaunchers()
+    {
+        try
+        {
+            int me = Environment.ProcessId;
+            foreach (var p in System.Diagnostics.Process.GetProcessesByName("ptolaunch"))
+                if (p.Id != me) { try { p.Kill(); } catch { } }
+        }
+        catch { }
     }
 
     // Route one game connection. Once we've been elected the guest, the game's
@@ -358,14 +389,18 @@ static class Program
     }
 
     // Read and discard whole framed packets from a stream until (and including) one with `opcode`.
-    static async Task SuppressUntilAsync(Stream s, byte opcode)
+    // Times out so a guest whose host is unreachable fails over to the fallback instead of hanging.
+    static async Task SuppressUntilAsync(Stream s, byte opcode, int timeoutSeconds = 20)
     {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds));
         var acc = new byte[8192];
         int len = 0;
         var buf = new byte[16384];
         while (true)
         {
-            int n = await s.ReadAsync(buf);
+            int n;
+            try { n = await s.ReadAsync(buf, cts.Token); }
+            catch (OperationCanceledException) { throw new TimeoutException("no response from host during the login handoff"); }
             if (n <= 0) throw new IOException("host closed during the login handoff");
             if (len + n > acc.Length) Array.Resize(ref acc, Math.Max(len + n, acc.Length * 2));
             Array.Copy(buf, 0, acc, len, n); len += n;
